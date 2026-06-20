@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -15,12 +16,14 @@ import (
 // registry (operation lifecycle + engine), and the fleet hub (live container
 // snapshots to the dashboard).
 type app struct {
-	cfg    Config
-	cc     *http.Client
-	docker *dockerClient
-	events *eventBuffer
-	reg    *jobRegistry
-	fleet  *fleetHub
+	cfg      Config
+	cc       *http.Client
+	docker   *dockerClient
+	compose  *composeBackend
+	projects *composeRegistry
+	events   *eventBuffer
+	reg      *jobRegistry
+	fleet    *fleetHub
 }
 
 func newApp(_ context.Context, cfg Config) (*app, error) {
@@ -33,11 +36,29 @@ func newApp(_ context.Context, cfg Config) (*app, error) {
 	if err != nil {
 		return nil, fmt.Errorf("event buffer: %w", err)
 	}
-	eng := newEngine(cfg, dc)
+
+	// Durable compose-project registry (projects.json). Missing file = empty
+	// registry; a malformed file is fatal (surface corruption, don't silently
+	// drop the index).
+	projects := newComposeRegistry(cfg.ComposeRegistryPath)
+	if err := projects.load(); err != nil {
+		return nil, fmt.Errorf("load compose registry: %w", err)
+	}
+
+	// In-process compose-v2 backend. A failure here (e.g. docker cli init) must
+	// NOT kill the agent — read-only fleet + container lifecycle still work, and
+	// compose ops fail loudly per-op. Log and continue with a nil backend.
+	cb, err := newComposeBackend(cfg)
+	if err != nil {
+		slog.Error("compose backend init failed — compose ops disabled", "error", err)
+		cb = nil
+	}
+
+	eng := newEngine(cfg, dc, cb, projects)
 	reg := newJobRegistry(cfg, eng, events)
 	reg.setHook(events.handleJobEvent)
 
-	a := &app{cfg: cfg, cc: cc, docker: dc, events: events, reg: reg}
+	a := &app{cfg: cfg, cc: cc, docker: dc, compose: cb, projects: projects, events: events, reg: reg}
 	a.fleet = newFleetHub(a)
 	reg.setFleet(a.fleet)
 	return a, nil
@@ -53,9 +74,25 @@ func (a *app) close() {
 }
 
 func (a *app) startBackgroundWorkers(ctx context.Context) {
-	a.events.Start(ctx) // outbox drain
-	go a.fleet.Run(ctx) // fleet broadcaster
-	go a.startReconcile(ctx)
+	a.events.Start(ctx)          // outbox drain
+	go a.fleet.Run(ctx)          // fleet broadcaster
+	go a.startReconcile(ctx)     //
+	go a.enrichProjectsOnce(ctx) // auto-adopt running compose projects into the registry
+}
+
+// enrichProjectsOnce reads the current container set once at boot and
+// auto-adopts any running compose project not already in projects.json, so an
+// operator never has to register a project that's already up. Stopped projects
+// already in the registry are untouched.
+func (a *app) enrichProjectsOnce(ctx context.Context) {
+	sctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	_, live, err := a.docker.snapshot(sctx)
+	if err != nil {
+		slog.Warn("project enrichment skipped — snapshot failed", "error", err)
+		return
+	}
+	a.projects.enrichFromLive(live)
 }
 
 // startReconcile POSTs this agent's authoritative job set to the controller on

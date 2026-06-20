@@ -46,6 +46,11 @@ func newFleetHub(a *app) *fleetHub {
 		if err != nil {
 			return fleetEnvelope{}, err
 		}
+		// Merge stopped-but-registered projects so a managed stack appears even
+		// when all its containers are down, and flag running ones as Managed.
+		if a.projects != nil {
+			projects = a.projects.mergeKnown(projects)
+		}
 		return fleetEnvelope{
 			Type: "snapshot",
 			Data: DockerSnapshot{

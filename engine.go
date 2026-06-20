@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Operation names. Container-scoped lifecycle ops (Phase 1) act on a single
@@ -20,7 +21,22 @@ const (
 	opContainerRemove     = "container.remove"
 	opContainerKill       = "container.kill"
 	opContainerBulkPrefix = "container.bulk." // + verb (start|stop|restart|kill|remove)
+
+	// Compose project ops (Phase 2) — project-scoped, run via the in-process
+	// compose-v2 library (compose.go). The Job's Project names the target stack.
+	opComposeUp       = "up"
+	opComposeDown     = "down"
+	opComposePull     = "pull"
+	opComposeRestart  = "restart"
+	opComposeRecreate = "recreate"
 )
+
+// composeOps is the set of valid project ops — used for dispatch + request
+// validation (handlers.go).
+var composeOps = map[string]bool{
+	opComposeUp: true, opComposeDown: true, opComposePull: true,
+	opComposeRestart: true, opComposeRecreate: true,
+}
 
 // engine executes a Job's operation against the docker engine, streaming output
 // to the job's log ring (j.appendLine) and emitting lifecycle events via
@@ -33,20 +49,32 @@ const (
 //   - Phase 3.5: the stack-update engine (resolve→snapshot→pull+up→health-wait→
 //     rollback).
 type engine struct {
-	cfg    Config
-	docker *dockerClient
+	cfg      Config
+	docker   *dockerClient
+	compose  *composeBackend  // in-process compose-v2 SDK (nil if init failed)
+	projects *composeRegistry // durable project index
 
 	// bulkConcurrency caps simultaneous container ops in a bulk fan-out (the
 	// duplicacy DUPLICACY_MAX_CONCURRENT_* posture — keep the Pi from thrashing).
 	bulkConcurrency int
+	// composeOpTimeout bounds one compose op so a wedged pull/up can't run
+	// forever; cancellation still works via the job context.
+	composeOpTimeout time.Duration
 }
 
-func newEngine(cfg Config, dc *dockerClient) *engine {
+func newEngine(cfg Config, dc *dockerClient, cb *composeBackend, reg *composeRegistry) *engine {
 	bc := getEnvInt("DOCKER_BULK_CONCURRENCY", defaultBulkConcurrency())
 	if bc < 1 {
 		bc = 1
 	}
-	return &engine{cfg: cfg, docker: dc, bulkConcurrency: bc}
+	return &engine{
+		cfg:              cfg,
+		docker:           dc,
+		compose:          cb,
+		projects:         reg,
+		bulkConcurrency:  bc,
+		composeOpTimeout: getEnvDuration("DOCKER_COMPOSE_OP_TIMEOUT", 30*time.Minute),
+	}
 }
 
 // defaultBulkConcurrency derives from the (cgroup-accurate, Go 1.25) GOMAXPROCS
@@ -77,7 +105,9 @@ func (e *engine) run(ctx context.Context, j *Job, onChange func(JobEvent), fleet
 		e.runContainerOp(ctx, j, strings.TrimPrefix(op, "container."), fleetTrigger)
 	case strings.HasPrefix(op, opContainerBulkPrefix):
 		e.runBulk(ctx, j, strings.TrimPrefix(op, opContainerBulkPrefix), fleetTrigger)
-	// Phase 2/3.5 add compose ops (up/down/pull/restart, update) here.
+	case composeOps[op]:
+		e.runComposeOp(ctx, j, op, fleetTrigger)
+	// Phase 3.5 adds the stack-update op ("update") here.
 	default:
 		j.markFailed("unsupported operation: " + op)
 		slog.Warn("job with unsupported operation", "id", j.snapshot().ID, "operation", op)
@@ -157,6 +187,59 @@ func (e *engine) runBulk(ctx context.Context, j *Job, verb string, fleetTrigger 
 		j.appendLine(fmt.Sprintf("all %d %s ok", total, verb))
 		j.markCompleted()
 	}
+	fleetTrigger()
+}
+
+// runComposeOp executes a project-scoped compose op (up/down/pull/restart/
+// recreate) via the in-process compose-v2 library. Progress + stream output are
+// funneled into the job log by the per-job api.Compose (compose.go); cancellation
+// flows through the job context, and composeOpTimeout bounds a wedged op.
+func (e *engine) runComposeOp(ctx context.Context, j *Job, op string, fleetTrigger func()) {
+	if e.compose == nil {
+		j.markFailed("compose backend unavailable")
+		return
+	}
+	name := j.snapshot().Project
+	if name == "" {
+		j.markFailed("no target project")
+		return
+	}
+
+	// Resolve from the durable registry first; fall back to live container
+	// labels so an ad-hoc / not-yet-registered running project is still operable.
+	entry, ok := e.projects.get(name)
+	if !ok {
+		if _, live, err := e.docker.snapshot(ctx); err == nil {
+			entry, ok = e.projects.resolve(name, live)
+		}
+	}
+	if !ok {
+		j.markFailed("unknown project: " + name)
+		return
+	}
+
+	opCtx := ctx
+	if e.composeOpTimeout > 0 {
+		var cancel context.CancelFunc
+		opCtx, cancel = context.WithTimeout(ctx, e.composeOpTimeout)
+		defer cancel()
+	}
+
+	j.appendLine(fmt.Sprintf("compose %s %s (%s)", op, name, entry.WorkingDir))
+	if err := e.compose.execute(opCtx, j, op, entry, fleetTrigger); err != nil {
+		if ctx.Err() != nil {
+			// Cancelled (or timed out) — let the cancel path own the terminal state.
+			j.appendLine("cancelled")
+			j.markFailed("cancelled: " + err.Error())
+		} else {
+			j.appendLine("error: " + err.Error())
+			j.markFailed(err.Error())
+		}
+		fleetTrigger()
+		return
+	}
+	j.appendLine(fmt.Sprintf("compose %s %s ok", op, name))
+	j.markCompleted()
 	fleetTrigger()
 }
 

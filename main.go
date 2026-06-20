@@ -87,6 +87,16 @@ func registerRoutes(r *gin.Engine, app *app) {
 	r.DELETE("/v1/containers/:id", app.handleContainerRemove)
 	r.POST("/v1/containers/bulk", app.handleContainerBulk)
 
+	// Compose project ops + registry (Phase 2) — ops are long async jobs
+	// (202 + job id), CRUD/copy are synchronous. All ride the ProxyHandler
+	// catch-all (no new router code). Project name is the path param.
+	r.GET("/v1/projects", app.handleListProjects)
+	r.POST("/v1/projects", app.handleRegisterProject)
+	r.DELETE("/v1/projects/:name", app.handleDeregisterProject)
+	r.POST("/v1/projects/:name/op", app.handleComposeOp)
+	r.GET("/v1/projects/:name/bundle", app.handleProjectBundle)
+	r.POST("/v1/projects/:name/copy", app.handleCopyProject)
+
 	r.GET("/ws/jobs/:id/logs", app.handleJobLogsWS)
 	r.GET("/ws/fleet", app.handleFleetWS)
 }

@@ -61,6 +61,10 @@ type ComposeProject struct {
 	ContainerCount int      `json:"container_count"`
 	RunningCount   int      `json:"running_count"`
 	Containers     []string `json:"containers"`
+	// Managed is true when this project is in the durable compose registry
+	// (projects.json) — set by composeRegistry.mergeKnown when building the fleet
+	// snapshot, so the UI can distinguish managed stacks from ad-hoc ones.
+	Managed bool `json:"managed,omitempty"`
 }
 
 // dockerClient wraps the moby Engine API client. Phase 0 uses it read-only
