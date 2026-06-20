@@ -21,9 +21,13 @@ import (
 
 // composeOpBody is the body for POST /v1/projects/:name/op.
 type composeOpBody struct {
-	Op         string `json:"op"`                // up|down|pull|restart|recreate
+	Op         string `json:"op"`                // up|down|pull|restart|recreate|update
 	Timeout    *int   `json:"timeout,omitempty"` // restart: container stop grace seconds
 	TriggerKey string `json:"trigger_key,omitempty"`
+	// Stack-update (op=update) options. OverrideImage deploys an exact image
+	// (traefik/manual); OverrideService targets a specific service for the override.
+	OverrideImage   string `json:"override_image,omitempty"`
+	OverrideService string `json:"override_service,omitempty"`
 }
 
 func (a *app) handleComposeOp(c *gin.Context) {
@@ -37,8 +41,8 @@ func (a *app) handleComposeOp(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if !composeOps[body.Op] {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "op must be one of up|down|pull|restart|recreate"})
+	if !projectOps[body.Op] {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "op must be one of up|down|pull|restart|recreate|update"})
 		return
 	}
 	if a.compose == nil {
@@ -50,10 +54,12 @@ func (a *app) handleComposeOp(c *gin.Context) {
 		return
 	}
 	j := a.reg.start(context.Background(), JobRequest{
-		Operation:  body.Op,
-		Project:    name,
-		Timeout:    body.Timeout,
-		TriggerKey: orDefault(body.TriggerKey, "ui"),
+		Operation:       body.Op,
+		Project:         name,
+		Timeout:         body.Timeout,
+		OverrideImage:   body.OverrideImage,
+		OverrideService: body.OverrideService,
+		TriggerKey:      orDefault(body.TriggerKey, "ui"),
 	})
 	c.JSON(http.StatusAccepted, gin.H{"job_id": j.ID, "state": j.snapshot().State})
 }

@@ -109,6 +109,34 @@ func (b *composeBackend) execute(ctx context.Context, j *Job, op string, e Proje
 	return fmt.Errorf("unknown compose op %q", op)
 }
 
+// pullProject pulls the images for an ALREADY-LOADED (and possibly image-mutated)
+// project via a per-job compose service, so progress lands in the job log. Used
+// by the Phase-3.5 update engine, which mutates project.Services[*].Image
+// in-memory before deploying — it must NOT reload from disk (loadProject) or the
+// resolver's target tags would be lost.
+func (b *composeBackend) pullProject(ctx context.Context, j *Job, project *types.Project, fleetTrigger func()) error {
+	svc, err := b.serviceForJob(j, fleetTrigger)
+	if err != nil {
+		return fmt.Errorf("compose service: %w", err)
+	}
+	return svc.Pull(ctx, project, api.PullOptions{IgnoreFailures: false})
+}
+
+// upProject runs `up` (create+start) on an already-loaded project with the given
+// recreate strategy (api.RecreateForce for an update/rollback). Pull is governed
+// by each service's PullPolicy on the project model (the engine sets "never" on
+// rollback so it redeploys the snapshot image IDs without re-pulling).
+func (b *composeBackend) upProject(ctx context.Context, j *Job, project *types.Project, recreate string, fleetTrigger func()) error {
+	svc, err := b.serviceForJob(j, fleetTrigger)
+	if err != nil {
+		return fmt.Errorf("compose service: %w", err)
+	}
+	return svc.Up(ctx, project, api.UpOptions{
+		Create: api.CreateOptions{Recreate: recreate, RemoveOrphans: true, QuietPull: true},
+		Start:  api.StartOptions{Project: project},
+	})
+}
+
 // jobTimeoutDur converts the job's optional timeout (seconds) to the
 // *time.Duration the compose options expect; nil = engine/image default.
 func jobTimeoutDur(j *Job) *time.Duration {

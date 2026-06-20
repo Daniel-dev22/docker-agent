@@ -61,6 +61,7 @@ func newApp(_ context.Context, cfg Config) (*app, error) {
 
 	a := &app{cfg: cfg, cc: cc, docker: dc, compose: cb, projects: projects, events: events, reg: reg}
 	a.images = newImageChecker(cfg, dc, cc)
+	eng.setImageChecker(a.images) // Phase 3.5: update engine reuses strategy + clients
 	a.fleet = newFleetHub(a)
 	reg.setFleet(a.fleet)
 	return a, nil

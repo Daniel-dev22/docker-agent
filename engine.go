@@ -29,13 +29,27 @@ const (
 	opComposePull     = "pull"
 	opComposeRestart  = "restart"
 	opComposeRecreate = "recreate"
+
+	// Stack-update engine (Phase 3.5) — the Portainer fold-in. Resolves each
+	// service's target image, snapshots for rollback, pull+up, health-waits, and
+	// rolls back on failure. Project-scoped like the compose ops, but driven by
+	// stackengine.go (updateProject), not the plain compose.execute path.
+	opComposeUpdate = "update"
 )
 
-// composeOps is the set of valid project ops — used for dispatch + request
-// validation (handlers.go).
+// composeOps is the set of plain compose ops (compose.go) — used for dispatch +
+// request validation. The stack-update op ("update") is dispatched separately
+// (stackengine.go) so it is intentionally NOT in this set.
 var composeOps = map[string]bool{
 	opComposeUp: true, opComposeDown: true, opComposePull: true,
 	opComposeRestart: true, opComposeRecreate: true,
+}
+
+// projectOps is the full set of valid POST /v1/projects/:name/op values
+// (the plain compose ops plus the stack-update op) — used for request validation.
+var projectOps = map[string]bool{
+	opComposeUp: true, opComposeDown: true, opComposePull: true,
+	opComposeRestart: true, opComposeRecreate: true, opComposeUpdate: true,
 }
 
 // engine executes a Job's operation against the docker engine, streaming output
@@ -53,6 +67,12 @@ type engine struct {
 	docker   *dockerClient
 	compose  *composeBackend  // in-process compose-v2 SDK (nil if init failed)
 	projects *composeRegistry // durable project index
+	// images is the Phase-3 image-outdated checker, reused by the Phase-3.5
+	// stack-update engine for strategy resolution (central overrides + auto-detect)
+	// and its registry/github clients. Set via setImageChecker after construction
+	// (app.go wires it once the checker exists). nil → update falls back to a
+	// pull-only deploy with no version resolution.
+	images *imageChecker
 
 	// bulkConcurrency caps simultaneous container ops in a bulk fan-out (the
 	// duplicacy DUPLICACY_MAX_CONCURRENT_* posture — keep the Pi from thrashing).
@@ -61,6 +81,10 @@ type engine struct {
 	// forever; cancellation still works via the job context.
 	composeOpTimeout time.Duration
 }
+
+// setImageChecker wires the Phase-3 checker into the engine for the Phase-3.5
+// update path (strategy resolution + shared registry/github clients).
+func (e *engine) setImageChecker(ic *imageChecker) { e.images = ic }
 
 func newEngine(cfg Config, dc *dockerClient, cb *composeBackend, reg *composeRegistry) *engine {
 	bc := getEnvInt("DOCKER_BULK_CONCURRENCY", defaultBulkConcurrency())
@@ -105,9 +129,10 @@ func (e *engine) run(ctx context.Context, j *Job, onChange func(JobEvent), fleet
 		e.runContainerOp(ctx, j, strings.TrimPrefix(op, "container."), fleetTrigger)
 	case strings.HasPrefix(op, opContainerBulkPrefix):
 		e.runBulk(ctx, j, strings.TrimPrefix(op, opContainerBulkPrefix), fleetTrigger)
+	case op == opComposeUpdate:
+		e.runUpdate(ctx, j, fleetTrigger)
 	case composeOps[op]:
 		e.runComposeOp(ctx, j, op, fleetTrigger)
-	// Phase 3.5 adds the stack-update op ("update") here.
 	default:
 		j.markFailed("unsupported operation: " + op)
 		slog.Warn("job with unsupported operation", "id", j.snapshot().ID, "operation", op)

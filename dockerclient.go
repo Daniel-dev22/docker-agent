@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"regexp"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/stdcopy"
 )
 
 // Compose labels written by docker compose on every managed container.
@@ -284,4 +286,86 @@ func (d *dockerClient) containerLogsFollow(ctx context.Context, id string) (io.R
 		Timestamps: true,
 		Tail:       "500",
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Inspect helpers (Phase 3.5 stack-update engine: health-wait + net reconcile).
+// One ContainerInspect per container, used ONLY in the update pipeline (a
+// deliberate op), never in the fleet snapshot's single ContainerList pass.
+// ---------------------------------------------------------------------------
+
+// containerState is the slice of a container inspect the health-wait needs —
+// the Go equivalent of docker_health_wait.py's
+// `Id|health|restart_count|running` format string (no subprocess, no parsing).
+type containerState struct {
+	ID           string
+	Health       string // healthy|unhealthy|starting|none
+	RestartCount int
+	Running      bool
+}
+
+// inspectState returns a container's id, health status, restart count, and
+// running flag. A missing container surfaces as an error (the caller treats it
+// as "being recreated" during swap detection, exactly like the python).
+func (d *dockerClient) inspectState(ctx context.Context, nameOrID string) (containerState, error) {
+	resp, err := d.cli.ContainerInspect(ctx, nameOrID)
+	if err != nil {
+		return containerState{}, err
+	}
+	st := containerState{ID: resp.ID, Health: "none", RestartCount: resp.RestartCount}
+	if resp.State != nil {
+		st.Running = resp.State.Running
+		if resp.State.Health != nil && resp.State.Health.Status != "" {
+			st.Health = resp.State.Health.Status
+		}
+	}
+	return st, nil
+}
+
+// containerNetworks returns the set of network names a container is currently
+// attached to (Phase 3.5 net reconcile: detect containers detached from a
+// recreated network).
+func (d *dockerClient) containerNetworks(ctx context.Context, nameOrID string) (map[string]struct{}, error) {
+	resp, err := d.cli.ContainerInspect(ctx, nameOrID)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]struct{}{}
+	if resp.NetworkSettings != nil {
+		for name := range resp.NetworkSettings.Networks {
+			out[name] = struct{}{}
+		}
+	}
+	return out, nil
+}
+
+// containerLogsTail returns the last `tail` lines of a container's combined
+// stdout+stderr (Phase 3.5: dump an unhealthy container's logs into the update
+// job log on rollback). Non-following, demuxed.
+func (d *dockerClient) containerLogsTail(ctx context.Context, nameOrID, tail string) ([]string, error) {
+	rc, err := d.cli.ContainerLogs(ctx, nameOrID, container.LogsOptions{
+		ShowStdout: true, ShowStderr: true, Tail: tail,
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	var buf bytes.Buffer
+	if _, err := stdcopy.StdCopy(&buf, &buf, rc); err != nil {
+		// TTY containers aren't multiplexed — fall back to raw on demux failure.
+		buf.Reset()
+		rc2, e2 := d.cli.ContainerLogs(ctx, nameOrID, container.LogsOptions{ShowStdout: true, ShowStderr: true, Tail: tail})
+		if e2 != nil {
+			return nil, e2
+		}
+		defer rc2.Close()
+		_, _ = io.Copy(&buf, rc2)
+	}
+	var lines []string
+	for _, ln := range strings.Split(buf.String(), "\n") {
+		if strings.TrimSpace(ln) != "" {
+			lines = append(lines, ln)
+		}
+	}
+	return lines, nil
 }

@@ -72,6 +72,22 @@ type strategyOverride struct {
 	TagExcludes   []string `json:"tag_excludes"`
 	Image         string   `json:"image"`
 	Service       string   `json:"service"`
+
+	// Resolver half (Phase 3.5) — the `update` engine's deploy step. VersionSource
+	// (above) answers "is something newer?"; these answer "what do I deploy?".
+	// ImageResolver defaults are derived from VersionSource when empty (see
+	// resolvers.go resolverFor): registry-digest→registry, github-release→registry
+	// (single-service) / upstream-compose (immich, when ServiceMap set),
+	// github-branch→registry, override→override.
+	ImageResolver    string            `json:"image_resolver,omitempty"`    // registry|upstream-compose|build-agent|override
+	ServiceMap       map[string]string `json:"service_map,omitempty"`       // upstream-compose: local service → upstream service name
+	UpstreamCompose  string            `json:"upstream_compose,omitempty"`  // upstream compose path template ({tag} substituted); default immich's docker/docker-compose.yml
+	BuildDescriptor  string            `json:"build_descriptor,omitempty"`  // build-agent: descriptor/service to build (e.g. "genmon")
+	BuildBranch      string            `json:"build_branch,omitempty"`      // build-agent: branch override (frigate custom)
+	RollbackScope    string            `json:"rollback_scope,omitempty"`    // per-container (default) | whole-stack (immich)
+	HealthStrategy   string            `json:"health_strategy,omitempty"`   // docker-health-wait (default) | http-probe
+	HealthContainers []string          `json:"health_containers,omitempty"` // subset of containers to health-check (frigate)
+	HealthExcludes   []string          `json:"health_excludes,omitempty"`   // containers with no shell/healthcheck (portainer, adguardhome-sync)
 }
 
 // effStrategy is the resolved per-image strategy (auto or override).
@@ -380,6 +396,25 @@ func (ic *imageChecker) refreshOverrides(ctx context.Context) {
 	ic.mu.Lock()
 	ic.overrides = m
 	ic.mu.Unlock()
+}
+
+// projectOverride returns the project-scoped override for a project name, if any
+// (the resolver-selection input for the Phase-3.5 update engine). Service-scoped
+// rows (o.Service != "") are intentionally NOT returned here — the engine selects
+// ONE resolver per project; per-service tweaks ride the registry resolver via
+// resolveStrategy/matchOverride.
+func (ic *imageChecker) projectOverride(name string) (strategyOverride, bool) {
+	ic.mu.RLock()
+	defer ic.mu.RUnlock()
+	for _, o := range ic.overrides {
+		if o.MatchType == "image" {
+			continue
+		}
+		if o.Key == name && o.Service == "" {
+			return o, true
+		}
+	}
+	return strategyOverride{}, false
 }
 
 // matchOverride finds an override for a container: project-scoped (optionally

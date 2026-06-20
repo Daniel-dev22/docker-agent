@@ -65,11 +65,13 @@ func (r *jobRegistry) start(parentCtx context.Context, req JobRequest) *Job {
 			ID: id, Project: req.Project, Operation: req.Operation,
 			Target: req.Target, State: JobPending, TriggerKey: req.TriggerKey,
 		},
-		targets:     req.Targets,
-		force:       req.Force,
-		timeout:     req.Timeout,
-		cancel:      cancel,
-		subscribers: map[chan string]struct{}{},
+		targets:         req.Targets,
+		force:           req.Force,
+		timeout:         req.Timeout,
+		overrideImage:   req.OverrideImage,
+		overrideService: req.OverrideService,
+		cancel:          cancel,
+		subscribers:     map[chan string]struct{}{},
 	}
 
 	r.mu.Lock()

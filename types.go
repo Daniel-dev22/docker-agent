@@ -68,6 +68,11 @@ type JobRequest struct {
 	Force      bool     `json:"force,omitempty"`
 	Timeout    *int     `json:"timeout,omitempty"`
 	TriggerKey string   `json:"trigger_key,omitempty"`
+	// Stack-update (Phase 3.5) options. OverrideImage deploys an exact image (the
+	// traefik/manual path); OverrideService names the target service when a
+	// multi-service project's override target can't be inferred. In-memory only.
+	OverrideImage   string `json:"override_image,omitempty"`
+	OverrideService string `json:"override_service,omitempty"`
 }
 
 // jobPublic carries the JSON-serializable fields of a Job, split out so
@@ -98,6 +103,9 @@ type Job struct {
 	targets []string
 	force   bool
 	timeout *int
+	// Stack-update (Phase 3.5) op params — in-memory, set at construction.
+	overrideImage   string
+	overrideService string
 
 	mu          sync.Mutex
 	cancel      context.CancelFunc
