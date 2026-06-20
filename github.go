@@ -1,0 +1,533 @@
+package main
+
+// GitHub version sources (Phase 3).
+//
+// Ports two ansible modules into one in-agent client:
+//   - github_releases.py  → githubClient.latestRelease  (release-tagged stacks:
+//     traefik/immich/genmon/portainer — semver sort, prerelease/draft filter,
+//     name_filter, tag_exclude)
+//   - github_package_versions.py → githubClient.latestPackageVersion (frigate
+//     github-branch: GH Packages versions minus the filter-branch CI SHAs, custom
+//     branch head, registry-existence verify of candidates)
+//
+// GitHub auth = reuse build-agent's GitHub App installation-token vend through the
+// controller (POST /api/docker/github-token). Unauthenticated GitHub is 60/hr →
+// a fleet would 429 immediately, so a token is required. The token is cached
+// per-agent (the router/minter caches too); 300s result TTL + bounded concurrency
+// (imagecheck.go) keep us far under the ~15k/hr ceiling.
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+const githubAPIBase = "https://api.github.com"
+
+// ---------------------------------------------------------------------------
+// Token vend (agent → controller). build-agent keeps this in network.go; the
+// docker-agent's network.go was cloned without it, so it lives here pointed at
+// the docker backend's endpoint.
+// ---------------------------------------------------------------------------
+
+type githubTokenResp struct {
+	Token     string    `json:"token"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+func readErrorBody(r io.Reader) string {
+	b, _ := io.ReadAll(io.LimitReader(r, 2048))
+	return strings.TrimSpace(string(b))
+}
+
+// githubClient mints + caches an installation token and queries the GitHub API
+// directly (public internet egress; NOT through the cc dial-rewriter — that path
+// is only for controller). registry is shared for the existence gate.
+type githubClient struct {
+	cc       *http.Client // controller client (bearer + dial rewrite) — token vend only
+	ccURL    string
+	api      *http.Client // plain pooled client for api.github.com
+	registry *registryClient
+
+	mu       sync.Mutex
+	token    string
+	tokenExp time.Time
+}
+
+func newGithubClient(cc *http.Client, ccURL string, registry *registryClient) *githubClient {
+	return &githubClient{
+		cc:       cc,
+		ccURL:    ccURL,
+		api:      &http.Client{Timeout: 30 * time.Second, Transport: pooledTransport(false)},
+		registry: registry,
+	}
+}
+
+// ensureToken returns a valid installation token, vending a fresh one through the
+// controller when the cache is empty or within 5 minutes of expiry.
+func (g *githubClient) ensureToken(ctx context.Context) (string, error) {
+	g.mu.Lock()
+	if g.token != "" && time.Now().Before(g.tokenExp.Add(-5*time.Minute)) {
+		tok := g.token
+		g.mu.Unlock()
+		return tok, nil
+	}
+	g.mu.Unlock()
+
+	if g.cc == nil || g.ccURL == "" {
+		return "", fmt.Errorf("controller client/url not configured")
+	}
+	body, _ := json.Marshal(map[string]any{"repositories": []string{}})
+	url := g.ccURL + "/api/docker/github-token"
+
+	const maxAttempts = 4
+	backoff := 500 * time.Millisecond
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return "", fmt.Errorf("token vend ctx done: %w", ctx.Err())
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+		}
+		tok, transient, err := g.vendOnce(ctx, url, body)
+		if err == nil {
+			g.mu.Lock()
+			g.token, g.tokenExp = tok.Token, tok.ExpiresAt
+			g.mu.Unlock()
+			return tok.Token, nil
+		}
+		if !transient {
+			return "", err
+		}
+		lastErr = err
+	}
+	return "", fmt.Errorf("github-token vend failed after %d attempts: %w", maxAttempts, lastErr)
+}
+
+func (g *githubClient) vendOnce(ctx context.Context, url string, body []byte) (githubTokenResp, bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return githubTokenResp{}, false, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := g.cc.Do(req)
+	if err != nil {
+		return githubTokenResp{}, true, fmt.Errorf("call controller: %w", err)
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return githubTokenResp{}, false, fmt.Errorf("controller rejected token vend (%d): %s", resp.StatusCode, readErrorBody(resp.Body))
+	case http.StatusServiceUnavailable, http.StatusBadGateway, http.StatusGatewayTimeout, http.StatusInternalServerError:
+		return githubTokenResp{}, true, fmt.Errorf("controller transient %d: %s", resp.StatusCode, readErrorBody(resp.Body))
+	default:
+		return githubTokenResp{}, false, fmt.Errorf("controller returned %d: %s", resp.StatusCode, readErrorBody(resp.Body))
+	}
+	var t githubTokenResp
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&t); err != nil {
+		return githubTokenResp{}, false, fmt.Errorf("decode vend response: %w", err)
+	}
+	if t.Token == "" {
+		return githubTokenResp{}, false, fmt.Errorf("vend response missing token")
+	}
+	return t, false, nil
+}
+
+// apiGet performs an authenticated GitHub API GET, returning the decoded body and
+// the raw response (for the Link header on paginated calls).
+func (g *githubClient) apiGet(ctx context.Context, url string, out any) (*http.Response, error) {
+	token, err := g.ensureToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	req.Header.Set("User-Agent", "docker-agent-imagecheck/1.0")
+	resp, err := g.api.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		body := readErrorBody(resp.Body)
+		resp.Body.Close()
+		return resp, fmt.Errorf("GitHub %d: %s", resp.StatusCode, body)
+	}
+	if out != nil {
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<20)).Decode(out); err != nil {
+			resp.Body.Close()
+			return resp, fmt.Errorf("decode GitHub response: %w", err)
+		}
+	}
+	resp.Body.Close()
+	return resp, nil
+}
+
+// ---------------------------------------------------------------------------
+// Semver (port of github_releases.parse_semver).
+// ---------------------------------------------------------------------------
+
+var semverRe = regexp.MustCompile(`(?i)^(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:[-.]?(alpha|beta|rc|dev)[-.]?(\d+)?)?`)
+
+// semver is (major, minor, patch, prereleasePriority, prereleaseNum). A stable
+// release sorts above any prerelease (priority 5); dev<alpha<beta<rc<stable.
+type semver [5]int
+
+func parseSemver(v string) semver {
+	if v == "" {
+		return semver{}
+	}
+	v = strings.TrimLeft(v, "vV")
+	m := semverRe.FindStringSubmatch(v)
+	if m == nil {
+		return semver{}
+	}
+	atoi := func(s string) int { n, _ := strconv.Atoi(s); return n }
+	prio := 5 // stable
+	if m[4] != "" {
+		switch strings.ToLower(m[4]) {
+		case "dev":
+			prio = 1
+		case "alpha":
+			prio = 2
+		case "beta":
+			prio = 3
+		case "rc":
+			prio = 4
+		default:
+			prio = 0
+		}
+	}
+	return semver{atoi(m[1]), atoi(m[2]), atoi(m[3]), prio, atoi(m[5])}
+}
+
+// cmp returns -1/0/1 comparing a to b.
+func (a semver) cmp(b semver) int {
+	for i := range a {
+		if a[i] != b[i] {
+			if a[i] < b[i] {
+				return -1
+			}
+			return 1
+		}
+	}
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// github-release source (traefik/immich/genmon/portainer).
+// ---------------------------------------------------------------------------
+
+type ghRelease struct {
+	TagName    string `json:"tag_name"`
+	Name       string `json:"name"`
+	Draft      bool   `json:"draft"`
+	Prerelease bool   `json:"prerelease"`
+}
+
+// releaseQuery configures a github-release lookup (mirrors the ansible repo
+// config dict).
+type releaseQuery struct {
+	Repo        string // owner/repo
+	ReleaseType string // "latest" (default) | "stable"
+	NameFilter  string // e.g. "STS" (portainer)
+	TagExclude  string // regex, e.g. "-ea" (traefik)
+	FetchCount  int    // releases to scan when filtering (default 30)
+}
+
+// latestRelease returns the newest release tag for q. When release_type=latest
+// and no name_filter, it uses the cheap /releases/latest endpoint; otherwise it
+// scans /releases, drops draft/prerelease (stable) or non-matching names, applies
+// the tag-exclude regex, and semver-sorts.
+func (g *githubClient) latestRelease(ctx context.Context, q releaseQuery) (string, error) {
+	if q.FetchCount <= 0 {
+		q.FetchCount = 30
+	}
+	if q.ReleaseType == "latest" && q.NameFilter == "" {
+		var rel ghRelease
+		if _, err := g.apiGet(ctx, fmt.Sprintf("%s/repos/%s/releases/latest", githubAPIBase, q.Repo), &rel); err != nil {
+			return "", err
+		}
+		return rel.TagName, nil
+	}
+
+	var rels []ghRelease
+	if _, err := g.apiGet(ctx, fmt.Sprintf("%s/repos/%s/releases?per_page=%d", githubAPIBase, q.Repo, q.FetchCount), &rels); err != nil {
+		return "", err
+	}
+
+	var excludeRe *regexp.Regexp
+	if q.TagExclude != "" {
+		excludeRe = regexp.MustCompile(q.TagExclude)
+	}
+	filtered := rels[:0]
+	for _, r := range rels {
+		if excludeRe != nil && excludeRe.MatchString(r.TagName) {
+			continue
+		}
+		if r.Draft {
+			continue
+		}
+		if q.NameFilter != "" {
+			if !strings.Contains(strings.ToLower(r.Name), strings.ToLower(q.NameFilter)) {
+				continue
+			}
+		} else if q.ReleaseType == "stable" && r.Prerelease {
+			continue
+		}
+		filtered = append(filtered, r)
+	}
+	if len(filtered) == 0 {
+		return "", fmt.Errorf("no matching releases for %s", q.Repo)
+	}
+	sort.SliceStable(filtered, func(i, j int) bool {
+		return parseSemver(filtered[i].TagName).cmp(parseSemver(filtered[j].TagName)) > 0
+	})
+	return filtered[0].TagName, nil
+}
+
+// ---------------------------------------------------------------------------
+// github-branch source (frigate) — port of github_package_versions.py.
+// ---------------------------------------------------------------------------
+
+// customBranchRe matches a custom/dev tag like "0.15-abc1234-amd64".
+var customBranchRe = regexp.MustCompile(`^(\d+\.\d+)(?:\.\d+)?-`)
+
+// shaTailRe extracts the trailing commit SHA from a stripped tag.
+var shaTailRe = regexp.MustCompile(`-([a-f0-9]{7,})$`)
+
+type branchQuery struct {
+	Owner        string   // ghcr owner (blakeblackshear)
+	Package      string   // container package (frigate)
+	Repo         string   // owner/repo for commit/branch lookups
+	FilterBranch string   // default "master"
+	ArchSuffix   string   // default "amd64"
+	TagExcludes  []string // default ["cache","h8l"]
+	Registry     string   // default "ghcr.io"
+	CurrentTag   string   // the running image tag
+}
+
+type branchResult struct {
+	VersionStatus string // outdated|updated|unknown
+	LatestImage   string // full registry/owner/package:tag-arch
+	LatestTag     string
+	CurrentParsed string
+}
+
+type parsedTag struct {
+	custom  bool
+	branch  string
+	version string
+	strip   string
+}
+
+func parseCurrentTag(tag, arch string) parsedTag {
+	strip := tag
+	if arch != "" {
+		strip = strings.TrimSuffix(strip, "-"+arch)
+	}
+	if m := customBranchRe.FindStringSubmatch(strip); m != nil {
+		version := strip
+		if sm := shaTailRe.FindStringSubmatch(strip); sm != nil {
+			version = sm[1]
+		}
+		return parsedTag{custom: true, branch: m[1], version: version, strip: strip}
+	}
+	return parsedTag{custom: false, version: strip, strip: strip}
+}
+
+// latestPackageVersion runs the frigate-style github-branch check.
+func (g *githubClient) latestPackageVersion(ctx context.Context, q branchQuery) (branchResult, error) {
+	if q.FilterBranch == "" {
+		q.FilterBranch = "master"
+	}
+	if q.ArchSuffix == "" {
+		q.ArchSuffix = "amd64"
+	}
+	if q.Registry == "" {
+		q.Registry = "ghcr.io"
+	}
+	if len(q.TagExcludes) == 0 {
+		q.TagExcludes = []string{"cache", "h8l"}
+	}
+	cur := parseCurrentTag(q.CurrentTag, q.ArchSuffix)
+	res := branchResult{VersionStatus: "unknown", CurrentParsed: cur.strip}
+
+	if cur.custom {
+		head, err := g.branchHead(ctx, q.Repo, cur.branch)
+		if err != nil || head == "" {
+			return res, err
+		}
+		if g.verifyImage(ctx, q, head) {
+			res.LatestTag, res.LatestImage = head, g.imageRefFor(q, head)
+			if head != cur.version {
+				res.VersionStatus = "outdated"
+			} else {
+				res.VersionStatus = "updated"
+			}
+		}
+		return res, nil
+	}
+
+	branchSHAs, err := g.branchCommitSHAs(ctx, q.Repo, q.FilterBranch, 14)
+	if err != nil {
+		return res, err
+	}
+	tags, err := g.packageTags(ctx, q.Owner, q.Package, 5)
+	if err != nil {
+		return res, err
+	}
+	candidates := filterDedupeTags(tags, branchSHAs, q.TagExcludes)
+	if len(candidates) == 0 {
+		return res, nil
+	}
+	for i, tag := range candidates {
+		if i >= 5 {
+			break
+		}
+		if g.verifyImage(ctx, q, tag) {
+			res.LatestTag, res.LatestImage = tag, g.imageRefFor(q, tag)
+			if tag != cur.version {
+				res.VersionStatus = "outdated"
+			} else {
+				res.VersionStatus = "updated"
+			}
+			return res, nil
+		}
+	}
+	return res, nil
+}
+
+func (g *githubClient) imageRefFor(q branchQuery, tag string) string {
+	return fmt.Sprintf("%s/%s/%s:%s-%s", q.Registry, q.Owner, q.Package, tag, q.ArchSuffix)
+}
+
+func (g *githubClient) verifyImage(ctx context.Context, q branchQuery, tag string) bool {
+	ref := parseImageReference(g.imageRefFor(q, tag), "latest")
+	vctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	return g.registry.imageExists(vctx, ref)
+}
+
+// branchHead returns the latest commit SHA (7 chars) for a custom branch.
+func (g *githubClient) branchHead(ctx context.Context, repo, branch string) (string, error) {
+	var out struct {
+		Commit struct {
+			SHA string `json:"sha"`
+		} `json:"commit"`
+	}
+	if _, err := g.apiGet(ctx, fmt.Sprintf("%s/repos/%s/branches/%s", githubAPIBase, repo, branch), &out); err != nil {
+		return "", err
+	}
+	if len(out.Commit.SHA) >= 7 {
+		return out.Commit.SHA[:7], nil
+	}
+	return "", nil
+}
+
+// branchCommitSHAs returns recent commit SHAs (7 chars) on filterBranch for the
+// last `days`, used to drop CI/continuous builds from the package tag list.
+func (g *githubClient) branchCommitSHAs(ctx context.Context, repo, branch string, days int) (map[string]bool, error) {
+	since := time.Now().UTC().AddDate(0, 0, -days).Format("2006-01-02T15:04:05Z")
+	url := fmt.Sprintf("%s/repos/%s/commits?sha=%s&since=%s&per_page=100", githubAPIBase, repo, branch, since)
+	shas := map[string]bool{}
+	for url != "" {
+		var commits []struct {
+			SHA string `json:"sha"`
+		}
+		resp, err := g.apiGet(ctx, url, &commits)
+		if err != nil {
+			return shas, nil // best-effort: a commits failure shouldn't kill the whole check
+		}
+		for _, c := range commits {
+			if len(c.SHA) >= 7 {
+				shas[c.SHA[:7]] = true
+			}
+		}
+		url = nextLink(resp.Header.Get("Link"))
+	}
+	return shas, nil
+}
+
+var nextLinkRe = regexp.MustCompile(`<([^>]+)>;\s*rel="next"`)
+
+func nextLink(link string) string {
+	if m := nextLinkRe.FindStringSubmatch(link); m != nil {
+		return m[1]
+	}
+	return ""
+}
+
+// packageTags fetches all container tags from the GH Packages API (paginated).
+func (g *githubClient) packageTags(ctx context.Context, owner, pkg string, maxPages int) ([]string, error) {
+	var all []string
+	for page := 1; page <= maxPages; page++ {
+		url := fmt.Sprintf("%s/users/%s/packages/container/%s/versions?per_page=100&page=%d", githubAPIBase, owner, pkg, page)
+		var versions []struct {
+			Metadata struct {
+				Container struct {
+					Tags []string `json:"tags"`
+				} `json:"container"`
+			} `json:"metadata"`
+		}
+		if _, err := g.apiGet(ctx, url, &versions); err != nil {
+			if page == 1 {
+				return nil, err
+			}
+			break
+		}
+		if len(versions) == 0 {
+			break
+		}
+		for _, v := range versions {
+			all = append(all, v.Metadata.Container.Tags...)
+		}
+		if len(versions) < 100 {
+			break
+		}
+	}
+	return all, nil
+}
+
+// filterDedupeTags drops excluded tags, strips arch variants (everything after
+// the first '-'), dedupes preserving order, and removes filter-branch CI SHAs.
+func filterDedupeTags(tags []string, branchSHAs map[string]bool, excludes []string) []string {
+	var excludeRe *regexp.Regexp
+	if len(excludes) > 0 {
+		excludeRe = regexp.MustCompile("(?i)" + strings.Join(excludes, "|"))
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, t := range tags {
+		if excludeRe != nil && excludeRe.MatchString(t) {
+			continue
+		}
+		stripped := t
+		if i := strings.Index(stripped, "-"); i >= 0 {
+			stripped = stripped[:i]
+		}
+		if stripped == "" || seen[stripped] || branchSHAs[stripped] {
+			continue
+		}
+		seen[stripped] = true
+		out = append(out, stripped)
+	}
+	return out
+}

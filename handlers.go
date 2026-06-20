@@ -180,3 +180,29 @@ func (a *app) handleJobLogsWS(c *gin.Context) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Image-outdated detection (Phase 3). The results normally ride the /ws/fleet
+// snapshot (stamped onto containers/projects). These endpoints expose the raw
+// cache for debugging + a manual refresh trigger.
+// ---------------------------------------------------------------------------
+
+// handleImageChecks returns the raw cached image-check results (debug/inspect).
+func (a *app) handleImageChecks(c *gin.Context) {
+	if a.images == nil {
+		c.JSON(http.StatusOK, gin.H{"checks": []imageCheck{}})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"checks": a.images.snapshotCache()})
+}
+
+// handleImageCheckRefresh requests an out-of-band image-check pass (coalesced,
+// TTL-gated). Returns 202 — the next /ws/fleet snapshot carries fresh statuses.
+func (a *app) handleImageCheckRefresh(c *gin.Context) {
+	if a.images == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "image checker not running"})
+		return
+	}
+	a.images.Trigger()
+	c.JSON(http.StatusAccepted, gin.H{"triggered": true})
+}

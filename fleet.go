@@ -46,6 +46,12 @@ func newFleetHub(a *app) *fleetHub {
 		if err != nil {
 			return fleetEnvelope{}, err
 		}
+		// Stamp cached image-outdated results onto containers + roll up to
+		// projects (Phase 3). The checks come from the imageChecker's slow capped
+		// pass — this merge is O(n) map lookups, never a registry/GitHub call.
+		if a.images != nil {
+			stampImageStatus(containers, projects, a.images)
+		}
 		// Merge stopped-but-registered projects so a managed stack appears even
 		// when all its containers are down, and flag running ones as Managed.
 		if a.projects != nil {

@@ -49,6 +49,14 @@ type ContainerStatus struct {
 	ComposeProject string `json:"compose_project,omitempty"`
 	ComposeService string `json:"compose_service,omitempty"`
 	Ports          []Port `json:"ports,omitempty"`
+
+	// Image-outdated detection (Phase 3). Populated by the imageChecker's slow
+	// jittered pass (NEVER inline in this snapshot) and stamped onto the container
+	// during the fleet merge. Empty until the first check completes.
+	ImageStatus        string `json:"image_status,omitempty"`         // updated|outdated|unknown
+	LatestImageVersion string `json:"latest_image_version,omitempty"` // full name:tag of the newest available
+	VersionSource      string `json:"version_source,omitempty"`       // auto:registry-digest|auto:github-release|override:…
+	CurrentVersion     string `json:"current_version,omitempty"`      // running version (OCI version label or tag)
 }
 
 // ComposeProject groups containers sharing a compose project label. Phase 0
@@ -65,6 +73,11 @@ type ComposeProject struct {
 	// (projects.json) — set by composeRegistry.mergeKnown when building the fleet
 	// snapshot, so the UI can distinguish managed stacks from ad-hoc ones.
 	Managed bool `json:"managed,omitempty"`
+
+	// Rolled-up image-outdated status (Phase 3), computed from the project's
+	// containers during the fleet merge: outdated if ANY service is outdated.
+	ImageStatus   string `json:"image_status,omitempty"` // updated|outdated|unknown
+	OutdatedCount int    `json:"outdated_count,omitempty"`
 }
 
 // dockerClient wraps the moby Engine API client. Phase 0 uses it read-only
@@ -96,6 +109,31 @@ func newDockerClient(host string) (*dockerClient, error) {
 }
 
 func (d *dockerClient) close() error { return d.cli.Close() }
+
+// imageInfo is the subset of an image inspect the imageChecker needs: the local
+// content digests (for digest comparison) and the OCI labels (source repo +
+// running version for auto-detection).
+type imageInfo struct {
+	ID          string
+	RepoTags    []string
+	RepoDigests []string
+	Labels      map[string]string
+}
+
+// inspectImage returns the local image's RepoDigests + OCI labels (Phase 3
+// image-outdated detection). One inspect per UNIQUE image, run only in the
+// imageChecker's slow capped pass — never in the fleet snapshot's single pass.
+func (d *dockerClient) inspectImage(ctx context.Context, id string) (imageInfo, error) {
+	resp, err := d.cli.ImageInspect(ctx, id)
+	if err != nil {
+		return imageInfo{}, err
+	}
+	info := imageInfo{ID: resp.ID, RepoTags: resp.RepoTags, RepoDigests: resp.RepoDigests}
+	if resp.Config != nil {
+		info.Labels = resp.Config.Labels
+	}
+	return info, nil
+}
 
 // snapshot returns the full container list plus the compose-project grouping in a
 // single Engine API call — the bounded single-pass collection the plan requires.

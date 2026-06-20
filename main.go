@@ -97,6 +97,11 @@ func registerRoutes(r *gin.Engine, app *app) {
 	r.GET("/v1/projects/:name/bundle", app.handleProjectBundle)
 	r.POST("/v1/projects/:name/copy", app.handleCopyProject)
 
+	// Image-outdated detection (Phase 3) — raw cache + manual refresh; the live
+	// status normally rides the /ws/fleet snapshot.
+	r.GET("/v1/images/checks", app.handleImageChecks)
+	r.POST("/v1/images/refresh", app.handleImageCheckRefresh)
+
 	r.GET("/ws/jobs/:id/logs", app.handleJobLogsWS)
 	r.GET("/ws/fleet", app.handleFleetWS)
 }

@@ -24,6 +24,7 @@ type app struct {
 	events   *eventBuffer
 	reg      *jobRegistry
 	fleet    *fleetHub
+	images   *imageChecker
 }
 
 func newApp(_ context.Context, cfg Config) (*app, error) {
@@ -59,6 +60,7 @@ func newApp(_ context.Context, cfg Config) (*app, error) {
 	reg.setHook(events.handleJobEvent)
 
 	a := &app{cfg: cfg, cc: cc, docker: dc, compose: cb, projects: projects, events: events, reg: reg}
+	a.images = newImageChecker(cfg, dc, cc)
 	a.fleet = newFleetHub(a)
 	reg.setFleet(a.fleet)
 	return a, nil
@@ -78,6 +80,7 @@ func (a *app) startBackgroundWorkers(ctx context.Context) {
 	go a.fleet.Run(ctx)          // fleet broadcaster
 	go a.startReconcile(ctx)     //
 	go a.enrichProjectsOnce(ctx) // auto-adopt running compose projects into the registry
+	go a.images.Run(ctx)         // slow jittered image-outdated pass (Phase 3)
 }
 
 // enrichProjectsOnce reads the current container set once at boot and
