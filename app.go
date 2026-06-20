@@ -16,15 +16,16 @@ import (
 // registry (operation lifecycle + engine), and the fleet hub (live container
 // snapshots to the dashboard).
 type app struct {
-	cfg      Config
-	cc       *http.Client
-	docker   *dockerClient
-	compose  *composeBackend
-	projects *composeRegistry
-	events   *eventBuffer
-	reg      *jobRegistry
-	fleet    *fleetHub
-	images   *imageChecker
+	cfg       Config
+	cc        *http.Client
+	docker    *dockerClient
+	compose   *composeBackend
+	projects  *composeRegistry
+	events    *eventBuffer
+	reg       *jobRegistry
+	fleet     *fleetHub
+	images    *imageChecker
+	discovery *discoveryPusher
 }
 
 func newApp(_ context.Context, cfg Config) (*app, error) {
@@ -64,6 +65,11 @@ func newApp(_ context.Context, cfg Config) (*app, error) {
 	eng.setImageChecker(a.images) // Phase 3.5: update engine reuses strategy + clients
 	a.fleet = newFleetHub(a)
 	reg.setFleet(a.fleet)
+	// Phase 4: discovery feed (full-snapshot push to controller). Wired after
+	// the fleet hub so it can reuse SnapshotNow; the image checker triggers it
+	// after each pass so newly-detected outdated images surface promptly.
+	a.discovery = newDiscoveryPusher(a)
+	a.images.setAfterPass(a.discovery.Trigger)
 	return a, nil
 }
 
@@ -82,6 +88,7 @@ func (a *app) startBackgroundWorkers(ctx context.Context) {
 	go a.startReconcile(ctx)     //
 	go a.enrichProjectsOnce(ctx) // auto-adopt running compose projects into the registry
 	go a.images.Run(ctx)         // slow jittered image-outdated pass (Phase 3)
+	go a.discovery.Run(ctx)      // periodic discovery-table feed (Phase 4)
 }
 
 // enrichProjectsOnce reads the current container set once at boot and

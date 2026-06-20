@@ -125,8 +125,14 @@ type imageChecker struct {
 	overrides   map[string]strategyOverride // override key → override
 	lastFullRun time.Time
 
-	trigger chan struct{}
+	trigger   chan struct{}
+	afterPass func() // Phase 4: invoked after each pass to refresh the discovery feed.
 }
+
+// setAfterPass registers a callback fired at the end of every completed pass
+// (Phase 4 wires the discovery feed here so newly-detected image status is
+// pushed promptly instead of waiting for the discovery tick).
+func (ic *imageChecker) setAfterPass(fn func()) { ic.afterPass = fn }
 
 func newImageChecker(cfg Config, dc *dockerClient, cc *http.Client) *imageChecker {
 	reg := newRegistryClient(cfg.RegistryAuthFile, splitCSV(getEnv("DOCKER_REGISTRY_INSECURE", "")))
@@ -278,6 +284,12 @@ func (ic *imageChecker) runOnce(ctx context.Context, ondemand bool) {
 		}
 	}
 	slog.Info("imagecheck pass complete", "images", len(results), "outdated", outdated, "ondemand", ondemand)
+
+	// Phase 4: nudge the discovery feed so freshly-detected image status reaches
+	// the action dropdowns without waiting for the next discovery tick.
+	if ic.afterPass != nil {
+		ic.afterPass()
+	}
 }
 
 // lookup returns the cached check for a container (by composite key).
