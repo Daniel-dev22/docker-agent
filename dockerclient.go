@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"io"
 	"regexp"
 	"sort"
 	"strconv"
@@ -194,4 +195,51 @@ func parseHealth(status string) string {
 	default:
 		return "none"
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Container lifecycle ops (Phase 1).
+//
+// Each is a thin typed wrapper over the moby Engine API — no shell, no output
+// parsing. They are driven as short async jobs by the engine (start has no
+// grace, but stop/restart/remove-running carry a SIGTERM grace, so none are
+// treated as synchronous). The container id may be the short id the snapshot
+// publishes; the Engine API resolves it by prefix.
+// ---------------------------------------------------------------------------
+
+func (d *dockerClient) startContainer(ctx context.Context, id string) error {
+	return d.cli.ContainerStart(ctx, id, container.StartOptions{})
+}
+
+// stopContainer sends SIGTERM then SIGKILL after the grace (timeout seconds;
+// nil = the engine/image default).
+func (d *dockerClient) stopContainer(ctx context.Context, id string, timeout *int) error {
+	return d.cli.ContainerStop(ctx, id, container.StopOptions{Timeout: timeout})
+}
+
+func (d *dockerClient) restartContainer(ctx context.Context, id string, timeout *int) error {
+	return d.cli.ContainerRestart(ctx, id, container.StopOptions{Timeout: timeout})
+}
+
+// killContainer sends SIGKILL immediately (the bulk "kill" action — no grace).
+func (d *dockerClient) killContainer(ctx context.Context, id string) error {
+	return d.cli.ContainerKill(ctx, id, "KILL")
+}
+
+// removeContainer removes a container; force kills a running one first.
+func (d *dockerClient) removeContainer(ctx context.Context, id string, force bool) error {
+	return d.cli.ContainerRemove(ctx, id, container.RemoveOptions{Force: force})
+}
+
+// containerLogsFollow opens a following log stream (stdout+stderr, timestamps,
+// last 500 lines of backlog). The caller owns Close. Multiplexed stdcopy frames
+// are demuxed by the reader in engine/handlers; raw text otherwise.
+func (d *dockerClient) containerLogsFollow(ctx context.Context, id string) (io.ReadCloser, error) {
+	return d.cli.ContainerLogs(ctx, id, container.LogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Follow:     true,
+		Timestamps: true,
+		Tail:       "500",
+	})
 }

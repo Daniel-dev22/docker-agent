@@ -72,12 +72,20 @@ func registerRoutes(r *gin.Engine, app *app) {
 	r.GET("/health/live", app.handleLiveness)
 	r.GET("/health/ready", app.handleReadiness)
 
-	// Read-only job introspection (no producers yet — Phase 1 adds the container
-	// lifecycle routes, Phase 2 the compose-op routes).
+	// Job introspection. Phase 1 wires the container-lifecycle producers below;
+	// Phase 2 adds the compose-op routes.
 	r.GET("/v1/jobs", app.handleListJobs)
 	r.GET("/v1/jobs/:id", app.handleGetJob)
 	r.GET("/v1/jobs/:id/log", app.handleGetJobLog)
 	r.POST("/v1/jobs/:id/cancel", app.handleCancelJob)
+
+	// Container lifecycle mutations (Phase 1) — short async jobs (202 + job id);
+	// reached through the router ProxyHandler catch-all (no new router code).
+	r.POST("/v1/containers/:id/start", app.handleContainerStart)
+	r.POST("/v1/containers/:id/stop", app.handleContainerStop)
+	r.POST("/v1/containers/:id/restart", app.handleContainerRestart)
+	r.DELETE("/v1/containers/:id", app.handleContainerRemove)
+	r.POST("/v1/containers/bulk", app.handleContainerBulk)
 
 	r.GET("/ws/jobs/:id/logs", app.handleJobLogsWS)
 	r.GET("/ws/fleet", app.handleFleetWS)

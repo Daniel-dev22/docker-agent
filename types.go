@@ -52,13 +52,22 @@ const (
 	subscriberBuffer   = 256
 )
 
-// JobRequest is the wire body that starts a job. Phase 1/2 add the HTTP routes
-// that build one; Phase 0 never constructs it.
+// JobRequest is the wire body that starts a job. Phase 1 adds the container
+// lifecycle routes; Phase 2 the compose routes.
+//
+// Target is the single container id for a container-scoped op; Targets carries
+// the id list for a bulk op (Operation "container.bulk.<verb>"). Force/Timeout
+// are op options (remove force, stop/restart SIGTERM grace). Targets/Force/
+// Timeout are NOT persisted to the controller — they live only on the in-memory
+// Job for the duration of the run.
 type JobRequest struct {
-	Operation  string `json:"operation"`
-	Project    string `json:"project,omitempty"`
-	Target     string `json:"target,omitempty"`
-	TriggerKey string `json:"trigger_key,omitempty"`
+	Operation  string   `json:"operation"`
+	Project    string   `json:"project,omitempty"`
+	Target     string   `json:"target,omitempty"`
+	Targets    []string `json:"targets,omitempty"`
+	Force      bool     `json:"force,omitempty"`
+	Timeout    *int     `json:"timeout,omitempty"`
+	TriggerKey string   `json:"trigger_key,omitempty"`
 }
 
 // jobPublic carries the JSON-serializable fields of a Job, split out so
@@ -79,8 +88,16 @@ type jobPublic struct {
 
 // Job is one operation tracked through its lifecycle, with a bounded log ring
 // and live subscribers (the /ws/jobs/:id/logs stream).
+//
+// targets/force/timeout are the in-memory op parameters (not serialized): set
+// once at construction in jobRegistry.start (before the run goroutine launches,
+// so they're safe to read without a lock during run).
 type Job struct {
 	jobPublic
+
+	targets []string
+	force   bool
+	timeout *int
 
 	mu          sync.Mutex
 	cancel      context.CancelFunc
