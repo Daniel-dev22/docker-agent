@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -253,13 +254,20 @@ func (a *app) handleCopyProject(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
-// readBundle reads a project's compose + env file contents off disk.
+// readBundle reads a project's compose + env file contents off disk. Unreadable
+// compose files are SKIPPED (logged), not fatal: an externally-managed stack
+// (Ansible/Portainer) whose working dir is outside the agent's bind-mounted
+// ComposeRoot returns an empty/partial bundle + its working_dir, so the UI shows
+// its graceful "not editable, files live at <working_dir>" notice instead of a
+// raw 500. (Such stacks are also flagged Managed=false up front — see mergeKnown.)
 func (a *app) readBundle(e ProjectEntry) (projectBundle, error) {
 	b := projectBundle{Name: e.Name, WorkingDir: e.WorkingDir}
 	for _, p := range e.absComposeFiles() {
 		data, err := os.ReadFile(p)
 		if err != nil {
-			return projectBundle{}, fmt.Errorf("read %s: %w", p, err)
+			slog.Warn("compose bundle: skipping unreadable file (likely outside the agent's ComposeRoot mount)",
+				"project", e.Name, "file", p, "error", err)
+			continue
 		}
 		b.ComposeFiles = append(b.ComposeFiles, bundleFile{Name: filepath.Base(p), Content: string(data)})
 	}

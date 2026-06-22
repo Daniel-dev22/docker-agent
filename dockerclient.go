@@ -71,9 +71,12 @@ type ComposeProject struct {
 	ContainerCount int      `json:"container_count"`
 	RunningCount   int      `json:"running_count"`
 	Containers     []string `json:"containers"`
-	// Managed is true when this project is in the durable compose registry
-	// (projects.json) — set by composeRegistry.mergeKnown when building the fleet
-	// snapshot, so the UI can distinguish managed stacks from ad-hoc ones.
+	// Managed is true when docker-agent owns this stack's compose files: it was
+	// created via register/copy and its working dir lives under ComposeRoot, so
+	// the agent can read/write it and the UI offers in-place Edit. False =
+	// externally-managed (Ansible/Portainer/ad-hoc) — discovered only, files live
+	// outside the agent's mount, so the UI greys out Edit. Set by
+	// composeRegistry.mergeKnown when building the fleet snapshot.
 	Managed bool `json:"managed,omitempty"`
 
 	// Rolled-up image-outdated status (Phase 3), computed from the project's

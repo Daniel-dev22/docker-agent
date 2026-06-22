@@ -53,7 +53,7 @@ func TestComposeSmoke(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compose backend: %v", err)
 	}
-	reg := newComposeRegistry(cfg.ComposeRegistryPath)
+	reg := newComposeRegistry(cfg.ComposeRegistryPath, cfg.ComposeRoot)
 	if err := reg.register(ProjectEntry{Name: name, WorkingDir: dir, ComposeFiles: []string{"docker-compose.yml"}}); err != nil {
 		t.Fatalf("register: %v", err)
 	}

@@ -63,7 +63,8 @@ func (e ProjectEntry) absComposeFiles() []string {
 // merged in on read so the dashboard sees both running and stopped-but-known
 // projects.
 type composeRegistry struct {
-	path string // <ComposeRoot>/projects.json
+	path        string // <ComposeRoot>/projects.json
+	composeRoot string // the bind-mounted data dir; a stack under it is agent-owned/editable
 
 	mu     sync.RWMutex
 	byName map[string]*ProjectEntry
@@ -71,8 +72,26 @@ type composeRegistry struct {
 	persistMu sync.Mutex // serializes the write-tmp/rename pair (duplicacy posture)
 }
 
-func newComposeRegistry(path string) *composeRegistry {
-	return &composeRegistry{path: path, byName: map[string]*ProjectEntry{}}
+func newComposeRegistry(path, composeRoot string) *composeRegistry {
+	return &composeRegistry{path: path, composeRoot: composeRoot, byName: map[string]*ProjectEntry{}}
+}
+
+// underComposeRoot reports whether workingDir lives inside root. The agent's own
+// register/copy is the ONLY writer under ComposeRoot (writeProjectFiles), so a
+// stack whose working dir is under it is one the agent created and can read/write
+// (editable in place). Externally-managed stacks (Ansible/Portainer/ad-hoc) live
+// elsewhere on the host — outside the agent's mount — and are NOT editable here.
+// Structural (no I/O) and self-correcting: it needs no migration of existing
+// projects.json entries and never depends on a persisted provenance flag.
+func underComposeRoot(workingDir, root string) bool {
+	if workingDir == "" || root == "" {
+		return false
+	}
+	rel, err := filepath.Rel(root, workingDir)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (!strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != ".." && !filepath.IsAbs(rel))
 }
 
 // load reads projects.json. Missing file is OK (empty registry); a malformed
@@ -205,9 +224,11 @@ func (r *composeRegistry) enrichFromLive(live []ComposeProject) {
 }
 
 // mergeKnown adds stopped-but-registered projects (absent from the live label
-// grouping) to the fleet snapshot as zero-container entries, and flags every
-// returned project that is in the durable index as Managed. So the dashboard
-// shows a registered project even when all its containers are down.
+// grouping) to the fleet snapshot as zero-container entries, and flags each
+// returned project Managed only when the agent actually owns its compose files
+// (working dir under ComposeRoot → created via register/copy → editable here).
+// Externally-managed stacks (Ansible/Portainer/ad-hoc) appear but Managed=false,
+// so the UI greys out Edit instead of offering an edit that can't read the files.
 func (r *composeRegistry) mergeKnown(live []ComposeProject) []ComposeProject {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -216,14 +237,15 @@ func (r *composeRegistry) mergeKnown(live []ComposeProject) []ComposeProject {
 		seen[p.Name] = i
 	}
 	for name, e := range r.byName {
+		managed := underComposeRoot(e.WorkingDir, r.composeRoot)
 		if idx, ok := seen[name]; ok {
-			live[idx].Managed = true
+			live[idx].Managed = managed
 			continue
 		}
 		live = append(live, ComposeProject{
 			Name:       name,
 			WorkingDir: e.WorkingDir,
-			Managed:    true,
+			Managed:    managed,
 		})
 	}
 	sort.Slice(live, func(i, j int) bool { return live[i].Name < live[j].Name })

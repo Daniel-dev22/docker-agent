@@ -42,7 +42,7 @@ func newApp(_ context.Context, cfg Config) (*app, error) {
 	// Durable compose-project registry (projects.json). Missing file = empty
 	// registry; a malformed file is fatal (surface corruption, don't silently
 	// drop the index).
-	projects := newComposeRegistry(cfg.ComposeRegistryPath)
+	projects := newComposeRegistry(cfg.ComposeRegistryPath, cfg.ComposeRoot)
 	if err := projects.load(); err != nil {
 		return nil, fmt.Errorf("load compose registry: %w", err)
 	}
