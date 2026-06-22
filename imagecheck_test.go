@@ -127,6 +127,70 @@ func TestAutoDetectStrategy(t *testing.T) {
 	}
 }
 
+func TestLooksLikeCommitSHATag(t *testing.T) {
+	sha := []string{"8203e39-amd64", "8203e39", "1a2b3c4d5e6f", "abc1234-arm64", "0123456789abcdef0123456789abcdef01234567"}
+	notSha := []string{"latest", "stable", "edge", "3", "3.7", "1.25-alpine", "3.19-slim", "v1.2.3", "", "rc1"}
+	for _, tag := range sha {
+		if !looksLikeCommitSHATag(tag, "amd64") {
+			t.Errorf("looksLikeCommitSHATag(%q) = false, want true", tag)
+		}
+	}
+	for _, tag := range notSha {
+		if looksLikeCommitSHATag(tag, "amd64") {
+			t.Errorf("looksLikeCommitSHATag(%q) = true, want false", tag)
+		}
+	}
+}
+
+func TestSplitOwnerPackage(t *testing.T) {
+	cases := []struct{ in, owner, pkg string }{
+		{"blakeblackshear/frigate", "blakeblackshear", "frigate"},
+		{"immich-app/immich-server", "immich-app", "immich-server"},
+		{"owner/sub/pkg", "owner", "sub/pkg"},
+		{"single", "single", ""},
+	}
+	for _, c := range cases {
+		o, p := splitOwnerPackage(c.in)
+		if o != c.owner || p != c.pkg {
+			t.Errorf("splitOwnerPackage(%q) = (%q,%q), want (%q,%q)", c.in, o, p, c.owner, c.pkg)
+		}
+	}
+}
+
+func TestAutoDetectGhcrCommitSHA(t *testing.T) {
+	ic := &imageChecker{overrides: map[string]strategyOverride{}, arch: "amd64"}
+	// frigate: bare commit-sha on ghcr → auto github-branch, owner/package derived.
+	s := ic.resolveStrategy(
+		ContainerStatus{Image: "ghcr.io/blakeblackshear/frigate:8203e39-amd64", ComposeProject: "frigate"},
+		imageInfo{},
+		parseImageReference("ghcr.io/blakeblackshear/frigate:8203e39-amd64", "latest"),
+	)
+	if s.source != "github-branch" || s.origin != "auto" {
+		t.Fatalf("frigate auto = %+v, want auto:github-branch", s)
+	}
+	if s.o.Owner != "blakeblackshear" || s.o.Package != "frigate" || s.o.GithubRepo != "blakeblackshear/frigate" {
+		t.Errorf("frigate synthesized override = %+v, want owner/package/repo blakeblackshear/frigate", s.o)
+	}
+	// commit-sha on a NON-ghcr registry (no derivable repo) → registry-digest.
+	s = ic.resolveStrategy(
+		ContainerStatus{Image: "docker.io/some/app:8203e39"},
+		imageInfo{},
+		parseImageReference("docker.io/some/app:8203e39", "latest"),
+	)
+	if s.source != "registry-digest" || s.origin != "auto" {
+		t.Errorf("non-ghcr sha = %+v, want auto:registry-digest", s)
+	}
+	// ghcr but a MOVING tag (not a sha) → registry-digest, not github-branch.
+	s = ic.resolveStrategy(
+		ContainerStatus{Image: "ghcr.io/owner/app:latest"},
+		imageInfo{},
+		parseImageReference("ghcr.io/owner/app:latest", "latest"),
+	)
+	if s.source != "registry-digest" {
+		t.Errorf("ghcr moving tag = %+v, want registry-digest", s)
+	}
+}
+
 func TestOverrideWins(t *testing.T) {
 	ic := &imageChecker{overrides: map[string]strategyOverride{
 		"immich": {Key: "immich", MatchType: "project", VersionSource: "github-release", GithubRepo: "immich-app/immich"},
