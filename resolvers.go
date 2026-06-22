@@ -138,6 +138,14 @@ func (e *engine) planProject(ctx context.Context, name string, containers []Cont
 	return kind, targets, err
 }
 
+// tracksMovingTag reports whether an image reference uses a moving tag
+// (release/latest/edge/…). Such a service auto-follows upstream, so a coupled
+// (upstream-compose) plan must not flag or rewrite it to the release's concrete
+// pin — only concretely-pinned coupled services drive the stack's status.
+func tracksMovingTag(image string) bool {
+	return movingKeyword[strings.ToLower(parseImageReference(image, "latest").Tag)]
+}
+
 // resolverKind returns the effective image_resolver: the explicit column if set,
 // else derived from version_source (immich's github-release + a service_map ⇒
 // upstream-compose; everything else ⇒ registry/override).
@@ -301,6 +309,16 @@ func (r *upstreamComposeResolver) plan(ctx context.Context, project *types.Proje
 		}
 		img, ok := upstream[upName]
 		if !ok || img == "" {
+			continue
+		}
+		// A service intentionally on a MOVING tag (immich-server ":release") is
+		// auto-tracking latest, so it is never "behind a release" — don't flag or
+		// rewrite it to the release's concrete pin (a plain `pull` refreshes it).
+		// Only concretely-pinned coupled services (redis/db @sha256, or a pinned
+		// X.Y.Z) are driven by the release compose. This keeps the WHOLE-STACK
+		// status driven by the actual drivers, never by a coupled service's own
+		// independent upstream.
+		if tracksMovingTag(svc.Image) {
 			continue
 		}
 		if img != svc.Image {
