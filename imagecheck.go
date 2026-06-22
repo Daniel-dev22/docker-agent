@@ -456,11 +456,15 @@ func (ic *imageChecker) matchOverride(c ContainerStatus, ref imageRef) (strategy
 var (
 	pinnedRe      = regexp.MustCompile(`^v?\d+\.\d+\.\d+`)
 	xyTruncateRe  = regexp.MustCompile(`^v?(\d+\.\d+)\.\d+`)
+	commitShaRe   = regexp.MustCompile(`^[0-9a-f]{7,40}$`)
 	movingKeyword = map[string]bool{
 		"latest": true, "stable": true, "release": true, "sts": true, "alpine": true,
 		"edge": true, "dev": true, "devel": true, "nightly": true, "main": true,
 		"master": true, "rolling": true, "current": true,
 	}
+	// knownArchSuffixes are stripped before classifying a tag, independent of the
+	// configured DOCKER_IMAGE_ARCH (images are sometimes tagged for a non-host arch).
+	knownArchSuffixes = []string{"amd64", "arm64", "aarch64", "armv7", "arm"}
 )
 
 // isPinnedTag reports whether a tag is a full pinned X.Y.Z (so the upstream
@@ -471,6 +475,34 @@ func isPinnedTag(tag string) bool {
 		return false
 	}
 	return pinnedRe.MatchString(tag)
+}
+
+// looksLikeCommitSHATag reports whether a (non-pinned) tag is a bare git
+// commit-sha, after stripping a trailing -<arch> suffix (frigate's
+// "8203e39-amd64" → "8203e39"). Such a tag is immutable, so same-tag
+// registry-digest can never see a newer build — it must be resolved by listing
+// the ghcr package's tags instead. Only the unambiguous bare-sha shape is
+// auto-detected; X.Y-<sha> dev tags collide with moving variant tags
+// (e.g. "1.25-alpine") and stay override-only.
+func looksLikeCommitSHATag(tag, arch string) bool {
+	t := tag
+	if arch != "" {
+		t = strings.TrimSuffix(t, "-"+arch)
+	}
+	for _, a := range knownArchSuffixes {
+		t = strings.TrimSuffix(t, "-"+a)
+	}
+	return commitShaRe.MatchString(t)
+}
+
+// splitOwnerPackage splits a ghcr repository path "owner/pkg[/sub]" into the
+// owner and the package name (the GitHub Packages API container name).
+func splitOwnerPackage(repository string) (owner, pkg string) {
+	parts := strings.SplitN(repository, "/", 2)
+	if len(parts) == 2 {
+		return parts[0], parts[1]
+	}
+	return repository, ""
 }
 
 // sourceRepoFromLabels reads org.opencontainers.image.source (a github URL) and
@@ -511,6 +543,19 @@ func (ic *imageChecker) resolveStrategy(c ContainerStatus, info imageInfo, ref i
 		}
 		return effStrategy{source: "registry-digest", origin: "auto", flag: "pinned-no-source"}
 	}
+	// Non-pinned tag. A bare commit-sha on a ghcr image is immutable, so same-tag
+	// registry-digest is useless ("updated" forever) — list the ghcr package's
+	// tags instead (frigate's "8203e39-amd64"). Auto-derive owner/package from the
+	// ghcr path (the GitHub Packages API key) so no override row is needed.
+	if ref.Registry == "ghcr.io" && repo != "" && looksLikeCommitSHATag(ref.Tag, ic.arch) {
+		owner, pkg := splitOwnerPackage(ref.Repository)
+		return effStrategy{
+			source: "github-branch", origin: "auto", repo: repo,
+			o: strategyOverride{Owner: owner, Package: pkg, GithubRepo: repo, ArchSuffix: ic.arch},
+		}
+	}
+	// Moving tag (latest/stable/edge/X/X.Y/date) or any other unresolvable shape:
+	// the tag rolls forward in place, so digest drift on the same tag detects it.
 	return effStrategy{source: "registry-digest", origin: "auto"}
 }
 
