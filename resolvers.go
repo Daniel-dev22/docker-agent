@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -234,7 +235,10 @@ func (r *upstreamComposeResolver) resolve(ctx context.Context, j *Job, project *
 	url := strings.ReplaceAll(tmpl, "{tag}", tag)
 	j.appendLine(fmt.Sprintf("immich: latest release %s — reading %s", tag, url))
 
-	upstream, err := fetchComposeImages(ctx, url)
+	// immich's compose templates the app images as ${IMMICH_VERSION:-release}; pin
+	// them to the concrete release tag (the whole point of the coupled update) so
+	// the rewrite is a real version, not the floating `release` tag.
+	upstream, err := fetchComposeImages(ctx, url, map[string]string{"IMMICH_VERSION": tag})
 	if err != nil {
 		return nil, fmt.Errorf("upstream-compose: %w", err)
 	}
@@ -272,9 +276,27 @@ type composeImagesDoc struct {
 	} `yaml:"services"`
 }
 
-// fetchComposeImages downloads a compose file and returns service → image. Plain
-// public HTTP (raw.githubusercontent) — no auth needed.
-func fetchComposeImages(ctx context.Context, url string) (map[string]string, error) {
+// composeVarRe matches a compose interpolation `${VAR}`, `${VAR:-default}`, or
+// `${VAR-default}` (the forms immich's compose uses for image tags).
+var composeVarRe = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)(?::?-([^}]*))?\}`)
+
+// interpolateComposeVars resolves `${VAR...}` against vars, falling back to the
+// `:-default` (or empty) when the var is absent — matching docker compose's own
+// substitution for the variables we know (e.g. IMMICH_VERSION).
+func interpolateComposeVars(s string, vars map[string]string) string {
+	return composeVarRe.ReplaceAllStringFunc(s, func(m string) string {
+		sub := composeVarRe.FindStringSubmatch(m)
+		if v, ok := vars[sub[1]]; ok && v != "" {
+			return v
+		}
+		return sub[2] // default group (empty when the form was bare `${VAR}`)
+	})
+}
+
+// fetchComposeImages downloads a compose file and returns service → image,
+// interpolating `${VAR}` image tags against vars. Plain public HTTP
+// (raw.githubusercontent) — no auth needed.
+func fetchComposeImages(ctx context.Context, url string, vars map[string]string) (map[string]string, error) {
 	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(cctx, http.MethodGet, url, nil)
@@ -301,7 +323,7 @@ func fetchComposeImages(ctx context.Context, url string) (map[string]string, err
 	out := make(map[string]string, len(doc.Services))
 	for name, s := range doc.Services {
 		if s.Image != "" {
-			out[name] = s.Image
+			out[name] = interpolateComposeVars(s.Image, vars)
 		}
 	}
 	return out, nil
