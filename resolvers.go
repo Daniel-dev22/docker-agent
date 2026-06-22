@@ -35,8 +35,16 @@ import (
 )
 
 // ImageResolver decides the target image for each service to change in a project.
+//
+// plan is a read-only dry-run: it returns the service→image change set WITHOUT
+// applying anything. The update engine (stackengine.go) runs it then applies;
+// the image checker (imagecheck.go) runs it to derive a project's outdated
+// status — so "is it outdated?" and "what do I deploy?" are the SAME answer and
+// can never diverge (e.g. a coupled stack is outdated iff its driver release
+// would actually change an image, never because a coupled service has its own
+// newer upstream). `log` receives progress lines (nil-safe via a no-op caller).
 type ImageResolver interface {
-	resolve(ctx context.Context, j *Job, project *types.Project) (map[string]string, error)
+	plan(ctx context.Context, project *types.Project, log func(string)) (map[string]string, error)
 	kind() string
 }
 
@@ -99,6 +107,37 @@ func (e *engine) selectResolver(projectName, overrideImage, overrideService stri
 	return &registryResolver{e: e}, meta
 }
 
+// planProject runs the project's resolver as a read-only dry-run to compute its
+// image change set — the single source of truth for both detection (is the
+// project outdated?) and the update engine. The synthetic project is built from
+// the RUNNING containers (service → running image), so the plan reflects what
+// the stack is actually running. Registry-kind projects are detected per-service
+// by the image checker (checkUnit), so planProject skips them (returns "registry"
+// + nil) and the per-service rollup stands.
+func (e *engine) planProject(ctx context.Context, name string, containers []ContainerStatus) (kind string, targets map[string]string, err error) {
+	resolver, _ := e.selectResolver(name, "", "")
+	kind = resolver.kind()
+	if kind == "registry" {
+		return kind, nil, nil
+	}
+	svcs := types.Services{}
+	for _, c := range containers {
+		if c.ComposeProject != name || c.ComposeService == "" || c.Image == "" {
+			continue
+		}
+		if _, ok := svcs[c.ComposeService]; ok {
+			continue
+		}
+		svcs[c.ComposeService] = types.ServiceConfig{Name: c.ComposeService, Image: c.Image}
+	}
+	if len(svcs) == 0 {
+		return kind, nil, nil // project not running → nothing to plan
+	}
+	project := &types.Project{Name: name, Services: svcs}
+	targets, err = resolver.plan(ctx, project, func(string) {})
+	return kind, targets, err
+}
+
 // resolverKind returns the effective image_resolver: the explicit column if set,
 // else derived from version_source (immich's github-release + a service_map ⇒
 // upstream-compose; everything else ⇒ registry/override).
@@ -124,10 +163,10 @@ type registryResolver struct{ e *engine }
 
 func (r *registryResolver) kind() string { return "registry" }
 
-func (r *registryResolver) resolve(ctx context.Context, j *Job, project *types.Project) (map[string]string, error) {
+func (r *registryResolver) plan(ctx context.Context, project *types.Project, log func(string)) (map[string]string, error) {
 	ic := r.e.images
 	if ic == nil {
-		j.appendLine("no image checker — pull-only update (no version resolution)")
+		log("no image checker — pull-only update (no version resolution)")
 		return map[string]string{}, nil
 	}
 	ic.refreshOverrides(ctx) // freshest central overrides for this update
@@ -146,16 +185,16 @@ func (r *registryResolver) resolve(ctx context.Context, j *Job, project *types.P
 		case statusOutdated:
 			// registry-digest = same tag, newer digest → pull handles it (no rewrite).
 			if strat.source == "registry-digest" {
-				j.appendLine(fmt.Sprintf("%s: newer digest for %s (pull)", name, svc.Image))
+				log(fmt.Sprintf("%s: newer digest for %s (pull)", name, svc.Image))
 				continue
 			}
 			if chk.LatestImageVersion != "" && chk.LatestImageVersion != svc.Image {
 				targets[name] = chk.LatestImageVersion
-				j.appendLine(fmt.Sprintf("%s: %s → %s (%s)", name, svc.Image, chk.LatestImageVersion, chk.VersionSource))
+				log(fmt.Sprintf("%s: %s → %s (%s)", name, svc.Image, chk.LatestImageVersion, chk.VersionSource))
 			}
 		case statusUnknown:
 			if chk.Error != "" {
-				j.appendLine(fmt.Sprintf("%s: version unknown (%s) — pull", name, chk.Error))
+				log(fmt.Sprintf("%s: version unknown (%s) — pull", name, chk.Error))
 			}
 		}
 	}
@@ -176,7 +215,7 @@ type overrideResolver struct {
 
 func (r *overrideResolver) kind() string { return "override" }
 
-func (r *overrideResolver) resolve(_ context.Context, j *Job, project *types.Project) (map[string]string, error) {
+func (r *overrideResolver) plan(_ context.Context, project *types.Project, log func(string)) (map[string]string, error) {
 	if strings.TrimSpace(r.image) == "" {
 		return nil, fmt.Errorf("override resolver: no image given")
 	}
@@ -193,10 +232,16 @@ func (r *overrideResolver) resolve(_ context.Context, j *Job, project *types.Pro
 	if svc == "" {
 		return nil, fmt.Errorf("override resolver: cannot infer target service for %q (specify service)", project.Name)
 	}
-	if _, ok := project.Services[svc]; !ok {
+	cur, ok := project.Services[svc]
+	if !ok {
 		return nil, fmt.Errorf("override resolver: service %q not in project %q", svc, project.Name)
 	}
-	j.appendLine(fmt.Sprintf("override: %s → %s", svc, r.image))
+	// Already on the pinned image → empty plan (so detection reports updated and
+	// the engine skips a needless force-recreate).
+	if cur.Image == r.image {
+		return map[string]string{}, nil
+	}
+	log(fmt.Sprintf("override: %s → %s", svc, r.image))
 	return map[string]string{svc: r.image}, nil
 }
 
@@ -213,7 +258,7 @@ type upstreamComposeResolver struct {
 
 func (r *upstreamComposeResolver) kind() string { return "upstream-compose" }
 
-func (r *upstreamComposeResolver) resolve(ctx context.Context, j *Job, project *types.Project) (map[string]string, error) {
+func (r *upstreamComposeResolver) plan(ctx context.Context, project *types.Project, log func(string)) (map[string]string, error) {
 	ic := r.e.images
 	if ic == nil || ic.github == nil {
 		return nil, fmt.Errorf("upstream-compose resolver: image checker unavailable")
@@ -233,7 +278,7 @@ func (r *upstreamComposeResolver) resolve(ctx context.Context, j *Job, project *
 		tmpl = "https://raw.githubusercontent.com/" + repo + "/{tag}/docker/docker-compose.yml"
 	}
 	url := strings.ReplaceAll(tmpl, "{tag}", tag)
-	j.appendLine(fmt.Sprintf("immich: latest release %s — reading %s", tag, url))
+	log(fmt.Sprintf("immich: latest release %s — reading %s", tag, url))
 
 	// immich's compose templates the app images as ${IMMICH_VERSION:-release}; pin
 	// them to the concrete release tag (the whole point of the coupled update) so
@@ -260,11 +305,11 @@ func (r *upstreamComposeResolver) resolve(ctx context.Context, j *Job, project *
 		}
 		if img != svc.Image {
 			targets[name] = img
-			j.appendLine(fmt.Sprintf("%s: %s → %s (upstream %s)", name, svc.Image, img, upName))
+			log(fmt.Sprintf("%s: %s → %s (upstream %s)", name, svc.Image, img, upName))
 		}
 	}
 	if len(targets) == 0 {
-		j.appendLine("immich: already on the latest coupled image set")
+		log("immich: already on the latest coupled image set")
 	}
 	return targets, nil
 }
@@ -348,7 +393,7 @@ type buildAgentResolver struct {
 
 func (r *buildAgentResolver) kind() string { return "build-agent" }
 
-func (r *buildAgentResolver) resolve(_ context.Context, j *Job, _ *types.Project) (map[string]string, error) {
-	j.appendLine("build-agent resolver is not wired yet")
+func (r *buildAgentResolver) plan(_ context.Context, _ *types.Project, log func(string)) (map[string]string, error) {
+	log("build-agent resolver is not wired yet")
 	return nil, fmt.Errorf("build-agent resolver not yet wired: build %q via ansible (build_genmon_image.yaml / deploy_custom_frigate_version.yaml); see handoff-phase35", orDefault(r.o.BuildDescriptor, r.o.Key))
 }

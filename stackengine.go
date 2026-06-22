@@ -202,12 +202,22 @@ func (e *engine) updateProject(ctx, parentCtx context.Context, j *Job, entry Pro
 	// 1. baseline snapshot (pre-update container IDs + per-service image IDs).
 	base := e.snapshotProject(ctx, name)
 
-	// 2. resolve targets.
+	// 2. resolve targets (read-only plan).
 	resolver, meta := e.selectResolver(name, j.overrideImage, j.overrideService)
 	j.appendLine("resolver: " + resolver.kind() + ", rollback-scope: " + meta.rollbackScope)
-	targets, err := resolver.resolve(ctx, j, project)
+	targets, err := resolver.plan(ctx, project, j.appendLine)
 	if err != nil {
 		return fmt.Errorf("resolve: %w", err)
+	}
+
+	// Gate the update: a coupled/special project (its plan is the whole truth) is
+	// only updated when its plan changes ≥1 service — an empty plan is a clean
+	// no-op, never a needless force-recreate. Registry projects keep their
+	// existing pull+recreate (a registry-digest "newer digest" yields no target
+	// rewrite, so an empty target set there does NOT mean "nothing to pull").
+	if resolver.kind() != "registry" && len(targets) == 0 {
+		j.appendLine("up to date — nothing to deploy")
+		return nil
 	}
 
 	// 3. apply targets in-memory + persist to disk (reversible per service).
