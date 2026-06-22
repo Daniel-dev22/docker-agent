@@ -115,7 +115,7 @@ func TestOverrideResolverServiceInference(t *testing.T) {
 		"sidecar": types.ServiceConfig{Name: "sidecar", Image: "x:1"},
 	}}
 	r := &overrideResolver{e: e, image: "traefik:v3.1"}
-	got, err := r.resolve(context.Background(), &Job{}, proj)
+	got, err := r.plan(context.Background(), proj, func(string) {})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestOverrideResolverServiceInference(t *testing.T) {
 
 	// Single-service project → the sole service.
 	single := &types.Project{Name: "x", Services: types.Services{"only": types.ServiceConfig{Name: "only", Image: "a:1"}}}
-	got, err = (&overrideResolver{e: e, image: "a:2"}).resolve(context.Background(), &Job{}, single)
+	got, err = (&overrideResolver{e: e, image: "a:2"}).plan(context.Background(), single, func(string) {})
 	if err != nil || got["only"] != "a:2" {
 		t.Fatalf("override (single) = %v err=%v", got, err)
 	}
@@ -135,7 +135,7 @@ func TestOverrideResolverServiceInference(t *testing.T) {
 		"a": types.ServiceConfig{Name: "a", Image: "a:1"},
 		"b": types.ServiceConfig{Name: "b", Image: "b:1"},
 	}}
-	if _, err := (&overrideResolver{e: e, image: "z:1"}).resolve(context.Background(), &Job{}, ambig); err == nil {
+	if _, err := (&overrideResolver{e: e, image: "z:1"}).plan(context.Background(), ambig, func(string) {}); err == nil {
 		t.Fatal("expected error for ambiguous override target")
 	}
 }

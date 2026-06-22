@@ -123,16 +123,35 @@ type imageChecker struct {
 	mu          sync.RWMutex
 	cache       map[string]imageCheck       // compositeKey → result
 	overrides   map[string]strategyOverride // override key → override
+	projPlans   map[string]projPlan         // coupled/special project name → resolver plan
 	lastFullRun time.Time
 
 	trigger   chan struct{}
 	afterPass func() // Phase 4: invoked after each pass to refresh the discovery feed.
+	// projectPlanner runs a project's resolver as a read-only dry-run (engine.planProject).
+	// Set by the app; nil-safe. Lets the pass derive a coupled project's status from
+	// what its update WOULD change, instead of independent per-service checks.
+	projectPlanner func(ctx context.Context, name string, containers []ContainerStatus) (string, map[string]string, error)
+}
+
+// projPlan is a cached resolver dry-run for a coupled/special (non-registry)
+// project: the services its update would change, the resolver kind, and any error.
+type projPlan struct {
+	kind    string
+	targets map[string]string
+	err     string
 }
 
 // setAfterPass registers a callback fired at the end of every completed pass
 // (Phase 4 wires the discovery feed here so newly-detected image status is
 // pushed promptly instead of waiting for the discovery tick).
 func (ic *imageChecker) setAfterPass(fn func()) { ic.afterPass = fn }
+
+// setProjectPlanner wires engine.planProject so the pass can derive coupled
+// projects' status from their resolver dry-run (DRY: detection == the update plan).
+func (ic *imageChecker) setProjectPlanner(fn func(ctx context.Context, name string, containers []ContainerStatus) (string, map[string]string, error)) {
+	ic.projectPlanner = fn
+}
 
 func newImageChecker(cfg Config, dc *dockerClient, cc *http.Client) *imageChecker {
 	reg := newRegistryClient(cfg.RegistryAuthFile, splitCSV(getEnv("DOCKER_REGISTRY_INSECURE", "")))
@@ -149,6 +168,7 @@ func newImageChecker(cfg Config, dc *dockerClient, cc *http.Client) *imageChecke
 		jitterSeed:  cfg.NodeName,
 		cache:       map[string]imageCheck{},
 		overrides:   map[string]strategyOverride{},
+		projPlans:   map[string]projPlan{},
 		trigger:     make(chan struct{}, 1),
 	}
 }
@@ -272,8 +292,38 @@ func (ic *imageChecker) runOnce(ctx context.Context, ondemand bool) {
 	}
 	_ = g.Wait()
 
+	// Project-level dry-run plans for coupled/special (non-registry) projects: a
+	// project is outdated iff its update WOULD change ≥1 service — so a coupled
+	// service with its own newer upstream can't make the stack look outdated.
+	// Registry projects stay per-service (the rollup above). Computed in the pass
+	// (it can do GitHub/registry calls); stampImageStatus only reads the cache.
+	plans := map[string]projPlan{}
+	if ic.projectPlanner != nil {
+		seen := map[string]bool{}
+		for _, c := range containers {
+			name := c.ComposeProject
+			if name == "" || seen[name] {
+				continue
+			}
+			seen[name] = true
+			if _, ok := ic.projectOverride(name); !ok {
+				continue // no override → registry path (per-service)
+			}
+			kind, targets, perr := ic.projectPlanner(ctx, name, containers)
+			if kind == "" || kind == "registry" {
+				continue
+			}
+			pp := projPlan{kind: kind, targets: targets}
+			if perr != nil {
+				pp.err = perr.Error()
+			}
+			plans[name] = pp
+		}
+	}
+
 	ic.mu.Lock()
 	ic.cache = results // replace wholesale → prunes vanished images
+	ic.projPlans = plans
 	ic.lastFullRun = time.Now()
 	ic.mu.Unlock()
 
@@ -370,6 +420,49 @@ func stampImageStatus(containers []ContainerStatus, projects []ComposeProject, i
 			p.ImageStatus = statusUnknown
 		}
 	}
+
+	// Coupled/special projects: override the per-service rollup with the resolver
+	// plan. The project is outdated iff its update would change ≥1 service, and
+	// member containers' pills follow the plan — so a coupled service whose own
+	// upstream moved (but the driver release did NOT) reports updated, and the
+	// whole stack reports updated. This is the DRY guarantee: detection == the
+	// update's dry-run.
+	ic.mu.RLock()
+	plans := ic.projPlans
+	ic.mu.RUnlock()
+	for name, pp := range plans {
+		if p := byProject[name]; p != nil {
+			p.OutdatedCount = len(pp.targets)
+			switch {
+			case pp.err != "":
+				p.ImageStatus = statusUnknown
+			case len(pp.targets) > 0:
+				p.ImageStatus = statusOutdated
+			default:
+				p.ImageStatus = statusUpdated
+			}
+		}
+		for i := range containers {
+			c := &containers[i]
+			if c.ComposeProject != name {
+				continue
+			}
+			switch {
+			case pp.err != "":
+				c.ImageStatus = statusUnknown
+			case planChanges(pp.targets, c.ComposeService):
+				c.ImageStatus = statusOutdated
+			default:
+				c.ImageStatus = statusUpdated
+			}
+		}
+	}
+}
+
+// planChanges reports whether a resolver plan would change the given service.
+func planChanges(targets map[string]string, service string) bool {
+	_, ok := targets[service]
+	return ok
 }
 
 // refreshOverrides pulls the central docker_stack_strategies table from the

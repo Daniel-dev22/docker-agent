@@ -62,7 +62,8 @@ func newApp(_ context.Context, cfg Config) (*app, error) {
 
 	a := &app{cfg: cfg, cc: cc, docker: dc, compose: cb, projects: projects, events: events, reg: reg}
 	a.images = newImageChecker(cfg, dc, cc)
-	eng.setImageChecker(a.images) // Phase 3.5: update engine reuses strategy + clients
+	eng.setImageChecker(a.images)               // Phase 3.5: update engine reuses strategy + clients
+	a.images.setProjectPlanner(eng.planProject) // coupled-project status = the update's dry-run (DRY)
 	a.fleet = newFleetHub(a)
 	reg.setFleet(a.fleet)
 	// Phase 4: discovery feed (full-snapshot push to controller). Wired after
