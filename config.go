@@ -16,8 +16,9 @@ import (
 // cert. The docker socket is mounted (never on TCP) — root-equivalent, the
 // standard Portainer-agent posture (we replace the holder, not widen trust).
 type Config struct {
-	NodeName string // host class this agent runs on (e.g. "nas", "nuc", "pi", "vm", "nuc02")
-	SiteID   string // "kd" | "ng"
+	NodeName string // full node identity (e.g. "nas01", "nuc01", "pi01", "vm01", "nuc02"),
+	// derived from the container hostname ("<site>-<node>") minus the SiteID prefix.
+	SiteID string // "kd" | "ng"
 
 	ConfigDir string // persistent state dir (events.sqlite, heartbeat) — bind-mounted
 
@@ -44,9 +45,15 @@ type Config struct {
 }
 
 func loadConfig() Config {
+	site := requireEnv("SITE_ID")
 	cfg := Config{
-		NodeName: requireEnv("NODE_NAME"),
-		SiteID:   requireEnv("SITE_ID"),
+		// The node identity is the container hostname ("<site>-<node>", e.g.
+		// "kd-pi01") minus the "<site>-" prefix → "pi01". This is the SINGLE source
+		// of truth — there is no NODE_NAME env (the hostname already encodes it, and
+		// it must match the per-host server_name the rest of the system uses so a
+		// host has ONE identity across all discovery platforms).
+		NodeName: deriveNodeName(site),
+		SiteID:   site,
 
 		ConfigDir: getEnv("CONFIG_DIR", "/var/lib/docker-agent"),
 
@@ -89,6 +96,33 @@ func readBearerToken(path string) (string, error) {
 type emptyTokenErr struct{ path string }
 
 func (e *emptyTokenErr) Error() string { return "bearer token file " + e.path + " is empty" }
+
+// deriveNodeName resolves this agent's node identity from the container hostname
+// ("<site>-<node>") by stripping the "<site>-" prefix — e.g. "kd-pi01" → "pi01".
+// Mirrors the prefix strip the router does in agentkit/agentproxy.go. The
+// hostname is required (set by the deploy to inventory_hostname); a hostname that
+// doesn't carry the site prefix is a misconfiguration we refuse to start on
+// rather than silently report a wrong/ambiguous node name.
+func deriveNodeName(site string) string {
+	host, err := os.Hostname()
+	if err != nil || strings.TrimSpace(host) == "" {
+		slog.Error("cannot read container hostname for node identity", "error", err)
+		os.Exit(1)
+	}
+	host = strings.TrimSpace(host)
+	prefix := site + "-"
+	if !strings.HasPrefix(host, prefix) {
+		slog.Error("container hostname does not start with the site prefix — cannot derive node name",
+			"hostname", host, "site", site)
+		os.Exit(1)
+	}
+	node := strings.TrimPrefix(host, prefix)
+	if node == "" {
+		slog.Error("derived empty node name from hostname", "hostname", host, "site", site)
+		os.Exit(1)
+	}
+	return node
+}
 
 func requireEnv(k string) string {
 	v := os.Getenv(k)

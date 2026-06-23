@@ -142,7 +142,10 @@ func (e *engine) snapshotProject(ctx context.Context, name string) projectBaseli
 // (slow SD-card I/O), mirroring manage_portainer_stack_update.yaml. Env-overridable.
 func (e *engine) healthTimeouts() (swap, health time.Duration) {
 	s, h := 120*time.Second, 180*time.Second
-	if strings.EqualFold(e.cfg.NodeName, "pi") {
+	// Compare the host CLASS, not the full node name: the node is now the suffixed
+	// identity ("pi01"), so strip the trailing numeric suffix before matching "pi"
+	// (same rule as the router's dockerDeriveServerType).
+	if strings.EqualFold(strings.TrimRight(e.cfg.NodeName, "0123456789"), "pi") {
 		s, h = 300*time.Second, 360*time.Second
 	}
 	return getEnvDuration("DOCKER_HEALTH_SWAP_TIMEOUT", s), getEnvDuration("DOCKER_HEALTH_TIMEOUT", h)
