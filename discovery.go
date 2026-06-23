@@ -43,18 +43,39 @@ type DiscoveryPayload struct {
 	Node            string            `json:"node"`
 	Containers      []ContainerStatus `json:"containers"`
 	ComposeProjects []ComposeProject  `json:"compose_projects"`
-	EmittedAt       time.Time         `json:"emitted_at"`
+	// Networks (platform=docker, domain=networks) — agent-native replacement for
+	// the retired ansible docker_network_metrics collector. POINTER: nil means
+	// "network list failed this push, don't touch existing rows"; a non-nil
+	// (even empty) slice is authoritative and replaces them. Containers/compose
+	// are always authoritative so they stay plain slices.
+	Networks *[]NetworkStatus `json:"networks,omitempty"`
+	// TraefikNetworks (platform=traefik, domain=networks) — the traefik
+	// container's network attachments, for entrypoint management. Always
+	// authoritative (empty when no traefik container on this host).
+	TraefikNetworks []ContainerNetAttachment `json:"traefik_networks"`
+	EmittedAt       time.Time                `json:"emitted_at"`
 }
 
 type discoveryPusher struct {
 	cfg      Config
 	cc       *http.Client
 	fleet    *fleetHub
+	docker   *dockerClient
 	interval time.Duration
 	trigger  chan struct{}
 
 	firstDone  bool
 	lastPushOK bool
+
+	// Network gather TTL cache (single-goroutine: only touched from Run's select
+	// loop, so no lock). Bounds docker-socket cost to ~2 calls per netTTL window
+	// rather than per push — keeps a low-power Pi cheap when a periodic tick and a
+	// post-image-check trigger land close together.
+	netTTL          time.Duration
+	netCachedAt     time.Time
+	netCacheOK      bool
+	netCache        []NetworkStatus
+	netTraefikCache []ContainerNetAttachment
 }
 
 func newDiscoveryPusher(a *app) *discoveryPusher {
@@ -62,9 +83,44 @@ func newDiscoveryPusher(a *app) *discoveryPusher {
 		cfg:      a.cfg,
 		cc:       a.cc,
 		fleet:    a.fleet,
+		docker:   a.docker,
 		interval: getEnvDuration("DOCKER_DISCOVERY_INTERVAL", 5*time.Minute),
+		netTTL:   getEnvDuration("DOCKER_NETWORK_TTL", 120*time.Second),
 		trigger:  make(chan struct{}, 1),
 	}
+}
+
+// gatherNetworks returns the docker network list (platform=docker/networks) and
+// the traefik container's attachments (platform=traefik/networks), TTL-cached.
+//
+// Gathering is intentionally CHEAP and FIXED-COST regardless of network count:
+// ONE batch NetworkList call (the summary already carries IPAM/options — no
+// per-network inspect/fan-out) plus ONE ContainerInspect for traefik = 2 socket
+// calls. There is nothing to parallelize, so unlike the image checker (which
+// fans out one registry call per image and caps concurrency via GOMAXPROCS),
+// this needs no concurrency throttle. The TTL just avoids re-running those 2
+// calls when the periodic push and the post-image-check trigger fire close
+// together. On a list error we don't cache (retry next push) and omit networks
+// so the router keeps the last-good rows instead of wiping them.
+func (d *discoveryPusher) gatherNetworks(ctx context.Context) (*[]NetworkStatus, []ContainerNetAttachment) {
+	if d.netCacheOK && time.Since(d.netCachedAt) < d.netTTL {
+		out := d.netCache
+		return &out, d.netTraefikCache
+	}
+	nctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	nets, err := d.docker.listNetworks(nctx)
+	traefik := d.docker.containerNetAttachments(nctx, "traefik")
+	cancel()
+	if err != nil {
+		slog.Warn("docker network list failed; pushing without networks", "node", d.cfg.NodeName, "error", err)
+		return nil, traefik
+	}
+	d.netCache = nets
+	d.netTraefikCache = traefik
+	d.netCachedAt = time.Now()
+	d.netCacheOK = true
+	out := nets
+	return &out, traefik
 }
 
 // Trigger requests an out-of-band push (coalesced). Called by the image checker
@@ -109,11 +165,17 @@ func (d *discoveryPusher) push(ctx context.Context) {
 		return
 	}
 
+	// Networks are gathered here (not in the high-frequency fleet WS snapshot —
+	// they change rarely), TTL-cached so frequent pushes don't re-hit the socket.
+	netsPtr, traefikNets := d.gatherNetworks(ctx)
+
 	payload := DiscoveryPayload{
 		Site:            d.cfg.SiteID,
 		Node:            d.cfg.NodeName,
 		Containers:      snap.Data.Containers,
 		ComposeProjects: snap.Data.ComposeProjects,
+		Networks:        netsPtr,
+		TraefikNetworks: traefikNets,
 		EmittedAt:       time.Now().UTC(),
 	}
 	body, err := json.Marshal(payload)
