@@ -220,9 +220,10 @@ func TestTagVariants(t *testing.T) {
 
 func TestFilterDedupeTags(t *testing.T) {
 	tags := []string{"abc1234-amd64", "abc1234-arm64", "def5678-amd64", "cache", "h8l-thing", "ci99999-amd64"}
-	branchSHAs := map[string]bool{"ci99999": true}
-	got := filterDedupeTags(tags, branchSHAs, []string{"cache", "h8l"})
-	// abc1234 deduped to one; def5678 kept; cache/h8l excluded; ci99999 is a branch SHA → removed.
+	masterSHAs := map[string]bool{"ci99999": true}
+	// Exclude-only mode (requireDev=false): no dev-membership requirement.
+	got := filterDedupeTags(tags, masterSHAs, nil, false, []string{"cache", "h8l"})
+	// abc1234 deduped to one; def5678 kept; cache/h8l excluded; ci99999 is a master SHA → removed.
 	want := []string{"abc1234", "def5678"}
 	if len(got) != len(want) {
 		t.Fatalf("filterDedupeTags = %v, want %v", got, want)
@@ -230,6 +231,24 @@ func TestFilterDedupeTags(t *testing.T) {
 	for i := range want {
 		if got[i] != want[i] {
 			t.Errorf("filterDedupeTags[%d] = %q, want %q (full %v)", i, got[i], want[i], got)
+		}
+	}
+}
+
+func TestFilterDedupeTagsDevMembership(t *testing.T) {
+	// Newest→oldest published order. master HEAD is newest; only dev builds qualify.
+	tags := []string{"933a7f1-amd64", "ec3fb00-amd64", "feat999-amd64", "8203e39-amd64"}
+	masterSHAs := map[string]bool{"933a7f1": true}               // master HEAD → excluded
+	devSHAs := map[string]bool{"ec3fb00": true, "8203e39": true} // the dev builds
+	got := filterDedupeTags(tags, masterSHAs, devSHAs, true, []string{"cache", "h8l"})
+	// 933a7f1 excluded (master); feat999 rejected (on neither dev nor master); dev builds kept, newest first.
+	want := []string{"ec3fb00", "8203e39"}
+	if len(got) != len(want) {
+		t.Fatalf("filterDedupeTags(dev) = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("filterDedupeTags(dev)[%d] = %q, want %q (full %v)", i, got[i], want[i], got)
 		}
 	}
 }

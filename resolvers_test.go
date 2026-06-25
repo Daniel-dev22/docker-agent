@@ -2,6 +2,35 @@ package main
 
 import "testing"
 
+func TestPlanServiceTarget(t *testing.T) {
+	const img = "ghcr.io/blakeblackshear/frigate:8203e39-amd64"
+	cases := []struct {
+		name    string
+		chk     imageCheck
+		want    string
+		wantErr bool
+	}{
+		{"outdated→rewrite", imageCheck{ImageStatus: statusOutdated, LatestImageVersion: "ghcr.io/blakeblackshear/frigate:ec3fb00-amd64"}, "ghcr.io/blakeblackshear/frigate:ec3fb00-amd64", false},
+		{"updated→noop", imageCheck{ImageStatus: statusUpdated, LatestImageVersion: img}, "", false},
+		{"outdated-but-equals-current→noop", imageCheck{ImageStatus: statusOutdated, LatestImageVersion: img}, "", false},
+		// the bug: outdated but the resolver produced no target → LOUD failure, not a silent no-op.
+		{"outdated-no-target→error", imageCheck{ImageStatus: statusOutdated, LatestImageVersion: ""}, "", true},
+		// a version check that failed (e.g. fail-closed github) must NOT silently redeploy the pin.
+		{"unknown→error", imageCheck{ImageStatus: statusUnknown, Error: "github-branch: list dev commits: 403"}, "", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := planServiceTarget("frigate", img, c.chk)
+			if (err != nil) != c.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, c.wantErr)
+			}
+			if got != c.want {
+				t.Errorf("target = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
 func TestInterpolateComposeVars(t *testing.T) {
 	vars := map[string]string{"IMMICH_VERSION": "v2.7.5"}
 	cases := []struct{ in, want string }{

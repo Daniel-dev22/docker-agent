@@ -29,6 +29,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 )
 
 const githubAPIBase = "https://api.github.com"
@@ -313,11 +315,21 @@ var customBranchRe = regexp.MustCompile(`^(\d+\.\d+)(?:\.\d+)?-`)
 // shaTailRe extracts the trailing commit SHA from a stripped tag.
 var shaTailRe = regexp.MustCompile(`-([a-f0-9]{7,})$`)
 
+// Branch-commit lookback windows. master (exclude) is short — under-covering only
+// risks *failing to exclude* an old master build, which is rare and harmless next to
+// fresh dev builds. dev (include, when configured) is generous so an active dev
+// branch's newest build is always inside the window.
+const (
+	masterWindowDays = 14
+	devWindowDays    = 30
+)
+
 type branchQuery struct {
 	Owner        string   // ghcr owner (blakeblackshear)
 	Package      string   // container package (frigate)
 	Repo         string   // owner/repo for commit/branch lookups
-	FilterBranch string   // default "master"
+	FilterBranch string   // branch to EXCLUDE; default "master"
+	DevBranch    string   // branch a build MUST be on; "" ⇒ exclude-only (no membership requirement)
 	ArchSuffix   string   // default "amd64"
 	TagExcludes  []string // default ["cache","h8l"]
 	Registry     string   // default "ghcr.io"
@@ -386,15 +398,40 @@ func (g *githubClient) latestPackageVersion(ctx context.Context, q branchQuery) 
 		return res, nil
 	}
 
-	branchSHAs, err := g.branchCommitSHAs(ctx, q.Repo, q.FilterBranch, 14)
-	if err != nil {
+	// Fetch the exclude set (filter branch, e.g. master), the include set (dev branch,
+	// when configured), and the package tags CONCURRENTLY. Fail closed: if ANY fetch
+	// errors we return unknown + error rather than risk selecting a master/feature
+	// build from incomplete data ("we must filter out master").
+	var (
+		masterSHAs, devSHAs map[string]bool
+		tags                []string
+	)
+	grp, gctx := errgroup.WithContext(ctx)
+	grp.Go(func() error {
+		s, e := g.branchCommitSHAs(gctx, q.Repo, q.FilterBranch, masterWindowDays)
+		masterSHAs = s
+		return e
+	})
+	requireDev := q.DevBranch != ""
+	if requireDev {
+		grp.Go(func() error {
+			s, e := g.branchCommitSHAs(gctx, q.Repo, q.DevBranch, devWindowDays)
+			devSHAs = s
+			return e
+		})
+	}
+	grp.Go(func() error {
+		t, e := g.packageTags(gctx, q.Owner, q.Package, 5)
+		tags = t
+		return e
+	})
+	if err := grp.Wait(); err != nil {
 		return res, err
 	}
-	tags, err := g.packageTags(ctx, q.Owner, q.Package, 5)
-	if err != nil {
-		return res, err
-	}
-	candidates := filterDedupeTags(tags, branchSHAs, q.TagExcludes)
+	// A candidate qualifies iff it is NOT a filter-branch (master) build and — when a
+	// dev branch is configured — IS a dev-branch build (so feature/dependabot/CI builds
+	// on other branches are rejected too).
+	candidates := filterDedupeTags(tags, masterSHAs, devSHAs, requireDev, q.TagExcludes)
 	if len(candidates) == 0 {
 		return res, nil
 	}
@@ -454,7 +491,9 @@ func (g *githubClient) branchCommitSHAs(ctx context.Context, repo, branch string
 		}
 		resp, err := g.apiGet(ctx, url, &commits)
 		if err != nil {
-			return shas, nil // best-effort: a commits failure shouldn't kill the whole check
+			// Fail closed: an incomplete branch-commit set would silently disable the
+			// master-exclude / dev-include filter and could select a master build.
+			return nil, fmt.Errorf("list %s commits for %s: %w", branch, repo, err)
 		}
 		for _, c := range commits {
 			if len(c.SHA) >= 7 {
@@ -506,9 +545,11 @@ func (g *githubClient) packageTags(ctx context.Context, owner, pkg string, maxPa
 	return all, nil
 }
 
-// filterDedupeTags drops excluded tags, strips arch variants (everything after
-// the first '-'), dedupes preserving order, and removes filter-branch CI SHAs.
-func filterDedupeTags(tags []string, branchSHAs map[string]bool, excludes []string) []string {
+// filterDedupeTags drops excluded tags, strips arch variants (everything after the
+// first '-'), dedupes preserving order, removes filter-branch (master) builds, and —
+// when requireDev is set — keeps ONLY builds whose SHA is on the dev branch (rejecting
+// release/feature/dependabot builds that are neither master nor dev).
+func filterDedupeTags(tags []string, masterSHAs, devSHAs map[string]bool, requireDev bool, excludes []string) []string {
 	var excludeRe *regexp.Regexp
 	if len(excludes) > 0 {
 		excludeRe = regexp.MustCompile("(?i)" + strings.Join(excludes, "|"))
@@ -523,8 +564,11 @@ func filterDedupeTags(tags []string, branchSHAs map[string]bool, excludes []stri
 		if i := strings.Index(stripped, "-"); i >= 0 {
 			stripped = stripped[:i]
 		}
-		if stripped == "" || seen[stripped] || branchSHAs[stripped] {
+		if stripped == "" || seen[stripped] || masterSHAs[stripped] {
 			continue
+		}
+		if requireDev && !devSHAs[stripped] {
+			continue // not a dev-branch build → reject (dev-only policy)
 		}
 		seen[stripped] = true
 		out = append(out, stripped)
