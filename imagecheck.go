@@ -67,7 +67,8 @@ type strategyOverride struct {
 	TagExclude    string   `json:"tag_exclude"`
 	Owner         string   `json:"owner"`
 	Package       string   `json:"package"`
-	FilterBranch  string   `json:"filter_branch"`
+	FilterBranch  string   `json:"filter_branch"` // github-branch: branch to EXCLUDE (e.g. master)
+	DevBranch     string   `json:"dev_branch"`    // github-branch: branch a build MUST be on (e.g. dev). Empty ⇒ exclude-only.
 	ArchSuffix    string   `json:"arch_suffix"`
 	TagExcludes   []string `json:"tag_excludes"`
 	Image         string   `json:"image"`
@@ -283,7 +284,17 @@ func (ic *imageChecker) runOnce(ctx context.Context, ondemand bool) {
 	for k, rep := range units {
 		k, rep := k, rep
 		g.Go(func() error {
-			res := ic.checkUnit(gctx, rep)
+			// Detection inspects the exact running image by ImageID (its labels +
+			// RepoDigests); a failed inspect is surfaced as unknown, same as before.
+			ictx, cancel := context.WithTimeout(gctx, 15*time.Second)
+			info, ierr := ic.docker.inspectImage(ictx, rep.ImageID)
+			cancel()
+			res := imageCheck{Image: rep.Image, ImageStatus: statusUnknown, VersionStatus: statusUnknown, CheckedAt: time.Now().Unix()}
+			if ierr != nil {
+				res.Error = "inspect: " + ierr.Error()
+			} else {
+				res = ic.checkUnit(gctx, rep, info)
+			}
 			rmu.Lock()
 			results[k] = res
 			rmu.Unlock()
@@ -652,18 +663,17 @@ func (ic *imageChecker) resolveStrategy(c ContainerStatus, info imageInfo, ref i
 	return effStrategy{source: "registry-digest", origin: "auto"}
 }
 
-// checkUnit computes one image's status.
-func (ic *imageChecker) checkUnit(ctx context.Context, c ContainerStatus) imageCheck {
+// checkUnit computes one image's status from a (best-effort) local image inspect.
+// The caller owns the inspect — detection by the running container's ImageID, the
+// update resolver by the compose image reference — so checkUnit classifies off the
+// image *reference* plus remote GitHub/registry lookups and treats an empty `info`
+// as non-fatal (current version falls back to the tag; only registry-digest needs
+// the local RepoDigest). This mirrors the ansible frigate model (reference-driven,
+// no hard ImageID dependency).
+func (ic *imageChecker) checkUnit(ctx context.Context, c ContainerStatus, info imageInfo) imageCheck {
 	ref := parseImageReference(c.Image, "latest")
 	res := imageCheck{Image: c.Image, ImageStatus: statusUnknown, VersionStatus: statusUnknown, CheckedAt: time.Now().Unix()}
 
-	ictx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	info, err := ic.docker.inspectImage(ictx, c.ImageID)
-	cancel()
-	if err != nil {
-		res.Error = "inspect: " + err.Error()
-		return res
-	}
 	current := info.Labels["org.opencontainers.image.version"]
 	if current == "" {
 		current = ref.Tag
@@ -793,6 +803,7 @@ func (ic *imageChecker) fillGithubBranch(ctx context.Context, res *imageCheck, c
 		Package:      o.Package,
 		Repo:         o.GithubRepo,
 		FilterBranch: o.FilterBranch,
+		DevBranch:    o.DevBranch,
 		ArchSuffix:   firstNonEmpty(o.ArchSuffix, ic.arch),
 		TagExcludes:  o.TagExcludes,
 		CurrentTag:   ref.Tag,

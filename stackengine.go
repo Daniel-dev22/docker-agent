@@ -225,7 +225,13 @@ func (e *engine) updateProject(ctx, parentCtx context.Context, j *Job, entry Pro
 
 	// 3. apply targets in-memory + persist to disk (reversible per service).
 	applyImages(project, targets)
-	diskOld := e.persistTargets(j, entry, targets) // service → prior on-disk image
+	diskOld, perr := e.persistTargets(j, entry, targets) // service → prior on-disk image
+	if perr != nil {
+		// A persist failure would leave running state ahead of disk (reverts on the
+		// next restart / manual `compose up`). Revert what we wrote and fail loudly.
+		e.revertDisk(j, entry, diskOld)
+		return fmt.Errorf("persist: %w", perr)
+	}
 
 	// 4. pull + up --force-recreate.
 	j.appendLine("pulling images")
@@ -298,19 +304,20 @@ func applyImages(project *types.Project, targets map[string]string) {
 }
 
 // persistTargets writes each resolved tag to the on-host compose/.env and returns
-// the prior on-disk value per service (for a reversible rollback). Best-effort:
-// a persistence failure is logged, not fatal (the in-memory deploy still proceeds).
-func (e *engine) persistTargets(j *Job, entry ProjectEntry, targets map[string]string) map[string]string {
+// the prior on-disk value per service (for a reversible rollback). A persistence
+// failure is fatal: returning an error lets the caller revert the partial writes and
+// fail the update, rather than deploy a tag that disk would revert on the next
+// `compose up`. The returned map holds whatever was written before the failure.
+func (e *engine) persistTargets(j *Job, entry ProjectEntry, targets map[string]string) (map[string]string, error) {
 	old := map[string]string{}
 	for svc, img := range targets {
 		prev, err := setServiceImage(entry, svc, img)
 		if err != nil {
-			j.appendLine(fmt.Sprintf("warn: persist %s tag failed: %v", svc, err))
-			continue
+			return old, fmt.Errorf("persist %s tag: %w", svc, err)
 		}
 		old[svc] = prev
 	}
-	return old
+	return old, nil
 }
 
 // revertDisk restores each persisted service's prior on-disk image (pull-failure

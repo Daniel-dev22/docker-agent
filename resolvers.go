@@ -184,29 +184,58 @@ func (r *registryResolver) plan(ctx context.Context, project *types.Project, log
 			continue // build-only service: nothing to resolve/pull by tag
 		}
 		ref := parseImageReference(svc.Image, "latest")
-		info, _ := r.e.docker.inspectImage(ctx, svc.Image) // best-effort (may be unpulled)
+		// Best-effort inspect by the compose image *reference* (may be unpulled); the
+		// reference is what we deploy, and checkUnit tolerates an empty info.
+		info, _ := r.e.docker.inspectImage(ctx, svc.Image)
 		synthC := ContainerStatus{ComposeProject: project.Name, ComposeService: name, Image: svc.Image}
 		strat := ic.resolveStrategy(synthC, info, ref)
+		chk := ic.checkUnit(ctx, synthC, info)
 
-		chk := ic.checkUnit(ctx, synthC)
-		switch chk.ImageStatus {
-		case statusOutdated:
-			// registry-digest = same tag, newer digest → pull handles it (no rewrite).
-			if strat.source == "registry-digest" {
+		// registry-digest = moving tag: pull always refreshes the digest, so an empty
+		// target (incl. an "unknown" from an unpulled image) is correct — no rewrite.
+		if strat.source == "registry-digest" {
+			if chk.ImageStatus == statusOutdated {
 				log(fmt.Sprintf("%s: newer digest for %s (pull)", name, svc.Image))
-				continue
 			}
-			if chk.LatestImageVersion != "" && chk.LatestImageVersion != svc.Image {
-				targets[name] = chk.LatestImageVersion
-				log(fmt.Sprintf("%s: %s → %s (%s)", name, svc.Image, chk.LatestImageVersion, chk.VersionSource))
-			}
-		case statusUnknown:
-			if chk.Error != "" {
-				log(fmt.Sprintf("%s: version unknown (%s) — pull", name, chk.Error))
-			}
+			continue
+		}
+
+		// Version-resolved (github-branch / github-release / override): we MUST resolve a
+		// concrete target. A failure here is LOUD — never silently redeploy the old pin
+		// and report success.
+		target, perr := planServiceTarget(name, svc.Image, chk)
+		if perr != nil {
+			return nil, perr
+		}
+		if target != "" {
+			targets[name] = target
+			log(fmt.Sprintf("%s: %s → %s (%s)", name, svc.Image, target, chk.VersionSource))
 		}
 	}
 	return targets, nil
+}
+
+// planServiceTarget decides the update target for one VERSION-RESOLVED service
+// (registry-digest is handled by the caller). It returns:
+//   - (tag, nil)  → rewrite the service image to tag,
+//   - ("",  nil)  → nothing to do (already current),
+//   - ("",  err)  → LOUD failure: the service is outdated/uncheckable but we could not
+//     resolve a concrete target, so the update must fail rather than silently redeploy
+//     the existing pin and report success.
+func planServiceTarget(name, svcImage string, chk imageCheck) (string, error) {
+	switch chk.ImageStatus {
+	case statusOutdated:
+		if chk.LatestImageVersion == "" {
+			return "", fmt.Errorf("%s: %s is outdated but the resolver produced no target image (%s)", name, svcImage, chk.VersionSource)
+		}
+		if chk.LatestImageVersion != svcImage {
+			return chk.LatestImageVersion, nil
+		}
+		return "", nil // resolved target equals current image — nothing to do
+	case statusUnknown:
+		return "", fmt.Errorf("%s: version check failed for %s (%s) — refusing to update from incomplete data", name, svcImage, chk.Error)
+	}
+	return "", nil // statusUpdated → already current
 }
 
 // ---------------------------------------------------------------------------
