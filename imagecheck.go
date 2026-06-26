@@ -126,6 +126,7 @@ type imageChecker struct {
 	overrides   map[string]strategyOverride // override key → override
 	projPlans   map[string]projPlan         // coupled/special project name → resolver plan
 	lastFullRun time.Time
+	forceNext   bool // defeat the TTL coalesce for the next pass (post-update recheck)
 
 	trigger   chan struct{}
 	afterPass func() // Phase 4: invoked after each pass to refresh the discovery feed.
@@ -232,6 +233,18 @@ func (ic *imageChecker) Trigger() {
 	}
 }
 
+// ForceRecheck requests an out-of-band pass that BYPASSES the TTL coalesce. Called
+// right after a successful update so the new image status reaches the fleet snapshot
+// and the discovery feed within seconds — otherwise both keep the pre-update status
+// for up to one interval, and the controller's smart-routing re-targets an
+// already-updated stack (sending an update where it should have skipped).
+func (ic *imageChecker) ForceRecheck() {
+	ic.mu.Lock()
+	ic.forceNext = true
+	ic.mu.Unlock()
+	ic.Trigger()
+}
+
 // jitterFor returns a deterministic [0,max) offset from a seed (node name) so
 // each host fires at a stable but distinct phase.
 func jitterFor(seed string, max time.Duration) time.Duration {
@@ -250,10 +263,12 @@ func jitterFor(seed string, max time.Duration) time.Duration {
 // (project,service,image), recompute stale entries with bounded concurrency, and
 // prune cache entries for images no longer present.
 func (ic *imageChecker) runOnce(ctx context.Context, ondemand bool) {
-	ic.mu.RLock()
+	ic.mu.Lock()
 	since := time.Since(ic.lastFullRun)
-	ic.mu.RUnlock()
-	if ondemand && since < ic.ttl {
+	force := ic.forceNext
+	ic.forceNext = false
+	ic.mu.Unlock()
+	if ondemand && !force && since < ic.ttl {
 		return // coalesce rapid triggers
 	}
 

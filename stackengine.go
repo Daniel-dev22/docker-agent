@@ -189,6 +189,13 @@ func (e *engine) runUpdate(ctx context.Context, j *Job, fleetTrigger func()) {
 	j.appendLine("update " + name + " ok")
 	j.markCompleted()
 	fleetTrigger()
+	// Re-check image status NOW (bypassing the TTL coalesce) so the just-deployed
+	// image's "updated" status reaches the fleet + discovery feed within seconds —
+	// otherwise the controller's smart-routing keeps seeing the stale "outdated" and
+	// re-targets this stack on the next action.
+	if e.images != nil {
+		e.images.ForceRecheck()
+	}
 }
 
 // updateProject runs the full pipeline. parentCtx is the un-timed-out job context
