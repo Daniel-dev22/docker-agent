@@ -115,18 +115,20 @@ type imageChecker struct {
 	cc       *http.Client
 	ccURL    string
 
-	interval    time.Duration
-	ttl         time.Duration
-	concurrency int
-	arch        string
-	jitterSeed  string // node name → deterministic per-node jitter
+	interval      time.Duration
+	ttl           time.Duration
+	forceDebounce time.Duration // min gap between admitted refresh-endpoint forces
+	concurrency   int
+	arch          string
+	jitterSeed    string // node name → deterministic per-node jitter
 
 	mu          sync.RWMutex
 	cache       map[string]imageCheck       // compositeKey → result
 	overrides   map[string]strategyOverride // override key → override
 	projPlans   map[string]projPlan         // coupled/special project name → resolver plan
 	lastFullRun time.Time
-	forceNext   bool // defeat the TTL coalesce for the next pass (post-update recheck)
+	forceNext   bool      // defeat the TTL coalesce for the next pass (post-update recheck)
+	lastForce   time.Time // last time a debounced force was admitted (refresh endpoint)
 
 	trigger   chan struct{}
 	afterPass func() // Phase 4: invoked after each pass to refresh the discovery feed.
@@ -158,20 +160,21 @@ func (ic *imageChecker) setProjectPlanner(fn func(ctx context.Context, name stri
 func newImageChecker(cfg Config, dc *dockerClient, cc *http.Client) *imageChecker {
 	reg := newRegistryClient(cfg.RegistryAuthFile, splitCSV(getEnv("DOCKER_REGISTRY_INSECURE", "")))
 	return &imageChecker{
-		docker:      dc,
-		registry:    reg,
-		github:      newGithubClient(cc, cfg.ControlCenterURL, reg),
-		cc:          cc,
-		ccURL:       cfg.ControlCenterURL,
-		interval:    getEnvDuration("DOCKER_IMAGECHECK_INTERVAL", 15*time.Minute),
-		ttl:         getEnvDuration("DOCKER_IMAGECHECK_TTL", 5*time.Minute),
-		concurrency: imageCheckConcurrency(),
-		arch:        getEnv("DOCKER_IMAGE_ARCH", "amd64"),
-		jitterSeed:  cfg.NodeName,
-		cache:       map[string]imageCheck{},
-		overrides:   map[string]strategyOverride{},
-		projPlans:   map[string]projPlan{},
-		trigger:     make(chan struct{}, 1),
+		docker:        dc,
+		registry:      reg,
+		github:        newGithubClient(cc, cfg.ControlCenterURL, reg),
+		cc:            cc,
+		ccURL:         cfg.ControlCenterURL,
+		interval:      getEnvDuration("DOCKER_IMAGECHECK_INTERVAL", 15*time.Minute),
+		ttl:           getEnvDuration("DOCKER_IMAGECHECK_TTL", 5*time.Minute),
+		forceDebounce: getEnvDuration("DOCKER_IMAGECHECK_FORCE_DEBOUNCE", 15*time.Second),
+		concurrency:   imageCheckConcurrency(),
+		arch:          getEnv("DOCKER_IMAGE_ARCH", "amd64"),
+		jitterSeed:    cfg.NodeName,
+		cache:         map[string]imageCheck{},
+		overrides:     map[string]strategyOverride{},
+		projPlans:     map[string]projPlan{},
+		trigger:       make(chan struct{}, 1),
 	}
 }
 
@@ -241,6 +244,21 @@ func (ic *imageChecker) Trigger() {
 func (ic *imageChecker) ForceRecheck() {
 	ic.mu.Lock()
 	ic.forceNext = true
+	ic.mu.Unlock()
+	ic.Trigger()
+}
+
+// ForceRecheckDebounced is the user-/test-facing refresh: it forces a non-coalesced
+// pass (so a just-changed strategy is reloaded and recomputed immediately, not up to
+// one TTL later) but admits at most one force per forceDebounce window. A spammed
+// refresh button thus collapses to a single forced pass plus cheap coalesced triggers,
+// instead of running back-to-back full snapshot+digest fan-outs.
+func (ic *imageChecker) ForceRecheckDebounced() {
+	ic.mu.Lock()
+	if time.Since(ic.lastForce) >= ic.forceDebounce {
+		ic.forceNext = true
+		ic.lastForce = time.Now()
+	}
 	ic.mu.Unlock()
 	ic.Trigger()
 }
