@@ -196,13 +196,15 @@ func (a *app) handleImageChecks(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"checks": a.images.snapshotCache()})
 }
 
-// handleImageCheckRefresh requests an out-of-band image-check pass (coalesced,
-// TTL-gated). Returns 202 — the next /ws/fleet snapshot carries fresh statuses.
+// handleImageCheckRefresh requests an out-of-band image-check pass that BYPASSES the
+// TTL coalesce (debounced to one force per window), so a strategy the caller just
+// changed is reloaded and recomputed within seconds instead of up to one TTL later.
+// Returns 202 — the next /ws/fleet snapshot carries fresh statuses.
 func (a *app) handleImageCheckRefresh(c *gin.Context) {
 	if a.images == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "image checker not running"})
 		return
 	}
-	a.images.Trigger()
+	a.images.ForceRecheckDebounced()
 	c.JSON(http.StatusAccepted, gin.H{"triggered": true})
 }
