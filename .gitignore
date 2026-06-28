@@ -1,3 +1,11 @@
 /docker-agent
 /.build/
 *.sqlite*
+
+# Runtime / deployment artifacts — never commit (host-local state & secrets)
+/data/
+/logs/
+/state/
+/bearer-token
+/docker-compose.yml
+*~

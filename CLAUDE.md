@@ -6,21 +6,30 @@ on `traefik-network`. Cross-cutting agent rules (outbound dial rewriter,
 bearer-token auth, agent-kit-go) live in the controller repo's `CLAUDE.md`
 "Standalone Agent APIs" section — read that first for anything deploy/auth.
 
-## API consumer contract — system_monitor (READ BEFORE CHANGING ANY ENDPOINT)
+## API consumer contract — Ansible + system_monitor (READ BEFORE CHANGING ANY ENDPOINT)
 
-`system_monitor` (the Ansible repo's `system_monitor/` service) is now a
-first-class consumer of this agent's API — it replaced the retired Portainer
-integration. It talks to the agent **directly** the way it talks to the Traefik
-API: it resolves the `docker-agent` container IP via `docker inspect` and
-`curl http://<ip>:8080{path}` on the host (local or over SSH for the NAS),
-bypassing Traefik's mTLS gate. So it sends **no bearer token and no client
-cert** — do not add an inbound auth requirement on these routes without
-coordinating, or you will silently break it.
+This agent's API has TWO consumers in the Ansible repo, and BOTH go through ONE
+shared client — `plugins/module_utils/docker_agent_client.py` (`DockerAgentClient`)
+— which OWNS every request/response shape:
 
-**HARD RULE: before you change the shape or behaviour of any endpoint below,
-check what `system_monitor` relies on and update it in lockstep.** A breaking
-change to this API is not "done" until `system_monitor` is updated and verified
-against it. Treat the response fields listed here as a contract.
+- the Ansible **`docker_agent_stack`** module (runs on-host under `become`) —
+  compose register / op (up/recreate/update/down/pull/restart);
+- the **`system_monitor`** service — network-mismatch + frigate remediation. It
+  replaced the retired Portainer integration.
+
+Both reach the agent **directly** on its `traefik-network` container IP via
+**in-process HTTP** (the client resolves the IP from the local Docker Engine unix
+socket, then `http://<ip>:8080{path}`) — **no curl, no `docker inspect`
+subprocess**. For remote hosts system_monitor SCPs that SAME client file
+(checksum-gated) and runs it on the host, so the call pattern never diverges. These
+routes carry **no bearer token and no client cert** — do not add an inbound auth
+requirement without coordinating, or you will silently break both consumers.
+
+**HARD RULE: the client is the single source of truth for these shapes — NOT the
+call sites. Before you change the shape or behaviour of any endpoint below, update
+`docker_agent_client.py`, then verify BOTH consumers in lockstep.** A breaking
+change to this API is not "done" until the client + both consumers are updated and
+verified. Treat the response fields listed here as a contract.
 
 Endpoints + fields system_monitor depends on:
 
@@ -48,6 +57,12 @@ Notes / gotchas:
   `compose_files`. Keep those two fields populated for every project.
 
 Consumer code (Ansible repo):
-- `system_monitor/modules/docker_agent_utils.py` — the transport (inspect + curl).
+- `plugins/module_utils/docker_agent_client.py` — **the shared client; owns all
+  shapes.** Change endpoints HERE first. Standalone (stdlib `json` + `aiohttp`, no
+  ansible/system_monitor imports) so it's importable by both consumers and SCP-able
+  as one file. NOTE: must stay orjson-free — the NAS has `aiohttp` but not `orjson`.
+- `plugins/modules/docker_agent_stack.py` — Ansible module (on-host) over the client.
+- `system_monitor/modules/docker_agent_utils.py` — system_monitor's local/remote
+  router over the client (local = in-process; remote = SCP'd client run on the host).
 - `system_monitor/modules/docker_network_health.py` / `docker_network_monitor.py`.
 - `system_monitor/modules/truenas_monitor.py` (frigate remediation).
