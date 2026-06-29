@@ -86,6 +86,9 @@ func registerRoutes(r *gin.Engine, app *app) {
 	r.POST("/v1/containers/:id/restart", app.handleContainerRestart)
 	r.DELETE("/v1/containers/:id", app.handleContainerRemove)
 	r.POST("/v1/containers/bulk", app.handleContainerBulk)
+	// Historical (non-follow) log window — the viewer's back-paging walks
+	// backwards via ?until=<oldest-ts>; the live tail is the WS route below.
+	r.GET("/v1/containers/:id/logs", app.handleContainerLogsHistory)
 
 	// Compose project ops + registry (Phase 2) — ops are long async jobs
 	// (202 + job id), CRUD/copy are synchronous. All ride the ProxyHandler
@@ -103,6 +106,7 @@ func registerRoutes(r *gin.Engine, app *app) {
 	r.POST("/v1/images/refresh", app.handleImageCheckRefresh)
 
 	r.GET("/ws/jobs/:id/logs", app.handleJobLogsWS)
+	r.GET("/ws/containers/:id/logs", app.handleContainerLogsWS)
 	r.GET("/ws/fleet", app.handleFleetWS)
 }
 
