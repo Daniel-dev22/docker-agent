@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -132,7 +131,9 @@ func (a *app) handleCancelJob(c *gin.Context) {
 	c.JSON(http.StatusConflict, gin.H{"error": "job not cancellable (unknown or already terminal)"})
 }
 
-// handleJobLogsWS streams a job's log: backlog then live lines.
+// handleJobLogsWS streams a job's log: backlog then live lines, over the shared
+// streamLines pump. The job registry is the SOURCE (in-process ring + channel);
+// delivery is identical to container logs.
 func (a *app) handleJobLogsWS(c *gin.Context) {
 	conn, err := fleetUpgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
@@ -145,40 +146,7 @@ func (a *app) handleJobLogsWS(c *gin.Context) {
 		return
 	}
 	defer unsub()
-	// Frontend JobLogStream expects raw newline-delimited text frames.
-	writeLine := func(line string) bool {
-		return conn.WriteMessage(websocket.TextMessage, []byte(line+"\n")) == nil
-	}
-	for _, line := range backlog {
-		if !writeLine(line) {
-			return
-		}
-	}
-	go func() {
-		for {
-			if _, _, err := conn.ReadMessage(); err != nil {
-				conn.Close()
-				return
-			}
-		}
-	}()
-	ping := time.NewTicker(20 * time.Second)
-	defer ping.Stop()
-	for {
-		select {
-		case line, open := <-ch:
-			if !open {
-				return
-			}
-			if !writeLine(line) {
-				return
-			}
-		case <-ping.C:
-			if conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second)) != nil {
-				return
-			}
-		}
-	}
+	streamLines(conn, backlog, ch)
 }
 
 // ---------------------------------------------------------------------------

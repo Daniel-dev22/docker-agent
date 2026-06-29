@@ -278,17 +278,151 @@ func (d *dockerClient) removeContainer(ctx context.Context, id string, force boo
 	return d.cli.ContainerRemove(ctx, id, container.RemoveOptions{Force: force})
 }
 
-// containerLogsFollow opens a following log stream (stdout+stderr, timestamps,
-// last 500 lines of backlog). The caller owns Close. Multiplexed stdcopy frames
-// are demuxed by the reader in engine/handlers; raw text otherwise.
-func (d *dockerClient) containerLogsFollow(ctx context.Context, id string) (io.ReadCloser, error) {
-	return d.cli.ContainerLogs(ctx, id, container.LogsOptions{
+// ---------------------------------------------------------------------------
+// Container log streaming (live follow + historical back-paging).
+//
+// Container logs are the agent's only EXTERNAL, daemon-owned, effectively
+// unbounded log source: stdout+stderr come back stdcopy-multiplexed (raw if the
+// container has a TTY), prefixed with RFC3339 timestamps, and queryable by
+// Tail/Since/Until. All that Docker-specific decoding lives here; the WS
+// delivery is the shared streamLines pump (wslog.go).
+// ---------------------------------------------------------------------------
+
+// containerLogChanBuf bounds the demux→WS handoff channel so the Docker reader
+// isn't stalled by a slow client, without buffering unboundedly.
+const containerLogChanBuf = 256
+
+// logQuery parameterises a container log fetch. Zero-value fields are omitted
+// (Tail "" means "all" to the daemon).
+type logQuery struct {
+	Tail       string // line count or "all"
+	Since      string // RFC3339 / unix; lower time bound
+	Until      string // RFC3339 / unix; upper time bound (history back-paging)
+	Timestamps bool   // prefix each line with the RFC3339 emit time
+	Follow     bool   // stream new lines (live tail) vs return and stop (history)
+}
+
+func (q logQuery) options() container.LogsOptions {
+	return container.LogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
-		Follow:     true,
-		Timestamps: true,
-		Tail:       "500",
-	})
+		Follow:     q.Follow,
+		Timestamps: q.Timestamps,
+		Tail:       q.Tail,
+		Since:      q.Since,
+		Until:      q.Until,
+	}
+}
+
+// lineWriter is an io.Writer that emits each complete '\n'-terminated line
+// (newline stripped) to emit, retaining a partial trailing line across writes.
+// It compacts in place so the buffer stays bounded by the longest single line —
+// no per-line allocation beyond the emitted string, and no scanner length cap.
+// Single-goroutine use only (the demux owns it).
+type lineWriter struct {
+	buf  []byte
+	emit func(string)
+}
+
+func (w *lineWriter) Write(p []byte) (int, error) {
+	w.buf = append(w.buf, p...)
+	start := 0
+	for {
+		i := bytes.IndexByte(w.buf[start:], '\n')
+		if i < 0 {
+			break
+		}
+		w.emit(string(w.buf[start : start+i]))
+		start += i + 1
+	}
+	if start > 0 {
+		w.buf = w.buf[:copy(w.buf, w.buf[start:])]
+	}
+	return len(p), nil
+}
+
+// flush emits a final line that has no trailing newline.
+func (w *lineWriter) flush() {
+	if len(w.buf) > 0 {
+		w.emit(string(w.buf))
+		w.buf = w.buf[:0]
+	}
+}
+
+// demuxLogs reads a Docker log stream to EOF, emitting each line. TTY streams are
+// raw; everything else is stdcopy-multiplexed (stdout+stderr to one sink keeps
+// arrival order). The single decode path shared by the follow channel, the
+// history slice, and containerLogsTail.
+func demuxLogs(rc io.Reader, tty bool, emit func(string)) {
+	lw := &lineWriter{emit: emit}
+	if tty {
+		_, _ = io.Copy(lw, rc)
+	} else {
+		_, _ = stdcopy.StdCopy(lw, lw, rc)
+	}
+	lw.flush()
+}
+
+// containerHasTTY reports whether the container allocates a TTY (its log stream
+// is then raw, not stdcopy-multiplexed).
+func (d *dockerClient) containerHasTTY(ctx context.Context, id string) (bool, error) {
+	info, err := d.cli.ContainerInspect(ctx, id)
+	if err != nil {
+		return false, err
+	}
+	return info.Config != nil && info.Config.Tty, nil
+}
+
+// containerLogLines opens a following log stream and returns a channel of decoded
+// lines plus a stop func. Docker delivers the Tail backlog inline as the first
+// lines, so there is no separate backlog slice. stop() cancels the stream and
+// closes the reader, unblocking the demux goroutine, which then closes the
+// channel — no goroutine or stream leak on client disconnect.
+func (d *dockerClient) containerLogLines(ctx context.Context, id string, q logQuery) (<-chan string, func(), error) {
+	tty, err := d.containerHasTTY(ctx, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	q.Follow = true
+	rc, err := d.cli.ContainerLogs(ctx, id, q.options())
+	if err != nil {
+		return nil, nil, err
+	}
+	ch := make(chan string, containerLogChanBuf)
+	streamCtx, cancel := context.WithCancel(ctx)
+	go func() {
+		defer close(ch)
+		defer rc.Close()
+		demuxLogs(rc, tty, func(line string) {
+			select {
+			case ch <- line:
+			case <-streamCtx.Done():
+			}
+		})
+	}()
+	stop := func() {
+		cancel()
+		_ = rc.Close()
+	}
+	return ch, stop, nil
+}
+
+// containerLogsHistory returns a bounded, non-following window of decoded lines
+// (the viewer's back-paging and the rollback log dump both go through here).
+func (d *dockerClient) containerLogsHistory(ctx context.Context, id string, q logQuery) ([]string, error) {
+	tty, err := d.containerHasTTY(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	q.Follow = false
+	rc, err := d.cli.ContainerLogs(ctx, id, q.options())
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	var lines []string
+	demuxLogs(rc, tty, func(line string) { lines = append(lines, line) })
+	return lines, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -344,28 +478,16 @@ func (d *dockerClient) containerNetworks(ctx context.Context, nameOrID string) (
 
 // containerLogsTail returns the last `tail` lines of a container's combined
 // stdout+stderr (Phase 3.5: dump an unhealthy container's logs into the update
-// job log on rollback). Non-following, demuxed.
+// job log on rollback). Non-following, no timestamps, empty lines dropped — a
+// thin filter over the shared historical-window fetch, byte-compatible with its
+// previous behaviour (TTY handling now via authoritative inspect, not a retry).
 func (d *dockerClient) containerLogsTail(ctx context.Context, nameOrID, tail string) ([]string, error) {
-	rc, err := d.cli.ContainerLogs(ctx, nameOrID, container.LogsOptions{
-		ShowStdout: true, ShowStderr: true, Tail: tail,
-	})
+	raw, err := d.containerLogsHistory(ctx, nameOrID, logQuery{Tail: tail})
 	if err != nil {
 		return nil, err
 	}
-	defer rc.Close()
-	var buf bytes.Buffer
-	if _, err := stdcopy.StdCopy(&buf, &buf, rc); err != nil {
-		// TTY containers aren't multiplexed — fall back to raw on demux failure.
-		buf.Reset()
-		rc2, e2 := d.cli.ContainerLogs(ctx, nameOrID, container.LogsOptions{ShowStdout: true, ShowStderr: true, Tail: tail})
-		if e2 != nil {
-			return nil, e2
-		}
-		defer rc2.Close()
-		_, _ = io.Copy(&buf, rc2)
-	}
-	var lines []string
-	for _, ln := range strings.Split(buf.String(), "\n") {
+	lines := raw[:0]
+	for _, ln := range raw {
 		if strings.TrimSpace(ln) != "" {
 			lines = append(lines, ln)
 		}
