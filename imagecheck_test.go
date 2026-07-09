@@ -1,6 +1,80 @@
 package main
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
+
+// TestMergeProjPlans covers the detection-path degradation: a transient upstream
+// failure must not flash a coupled stack's card to "unknown", but a persistent one
+// must still surface.
+func TestMergeProjPlans(t *testing.T) {
+	const ttl = 30 * time.Minute
+	now := time.Now()
+	good := func(at time.Time) projPlan {
+		return projPlan{kind: "upstream-compose", targets: map[string]string{"immich-server": "img:v3"}, at: at}
+	}
+	bad := projPlan{kind: "upstream-compose", err: "upstream-compose: fetch ...: HTTP 429"}
+
+	tests := []struct {
+		name        string
+		prev, next  map[string]projPlan
+		wantErr     bool // does the merged plan for "immich" carry an error?
+		wantTargets int
+	}{
+		{
+			name:    "transient error retains a recent good plan",
+			prev:    map[string]projPlan{"immich": good(now.Add(-time.Minute))},
+			next:    map[string]projPlan{"immich": bad},
+			wantErr: false, wantTargets: 1,
+		},
+		{
+			name:    "error surfaces once the retained plan ages past the ttl",
+			prev:    map[string]projPlan{"immich": good(now.Add(-2 * ttl))},
+			next:    map[string]projPlan{"immich": bad},
+			wantErr: true,
+		},
+		{
+			name:    "nothing to fall back to on the very first pass",
+			prev:    map[string]projPlan{},
+			next:    map[string]projPlan{"immich": bad},
+			wantErr: true,
+		},
+		{
+			name:    "a previous error is never retained",
+			prev:    map[string]projPlan{"immich": bad},
+			next:    map[string]projPlan{"immich": bad},
+			wantErr: true,
+		},
+		{
+			name:    "a successful pass always wins over the retained plan",
+			prev:    map[string]projPlan{"immich": good(now.Add(-time.Minute))},
+			next:    map[string]projPlan{"immich": good(now)},
+			wantErr: false, wantTargets: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := mergeProjPlans(tc.prev, tc.next, now, ttl)
+			pp := got["immich"]
+			if (pp.err != "") != tc.wantErr {
+				t.Fatalf("err = %q, wantErr %v", pp.err, tc.wantErr)
+			}
+			if len(pp.targets) != tc.wantTargets {
+				t.Fatalf("targets = %v, want %d", pp.targets, tc.wantTargets)
+			}
+		})
+	}
+
+	t.Run("a vanished project is dropped, never retained", func(t *testing.T) {
+		prev := map[string]projPlan{"immich": good(now)}
+		got := mergeProjPlans(prev, map[string]projPlan{}, now, ttl)
+		if _, ok := got["immich"]; ok {
+			t.Fatal("a project absent from the new pass must not linger")
+		}
+	})
+}
 
 func TestParseImageReference(t *testing.T) {
 	cases := []struct {

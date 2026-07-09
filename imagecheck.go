@@ -144,6 +144,35 @@ type projPlan struct {
 	kind    string
 	targets map[string]string
 	err     string
+	at      time.Time // when a SUCCESSFUL plan was computed; zero when err is set
+}
+
+// mergeProjPlans keeps a project's previous SUCCESSFUL plan when this pass failed
+// to compute one and the retained plan is still younger than ttl.
+//
+// A coupled plan depends on an upstream fetch that can fail transiently, and those
+// failures are invisible: planProject passes a no-op logger, so a bad pass silently
+// flipped the stack's card to "unknown" for a whole interval. Retaining the last
+// good plan absorbs a blip; a persistent failure still surfaces once the retained
+// plan ages out.
+//
+// Detection only. The update path (engine.updateProject) must keep failing loudly
+// on a resolve error, and does — it never reads this map. Projects absent from
+// next are dropped, so a vanished stack never lingers.
+func mergeProjPlans(prev, next map[string]projPlan, now time.Time, ttl time.Duration) map[string]projPlan {
+	for name, np := range next {
+		if np.err == "" {
+			continue
+		}
+		pp, ok := prev[name]
+		if !ok || pp.err != "" || pp.at.IsZero() {
+			continue // nothing good to fall back to
+		}
+		if now.Sub(pp.at) < ttl {
+			next[name] = pp
+		}
+	}
+	return next
 }
 
 // setAfterPass registers a callback fired at the end of every completed pass
@@ -341,6 +370,7 @@ func (ic *imageChecker) runOnce(ctx context.Context, ondemand bool) {
 	// service with its own newer upstream can't make the stack look outdated.
 	// Registry projects stay per-service (the rollup above). Computed in the pass
 	// (it can do GitHub/registry calls); stampImageStatus only reads the cache.
+	now := time.Now()
 	plans := map[string]projPlan{}
 	if ic.projectPlanner != nil {
 		seen := map[string]bool{}
@@ -360,6 +390,8 @@ func (ic *imageChecker) runOnce(ctx context.Context, ondemand bool) {
 			pp := projPlan{kind: kind, targets: targets}
 			if perr != nil {
 				pp.err = perr.Error()
+			} else {
+				pp.at = now
 			}
 			plans[name] = pp
 		}
@@ -367,7 +399,7 @@ func (ic *imageChecker) runOnce(ctx context.Context, ondemand bool) {
 
 	ic.mu.Lock()
 	ic.cache = results // replace wholesale → prunes vanished images
-	ic.projPlans = plans
+	ic.projPlans = mergeProjPlans(ic.projPlans, plans, now, 2*ic.interval)
 	ic.lastFullRun = time.Now()
 	ic.mu.Unlock()
 
@@ -763,12 +795,8 @@ func (ic *imageChecker) fillGithubRelease(ctx context.Context, res *imageCheck, 
 		res.Error = "github-release: no source repo"
 		return
 	}
-	q := releaseQuery{Repo: repo, ReleaseType: strat.o.ReleaseType, NameFilter: strat.o.NameFilter, TagExclude: strat.o.TagExclude}
-	if q.ReleaseType == "" {
-		q.ReleaseType = "latest"
-	}
 	rctx, cancel := context.WithTimeout(ctx, 25*time.Second)
-	tag, err := ic.github.latestRelease(rctx, q)
+	tag, err := ic.github.latestRelease(rctx, releaseQueryFor(repo, strat.o))
 	cancel()
 	if err != nil {
 		res.Error = "github-release: " + err.Error()

@@ -22,7 +22,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"net/url"
 	"regexp"
 	"sort"
 	"strconv"
@@ -33,7 +35,10 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-const githubAPIBase = "https://api.github.com"
+const (
+	githubAPIBase   = "https://api.github.com"
+	githubUserAgent = "docker-agent-imagecheck/1.0"
+)
 
 // ---------------------------------------------------------------------------
 // Token vend (agent → controller). build-agent keeps this in network.go; the
@@ -58,19 +63,30 @@ type githubClient struct {
 	cc       *http.Client // controller client (bearer + dial rewrite) — token vend only
 	ccURL    string
 	api      *http.Client // plain pooled client for api.github.com
+	apiBase  string
 	registry *registryClient
 
 	mu       sync.Mutex
 	token    string
 	tokenExp time.Time
+
+	// composeCache memoizes upstream compose bodies by resolved URL. A resolved
+	// URL embeds the release tag, and a tag's compose file is immutable, so a hit
+	// is always correct and a new release simply mints a new key. In-memory is the
+	// right layer: on restart we re-query GitHub (the source of truth) once, and
+	// nothing is replayed, re-fired, or lost.
+	composeMu    sync.Mutex
+	composeCache map[string]map[string]string // url → service → image TEMPLATE (pre-interpolation)
 }
 
 func newGithubClient(cc *http.Client, ccURL string, registry *registryClient) *githubClient {
 	return &githubClient{
-		cc:       cc,
-		ccURL:    ccURL,
-		api:      &http.Client{Timeout: 30 * time.Second, Transport: pooledTransport(false)},
-		registry: registry,
+		cc:           cc,
+		ccURL:        ccURL,
+		api:          &http.Client{Timeout: 30 * time.Second, Transport: pooledTransport(false)},
+		apiBase:      githubAPIBase,
+		registry:     registry,
+		composeCache: map[string]map[string]string{},
 	}
 }
 
@@ -162,7 +178,7 @@ func (g *githubClient) apiGet(ctx context.Context, url string, out any) (*http.R
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-	req.Header.Set("User-Agent", "docker-agent-imagecheck/1.0")
+	req.Header.Set("User-Agent", githubUserAgent)
 	resp, err := g.api.Do(req)
 	if err != nil {
 		return nil, err
@@ -180,6 +196,139 @@ func (g *githubClient) apiGet(ctx context.Context, url string, out any) (*http.R
 	}
 	resp.Body.Close()
 	return resp, nil
+}
+
+// ---------------------------------------------------------------------------
+// Raw file fetch (retrying, pooled, optionally authenticated).
+//
+// The compose body behind the upstream-compose resolver used to be pulled
+// anonymously from raw.githubusercontent.com in a single un-retried GET. That
+// host is Fastly-fronted with a bursty anonymous per-IP limit, so one 429 killed
+// a whole immich update — while the latestRelease call one line earlier was
+// already authenticated. rawContents closes that gap: same installation token,
+// same ~5k/hr budget.
+// ---------------------------------------------------------------------------
+
+const (
+	fetchMaxAttempts = 4
+	fetchBackoffCap  = 4 * time.Second
+	fetchMaxBytes    = 4 << 20
+)
+
+// fetchBackoffBase is the first retry delay. A var, not a const, so tests can
+// shrink it without sleeping for seconds.
+var fetchBackoffBase = 500 * time.Millisecond
+
+// retryAfter parses a Retry-After header (delta-seconds or HTTP-date). It returns
+// 0 when the header is absent, malformed, or already in the past. GitHub's raw
+// 429s carry no Retry-After at all, so the caller must not depend on it.
+func retryAfter(h http.Header) time.Duration {
+	v := strings.TrimSpace(h.Get("Retry-After"))
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
+	}
+	t, err := http.ParseTime(v)
+	if err != nil {
+		return 0
+	}
+	if d := time.Until(t); d > 0 {
+		return d
+	}
+	return 0
+}
+
+// getOnce performs a single GET. transient reports whether a retry could plausibly
+// succeed: 429, 5xx, and network errors are transient; every other 4xx is fatal,
+// because retrying a 404 or a bad credential only burns budget.
+func (g *githubClient) getOnce(ctx context.Context, u, accept string, auth bool) (body []byte, retry time.Duration, transient bool, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	if accept != "" {
+		req.Header.Set("Accept", accept)
+	}
+	req.Header.Set("User-Agent", githubUserAgent)
+	if auth {
+		token, terr := g.ensureToken(ctx)
+		if terr != nil {
+			return nil, 0, false, terr
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	}
+	resp, err := g.api.Do(req)
+	if err != nil {
+		return nil, 0, true, fmt.Errorf("get %s: %w", u, err)
+	}
+	defer resp.Body.Close()
+	switch {
+	case resp.StatusCode == http.StatusOK:
+	case resp.StatusCode == http.StatusTooManyRequests, resp.StatusCode >= 500:
+		return nil, retryAfter(resp.Header), true, fmt.Errorf("fetch %s: HTTP %d", u, resp.StatusCode)
+	default:
+		return nil, 0, false, fmt.Errorf("fetch %s: HTTP %d: %s", u, resp.StatusCode, readErrorBody(resp.Body))
+	}
+	b, rerr := io.ReadAll(io.LimitReader(resp.Body, fetchMaxBytes))
+	if rerr != nil {
+		return nil, 0, true, fmt.Errorf("read %s: %w", u, rerr)
+	}
+	return b, 0, false, nil
+}
+
+// nextWait is the delay before the next attempt: the exponential backoff, capped,
+// but never shorter than a server-supplied Retry-After. The caller's context
+// bounds the total, so an absurd Retry-After stalls nothing.
+func nextWait(backoff, retry time.Duration) time.Duration {
+	wait := min(backoff, fetchBackoffCap)
+	if retry > wait {
+		wait = retry
+	}
+	return wait
+}
+
+// getBytes GETs u with the shared pooled client, retrying transient failures with
+// exponential backoff that defers to Retry-After when the server sends one.
+func (g *githubClient) getBytes(ctx context.Context, u, accept string, auth bool) ([]byte, error) {
+	backoff := fetchBackoffBase
+	var lastErr error
+	for attempt := 1; attempt <= fetchMaxAttempts; attempt++ {
+		body, retry, transient, err := g.getOnce(ctx, u, accept, auth)
+		if err == nil {
+			return body, nil
+		}
+		if !transient {
+			return nil, err
+		}
+		lastErr = err
+		if attempt == fetchMaxAttempts {
+			break
+		}
+		wait := nextWait(backoff, retry)
+		slog.Warn("github fetch transient, retrying",
+			"url", u, "attempt", attempt, "of", fetchMaxAttempts, "wait", wait, "error", err)
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("fetch %s: %w", u, ctx.Err())
+		case <-time.After(wait):
+		}
+		backoff *= 2
+	}
+	return nil, fmt.Errorf("%w (after %d attempts)", lastErr, fetchMaxAttempts)
+}
+
+// rawContents fetches a repository file's raw bytes through the AUTHENTICATED
+// Contents API rather than raw.githubusercontent.com. Same bytes, but it rides
+// the installation token's budget instead of the anonymous per-IP bucket.
+func (g *githubClient) rawContents(ctx context.Context, repo, path, ref string) ([]byte, error) {
+	u := fmt.Sprintf("%s/repos/%s/contents/%s?ref=%s", g.apiBase, repo, path, url.QueryEscape(ref))
+	return g.getBytes(ctx, u, "application/vnd.github.raw", true)
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +401,24 @@ type releaseQuery struct {
 	NameFilter  string // e.g. "STS" (portainer)
 	TagExclude  string // regex, e.g. "-ea" (traefik)
 	FetchCount  int    // releases to scan when filtering (default 30)
+}
+
+// releaseQueryFor builds the release lookup for repo from a strategy override.
+//
+// Both callers MUST go through this. Detection (fillGithubRelease) and resolution
+// (upstreamComposeResolver.plan) have to agree on the tag, and they previously
+// built the query independently — the resolver dropped NameFilter/TagExclude, so
+// a filtered repo could resolve a tag detection had deliberately excluded.
+//
+// repo is a parameter because detection may use an auto-detected repo rather than
+// the override's own GithubRepo.
+func releaseQueryFor(repo string, o strategyOverride) releaseQuery {
+	return releaseQuery{
+		Repo:        repo,
+		ReleaseType: orDefault(o.ReleaseType, "latest"),
+		NameFilter:  o.NameFilter,
+		TagExclude:  o.TagExclude,
+	}
 }
 
 // latestRelease returns the newest release tag for q. When release_type=latest
