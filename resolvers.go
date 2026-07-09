@@ -24,8 +24,8 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
-	"net/http"
+	"log/slog"
+	neturl "net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -305,14 +305,14 @@ func (r *upstreamComposeResolver) plan(ctx context.Context, project *types.Proje
 		return nil, fmt.Errorf("upstream-compose resolver: github_repo required")
 	}
 	rctx, cancel := context.WithTimeout(ctx, 25*time.Second)
-	tag, err := ic.github.latestRelease(rctx, releaseQuery{Repo: repo, ReleaseType: orDefault(r.o.ReleaseType, "latest")})
+	tag, err := ic.github.latestRelease(rctx, releaseQueryFor(repo, r.o))
 	cancel()
 	if err != nil {
 		return nil, fmt.Errorf("upstream-compose: latest release: %w", err)
 	}
 	tmpl := r.o.UpstreamCompose
 	if tmpl == "" {
-		tmpl = "https://raw.githubusercontent.com/" + repo + "/{tag}/docker/docker-compose.yml"
+		tmpl = "https://" + rawGithubHost + "/" + repo + "/{tag}/docker/docker-compose.yml"
 	}
 	url := strings.ReplaceAll(tmpl, "{tag}", tag)
 	log(fmt.Sprintf("immich: latest release %s — reading %s", tag, url))
@@ -320,7 +320,12 @@ func (r *upstreamComposeResolver) plan(ctx context.Context, project *types.Proje
 	// immich's compose templates the app images as ${IMMICH_VERSION:-release}; pin
 	// them to the concrete release tag (the whole point of the coupled update) so
 	// the rewrite is a real version, not the floating `release` tag.
-	upstream, err := fetchComposeImages(ctx, url, map[string]string{"IMMICH_VERSION": tag})
+	//
+	// The budget is wider than one round trip because composeImages retries
+	// transient 429/5xx with backoff before giving up.
+	fctx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	upstream, err := ic.github.composeImages(fctx, url, map[string]string{"IMMICH_VERSION": tag})
+	cancel()
 	if err != nil {
 		return nil, fmt.Errorf("upstream-compose: %w", err)
 	}
@@ -385,40 +390,113 @@ func interpolateComposeVars(s string, vars map[string]string) string {
 	})
 }
 
-// fetchComposeImages downloads a compose file and returns service → image,
-// interpolating `${VAR}` image tags against vars. Plain public HTTP
-// (raw.githubusercontent) — no auth needed.
-func fetchComposeImages(ctx context.Context, url string, vars map[string]string) (map[string]string, error) {
-	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(cctx, http.MethodGet, url, nil)
+// rawGithubHost serves public repo files anonymously, with a bursty per-IP rate
+// limit. Everything it serves is also reachable through the authenticated
+// Contents API, which is what we actually use.
+const rawGithubHost = "raw.githubusercontent.com"
+
+// composeCacheMax bounds composeCache. Entries are a handful of services and grow
+// by one key per release tag observed, so this is a runaway backstop rather than a
+// working-set limit — clearing merely costs one re-fetch.
+const composeCacheMax = 64
+
+// parseRawGithubURL splits
+// https://raw.githubusercontent.com/{owner}/{name}/{ref}/{path...}
+// into its Contents-API components. ok=false for any other host, so an
+// upstream_compose pointing at a non-GitHub server still works over a plain GET.
+//
+// This is the single switch point for how a compose body is transported.
+func parseRawGithubURL(raw string) (repo, ref, path string, ok bool) {
+	u, err := neturl.Parse(raw)
+	if err != nil || u.Host != rawGithubHost {
+		return "", "", "", false
+	}
+	// A query or fragment carries intent the Contents API cannot express (a signed
+	// URL, say). Leave those alone rather than silently dropping credentials.
+	if u.RawQuery != "" || u.Fragment != "" {
+		return "", "", "", false
+	}
+	parts := strings.Split(strings.TrimPrefix(u.Path, "/"), "/")
+	if len(parts) < 4 {
+		return "", "", "", false
+	}
+	for _, p := range parts[:4] { // owner, name, ref, and at least one path segment
+		if p == "" {
+			return "", "", "", false
+		}
+	}
+	return parts[0] + "/" + parts[1], parts[2], strings.Join(parts[3:], "/"), true
+}
+
+// composeImages returns the upstream compose's service → image map for u,
+// interpolating `${VAR}` image tags against vars.
+//
+// The parsed body is cached by u. A resolved URL embeds the release tag and a
+// tag's compose file is immutable, so a hit is always correct and a new release
+// simply mints a new key. That collapses the 15-minute imagecheck pass, the
+// update's re-resolve, and the post-update ForceRecheck into ONE fetch per
+// release. The tag itself is still re-resolved every time (a cheap authenticated
+// API call), so freshness is never traded away for the cache.
+func (g *githubClient) composeImages(ctx context.Context, u string, vars map[string]string) (map[string]string, error) {
+	if tmpl, ok := g.cachedCompose(u); ok {
+		return interpolateImages(tmpl, vars), nil
+	}
+
+	var (
+		body []byte
+		err  error
+	)
+	if repo, ref, path, ok := parseRawGithubURL(u); ok {
+		body, err = g.rawContents(ctx, repo, path, ref)
+	} else {
+		body, err = g.getBytes(ctx, u, "", false)
+	}
 	if err != nil {
 		return nil, err
 	}
-	hc := &http.Client{Timeout: 20 * time.Second, Transport: pooledTransport(false)}
-	resp, err := hc.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("fetch %s: HTTP %d", url, resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if err != nil {
-		return nil, err
-	}
+
 	var doc composeImagesDoc
 	if err := yaml.Unmarshal(body, &doc); err != nil {
 		return nil, fmt.Errorf("parse upstream compose: %w", err)
 	}
-	out := make(map[string]string, len(doc.Services))
+	tmpl := make(map[string]string, len(doc.Services))
 	for name, s := range doc.Services {
 		if s.Image != "" {
-			out[name] = interpolateComposeVars(s.Image, vars)
+			tmpl[name] = s.Image
 		}
 	}
-	return out, nil
+	g.storeCompose(u, tmpl)
+	// One line per real network fetch — i.e. once per upstream release, not once
+	// per pass. The cache-hit path stays silent.
+	slog.Info("upstream compose fetched", "url", u, "services", len(tmpl))
+	return interpolateImages(tmpl, vars), nil
+}
+
+func (g *githubClient) cachedCompose(u string) (map[string]string, bool) {
+	g.composeMu.Lock()
+	defer g.composeMu.Unlock()
+	tmpl, ok := g.composeCache[u]
+	return tmpl, ok
+}
+
+func (g *githubClient) storeCompose(u string, tmpl map[string]string) {
+	g.composeMu.Lock()
+	defer g.composeMu.Unlock()
+	if len(g.composeCache) >= composeCacheMax {
+		clear(g.composeCache)
+	}
+	g.composeCache[u] = tmpl
+}
+
+// interpolateImages resolves each cached image template against vars into a FRESH
+// map. The cache holds uninterpolated templates, so it stays vars-independent and
+// callers never share (or mutate) a cached map.
+func interpolateImages(tmpl, vars map[string]string) map[string]string {
+	out := make(map[string]string, len(tmpl))
+	for name, img := range tmpl {
+		out[name] = interpolateComposeVars(img, vars)
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------
