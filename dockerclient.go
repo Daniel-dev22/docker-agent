@@ -180,6 +180,36 @@ func summaryToStatus(s container.Summary) ContainerStatus {
 	for _, p := range s.Ports {
 		cs.Ports = append(cs.Ports, Port{IP: p.IP, PrivatePort: p.PrivatePort, PublicPort: p.PublicPort, Type: p.Type})
 	}
+	// SORT — this snapshot is a change-detection input, not just a display value.
+	//
+	// The Docker API returns a container's port bindings in no particular order,
+	// and it genuinely reshuffles them between calls. The controller hashes the
+	// whole frame to decide whether the fleet changed (FleetCache.contentChanged
+	// in controller's router), so an unordered array makes an idle host look
+	// like it changed on almost every poll.
+	//
+	// Measured on the live estate: two docker snapshots 12s apart on an idle
+	// fleet differed in 45 of 1256 leaf fields — every one of them a port
+	// reshuffle, identical as a SET. That was ~69% of all docker fleet "changes",
+	// and each phantom change cost a full overview rebuild on both router
+	// replicas at both sites plus a push to every open dashboard.
+	//
+	// Sorting here rather than in the controller: the agent owns its wire format,
+	// and a consumer cannot canonicalise a payload whose schema it deliberately
+	// does not know.
+	sort.Slice(cs.Ports, func(i, j int) bool {
+		a, b := cs.Ports[i], cs.Ports[j]
+		if a.PrivatePort != b.PrivatePort {
+			return a.PrivatePort < b.PrivatePort
+		}
+		if a.PublicPort != b.PublicPort {
+			return a.PublicPort < b.PublicPort
+		}
+		if a.Type != b.Type {
+			return a.Type < b.Type
+		}
+		return a.IP < b.IP
+	})
 	return cs
 }
 
