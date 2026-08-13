@@ -62,13 +62,13 @@ func newApp(_ context.Context, cfg Config) (*app, error) {
 
 	a := &app{cfg: cfg, cc: cc, docker: dc, compose: cb, projects: projects, events: events, reg: reg}
 	a.images = newImageChecker(cfg, dc, cc)
-	eng.setImageChecker(a.images)               // Phase 3.5: update engine reuses strategy + clients
+	eng.setImageChecker(a.images)               // the update engine reuses strategy + clients
 	a.images.setProjectPlanner(eng.planProject) // coupled-project status = the update's dry-run (DRY)
 	a.fleet = newFleetHub(a)
 	reg.setFleet(a.fleet)
-	// Phase 4: discovery feed (full-snapshot push to controller). Wired after
-	// the fleet hub so it can reuse SnapshotNow; the image checker triggers it
-	// after each pass so newly-detected outdated images surface promptly.
+	// Discovery feed (full-snapshot push to the controller). Wired after the fleet
+	// hub so it can reuse SnapshotNow; the image checker triggers it after each
+	// pass so newly-detected outdated images surface promptly.
 	a.discovery = newDiscoveryPusher(a)
 	a.images.setAfterPass(a.discovery.Trigger)
 	return a, nil
@@ -88,8 +88,8 @@ func (a *app) startBackgroundWorkers(ctx context.Context) {
 	go a.fleet.Run(ctx)          // fleet broadcaster
 	go a.startReconcile(ctx)     //
 	go a.enrichProjectsOnce(ctx) // auto-adopt running compose projects into the registry
-	go a.images.Run(ctx)         // slow jittered image-outdated pass (Phase 3)
-	go a.discovery.Run(ctx)      // periodic discovery-table feed (Phase 4)
+	go a.images.Run(ctx)         // slow jittered image-outdated pass
+	go a.discovery.Run(ctx)      // periodic discovery snapshot feed
 }
 
 // enrichProjectsOnce reads the current container set once at boot and
@@ -108,9 +108,8 @@ func (a *app) enrichProjectsOnce(ctx context.Context) {
 }
 
 // startReconcile POSTs this agent's authoritative job set to the controller on
-// boot + every 5m, so a lost terminal event can't strand a row "running". In
-// Phase 0 (no producers) the snapshot is empty — a correct no-op that exercises
-// the path end to end.
+// boot + every 5m, so a lost terminal event can't strand a row "running". An
+// agent that has run no jobs posts an empty snapshot — a correct no-op.
 func (a *app) startReconcile(ctx context.Context) {
 	reconcile.Run(ctx, reconcile.Config{
 		Client:   a.cc,

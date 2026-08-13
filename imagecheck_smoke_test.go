@@ -1,6 +1,6 @@
 //go:build smoke
 
-// Phase 3 smoke test — exercises the registry-digest VersionSource + the
+// Smoke test — exercises the registry-digest VersionSource + the
 // existence gate against the REAL Docker Hub registry and a LIVE docker socket
 // (read-only: inspects local images, no mutations). GitHub/controller paths are
 // NOT exercised here (no creds in a local run); those are unit-tested for logic

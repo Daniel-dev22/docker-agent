@@ -11,9 +11,6 @@ import (
 // jobRegistry owns in-flight Jobs, drives the engine, and fans lifecycle changes
 // out to the event hook (durable outbox) + fleet hub. It is the single entry
 // point for every mutation.
-//
-// Phase 0 ships no producers — start() is wired and ready but no HTTP route calls
-// it yet; container lifecycle (Phase 1) and compose ops (Phase 2) add the routes.
 type jobRegistry struct {
 	cfg    Config
 	eng    *engine

@@ -14,12 +14,12 @@ import (
 // assumption the whole upstream-compose fix rests on.
 //
 // Skipped unless a token is supplied, so CI and the normal `go test ./...` stay
-// hermetic:
+// hermetic. Supply any GitHub App INSTALLATION token with read access to public
+// repository contents — either one you mint yourself from your App, or one from
+// the same controller endpoint the agent uses at runtime
+// (POST /api/docker/github-token, authenticated with this node's bearer token):
 //
-//	TOK=$(curl -s -X POST "http://$ROUTER_IP:5000/api/docker/github-token" \
-//	  -H "Authorization: Bearer $(sudo cat /srv/containers/docker-agent/bearer-token)" \
-//	  -H 'content-type: application/json' -d '{"repositories":[]}' | jq -r .token)
-//	DOCKER_AGENT_GH_TOKEN=$TOK go test -run TestComposeImagesLive -v .
+//	DOCKER_AGENT_GH_TOKEN=<installation-token> go test -run TestComposeImagesLive -v .
 func TestComposeImagesLiveContentsAPI(t *testing.T) {
 	token := os.Getenv("DOCKER_AGENT_GH_TOKEN")
 	if token == "" {

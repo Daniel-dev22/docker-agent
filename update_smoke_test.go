@@ -1,6 +1,6 @@
 //go:build smoke
 
-// Phase 3.5 smoke test — exercises the stack-update engine end-to-end against a
+// Smoke test — exercises the stack-update engine end-to-end against a
 // LIVE docker socket with a throwaway project (real stacks untouched). Uses the
 // override resolver (deploy an exact tag) so it needs no GitHub/registry version
 // resolution and is fully deterministic: it deploys alpine:3.19, then `update`s

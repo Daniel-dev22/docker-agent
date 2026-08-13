@@ -11,47 +11,43 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Phase 4 — discovery feed.
+// Discovery feed.
 //
-// discoveryPusher periodically POSTs the live fleet snapshot to controller's
-// POST /api/docker/discovery, which materializes it into the shared `discovery`
-// table — the same source the action dropdowns + browse pages read. This is the
-// agent-native REPLACEMENT for the portainer-scan → MQTT → mqtt-ingest producer
-// for docker hosts. The agent has no MQTT client by design (adding one would
-// re-introduce the scan→MQTT→ingest chain we're retiring), so the existing
-// durable, per-node-authenticated mTLS HTTP path is reused.
+// discoveryPusher periodically POSTs the live fleet snapshot to the controller's
+// POST /api/docker/discovery, which materializes it into whatever inventory the
+// controller serves to its UI. The agent speaks only HTTP over the same durable,
+// per-node-authenticated path everything else uses — it has no message-bus client
+// by design.
 //
-// Discovery is a FULL-SNAPSHOT, latest-wins feed: the router DELETEs + re-inserts
-// every record for this (site,node,platform,domain) on each push. So it needs no
-// durable outbox (unlike job events, which are append-only and each one matters).
-// The feed is a derived shadow of live docker state (the engine + the image-check
-// cache) — the source of truth lives elsewhere. State-persistence litmus test:
-// "if the agent restarts right now, the next cycle will…" → re-push the complete
-// snapshot within DOCKER_DISCOVERY_INTERVAL. No disk, no replay, correct on restart.
+// Discovery is a FULL-SNAPSHOT, latest-wins feed: the controller replaces every
+// record for this (site, node) on each push. So it needs no durable outbox
+// (unlike job events, which are append-only and each one matters). The feed is a
+// derived shadow of live docker state (the engine + the image-check cache) — the
+// source of truth lives on this host. State-persistence litmus test: "if the
+// agent restarts right now, the next cycle will…" → re-push the complete snapshot
+// within DOCKER_DISCOVERY_INTERVAL. No disk, no replay, correct on restart.
 //
 // Cadence: a periodic tick (default 5m) PLUS an out-of-band trigger fired after
-// every image-check pass, so a freshly-detected outdated image surfaces in the
-// dropdowns within seconds rather than waiting for the next tick.
+// every image-check pass, so a freshly-detected outdated image surfaces within
+// seconds rather than waiting for the next tick.
 // ---------------------------------------------------------------------------
 
-// DiscoveryPayload is the wire body of POST /api/docker/discovery. The router
-// fans it out into discovery records under platform='docker' (containers +
-// compose_projects) and, during migration, the legacy platform='portainer',
-// domain='stacks' shape so the existing portainer-stack-update dropdown resolves.
+// DiscoveryPayload is the wire body of POST /api/docker/discovery.
 type DiscoveryPayload struct {
 	Site            string            `json:"site"`
 	Node            string            `json:"node"`
 	Containers      []ContainerStatus `json:"containers"`
 	ComposeProjects []ComposeProject  `json:"compose_projects"`
-	// Networks (platform=docker, domain=networks) — agent-native replacement for
-	// the retired ansible docker_network_metrics collector. POINTER: nil means
-	// "network list failed this push, don't touch existing rows"; a non-nil
+	// Networks — every user-defined docker network on this host. POINTER: nil
+	// means "network list failed this push, don't touch existing rows"; a non-nil
 	// (even empty) slice is authoritative and replaces them. Containers/compose
 	// are always authoritative so they stay plain slices.
 	Networks *[]NetworkStatus `json:"networks,omitempty"`
-	// TraefikNetworks (platform=traefik, domain=networks) — the traefik
-	// container's network attachments, for entrypoint management. Always
-	// authoritative (empty when no traefik container on this host).
+	// TraefikNetworks — the network attachments of the host's reverse-proxy
+	// container (DOCKER_PROXY_CONTAINER, default "traefik"), which a controller
+	// needs to manage proxy entrypoints. Always authoritative (empty when there is
+	// no such container on this host). The wire name is fixed by the controller's
+	// API even though the container name is configurable.
 	TraefikNetworks []ContainerNetAttachment `json:"traefik_networks"`
 	EmittedAt       time.Time                `json:"emitted_at"`
 }
@@ -63,6 +59,10 @@ type discoveryPusher struct {
 	docker   *dockerClient
 	interval time.Duration
 	trigger  chan struct{}
+
+	// proxyContainer is the name (or id) of the host's reverse-proxy container
+	// whose network attachments are published alongside the network list.
+	proxyContainer string
 
 	firstDone  bool
 	lastPushOK bool
@@ -87,16 +87,19 @@ func newDiscoveryPusher(a *app) *discoveryPusher {
 		interval: getEnvDuration("DOCKER_DISCOVERY_INTERVAL", 5*time.Minute),
 		netTTL:   getEnvDuration("DOCKER_NETWORK_TTL", 120*time.Second),
 		trigger:  make(chan struct{}, 1),
+		// The proxy container is a deployment convention, not a docker fact, so it
+		// is configuration with a neutral default rather than a literal in the call.
+		proxyContainer: getEnv("DOCKER_PROXY_CONTAINER", "traefik"),
 	}
 }
 
-// gatherNetworks returns the docker network list (platform=docker/networks) and
-// the traefik container's attachments (platform=traefik/networks), TTL-cached.
+// gatherNetworks returns the docker network list and the proxy container's
+// network attachments, TTL-cached.
 //
 // Gathering is intentionally CHEAP and FIXED-COST regardless of network count:
 // ONE batch NetworkList call (the summary already carries IPAM/options — no
-// per-network inspect/fan-out) plus ONE ContainerInspect for traefik = 2 socket
-// calls. There is nothing to parallelize, so unlike the image checker (which
+// per-network inspect/fan-out) plus ONE ContainerInspect for the proxy container
+// = 2 socket calls. There is nothing to parallelize, so unlike the image checker (which
 // fans out one registry call per image and caps concurrency via GOMAXPROCS),
 // this needs no concurrency throttle. The TTL just avoids re-running those 2
 // calls when the periodic push and the post-image-check trigger fire close
@@ -109,7 +112,7 @@ func (d *discoveryPusher) gatherNetworks(ctx context.Context) (*[]NetworkStatus,
 	}
 	nctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	nets, err := d.docker.listNetworks(nctx)
-	traefik := d.docker.containerNetAttachments(nctx, "traefik")
+	traefik := d.docker.containerNetAttachments(nctx, d.proxyContainer)
 	cancel()
 	if err != nil {
 		slog.Warn("docker network list failed; pushing without networks", "node", d.cfg.NodeName, "error", err)

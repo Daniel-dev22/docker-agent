@@ -1,7 +1,7 @@
 package main
 
-// Image-outdated detection (Phase 3) — the in-agent replacement for Portainer's
-// /api/stacks/{id}/images_status + the server_metrics custom logic.
+// Image-outdated detection — "is a newer image available for what this host is
+// running?", answered without any external management plane.
 //
 // Runs as a SLOW, JITTERED, CAPPED, CACHED pass (never inline in the fleet
 // snapshot — architectural decision: the snapshot is one bounded list call, this
@@ -14,11 +14,13 @@ package main
 //     (full X.Y.Z = pinned → github-release when an OCI source label exists, else
 //     registry-digest; X.Y / X / keyword = moving → registry-digest) + the OCI
 //     `source`/`version` labels.
-//   - central override (docker_stack_strategies, pulled from controller) wins
-//     for the un-inferable oddballs (immich multi-service, genmon build, frigate
-//     github-branch).
+//   - a central override (a strategy row pulled from the controller) wins for the
+//     un-inferable cases: a multi-service stack version-locked to one upstream
+//     release, an image that is built rather than pulled, or one versioned off a
+//     GitHub branch's CI builds.
 // Repo-driven candidates pass a registry-existence gate (don't propose a tag
-// whose image isn't pushed yet). GitHub auth reuses build-agent's App token vend.
+// whose image isn't pushed yet). GitHub auth is an App installation token vended
+// by the controller (see github.go).
 
 import (
 	"context"
@@ -37,7 +39,7 @@ import (
 )
 
 // imageCheck is the per-image result. The keys image_status / latest_image_version
-// / version_status are a HARD CONTRACT consumed by the Phase-4 discovery feed.
+// / version_status are a HARD CONTRACT consumed by the discovery feed.
 type imageCheck struct {
 	Image              string `json:"image"`
 	ImageStatus        string `json:"image_status"`   // updated|outdated|unknown
@@ -55,8 +57,8 @@ const (
 	statusUnknown  = "unknown"
 )
 
-// strategyOverride mirrors a docker_stack_strategies row (pulled from the
-// controller). Match by project name (optionally one service) or image repo.
+// strategyOverride is one central strategy row pulled from the controller. Match
+// by project name (optionally one service) or by image repo.
 type strategyOverride struct {
 	Key           string   `json:"key"`
 	MatchType     string   `json:"match_type"` // project|image
@@ -74,21 +76,21 @@ type strategyOverride struct {
 	Image         string   `json:"image"`
 	Service       string   `json:"service"`
 
-	// Resolver half (Phase 3.5) — the `update` engine's deploy step. VersionSource
-	// (above) answers "is something newer?"; these answer "what do I deploy?".
+	// Resolver half — the `update` engine's deploy step. VersionSource (above)
+	// answers "is something newer?"; these answer "what do I deploy?".
 	// ImageResolver defaults are derived from VersionSource when empty (see
-	// resolvers.go resolverFor): registry-digest→registry, github-release→registry
-	// (single-service) / upstream-compose (immich, when ServiceMap set),
+	// resolvers.go resolverKind): registry-digest→registry, github-release→registry
+	// (single-service) / upstream-compose (when ServiceMap is set),
 	// github-branch→registry, override→override.
 	ImageResolver    string            `json:"image_resolver,omitempty"`    // registry|upstream-compose|build-agent|override
 	ServiceMap       map[string]string `json:"service_map,omitempty"`       // upstream-compose: local service → upstream service name
-	UpstreamCompose  string            `json:"upstream_compose,omitempty"`  // upstream compose path template ({tag} substituted); default immich's docker/docker-compose.yml
-	BuildDescriptor  string            `json:"build_descriptor,omitempty"`  // build-agent: descriptor/service to build (e.g. "genmon")
-	BuildBranch      string            `json:"build_branch,omitempty"`      // build-agent: branch override (frigate custom)
-	RollbackScope    string            `json:"rollback_scope,omitempty"`    // per-container (default) | whole-stack (immich)
+	UpstreamCompose  string            `json:"upstream_compose,omitempty"`  // upstream compose path template ({tag} substituted); defaults to docker/docker-compose.yml in the repo
+	BuildDescriptor  string            `json:"build_descriptor,omitempty"`  // build-agent: descriptor/service to build
+	BuildBranch      string            `json:"build_branch,omitempty"`      // build-agent: branch override
+	RollbackScope    string            `json:"rollback_scope,omitempty"`    // per-container (default) | whole-stack (version-locked stacks)
 	HealthStrategy   string            `json:"health_strategy,omitempty"`   // docker-health-wait (default) | http-probe
-	HealthContainers []string          `json:"health_containers,omitempty"` // subset of containers to health-check (frigate)
-	HealthExcludes   []string          `json:"health_excludes,omitempty"`   // containers with no shell/healthcheck (portainer, adguardhome-sync)
+	HealthContainers []string          `json:"health_containers,omitempty"` // subset of containers to health-check
+	HealthExcludes   []string          `json:"health_excludes,omitempty"`   // containers with no shell, so no healthcheck can ever report
 }
 
 // effStrategy is the resolved per-image strategy (auto or override).
@@ -131,7 +133,7 @@ type imageChecker struct {
 	lastForce   time.Time // last time a debounced force was admitted (refresh endpoint)
 
 	trigger   chan struct{}
-	afterPass func() // Phase 4: invoked after each pass to refresh the discovery feed.
+	afterPass func() // invoked after each pass to refresh the discovery feed.
 	// projectPlanner runs a project's resolver as a read-only dry-run (engine.planProject).
 	// Set by the app; nil-safe. Lets the pass derive a coupled project's status from
 	// what its update WOULD change, instead of independent per-service checks.
@@ -176,8 +178,8 @@ func mergeProjPlans(prev, next map[string]projPlan, now time.Time, ttl time.Dura
 }
 
 // setAfterPass registers a callback fired at the end of every completed pass
-// (Phase 4 wires the discovery feed here so newly-detected image status is
-// pushed promptly instead of waiting for the discovery tick).
+// (the discovery feed is wired here so newly-detected image status is pushed
+// promptly instead of waiting for the discovery tick).
 func (ic *imageChecker) setAfterPass(fn func()) { ic.afterPass = fn }
 
 // setProjectPlanner wires engine.planProject so the pass can derive coupled
@@ -207,9 +209,8 @@ func newImageChecker(cfg Config, dc *dockerClient, cc *http.Client) *imageChecke
 	}
 }
 
-// imageCheckConcurrency derives a low cap from the cgroup-accurate GOMAXPROCS
-// (the DUPLICACY_MAX_CONCURRENT_* posture) so the digest+GitHub fan-out stays
-// gentle on a Pi. Env-overridable.
+// imageCheckConcurrency derives a low cap from the cgroup-accurate GOMAXPROCS so
+// the digest+GitHub fan-out stays gentle on a small host. Env-overridable.
 func imageCheckConcurrency() int {
 	n := getEnvInt("DOCKER_IMAGECHECK_CONCURRENCY", defaultBulkConcurrency())
 	if n < 1 {
@@ -411,8 +412,8 @@ func (ic *imageChecker) runOnce(ctx context.Context, ondemand bool) {
 	}
 	slog.Info("imagecheck pass complete", "images", len(results), "outdated", outdated, "ondemand", ondemand)
 
-	// Phase 4: nudge the discovery feed so freshly-detected image status reaches
-	// the action dropdowns without waiting for the next discovery tick.
+	// Nudge the discovery feed so freshly-detected image status reaches the
+	// controller without waiting for the next discovery tick.
 	if ic.afterPass != nil {
 		ic.afterPass()
 	}
@@ -580,7 +581,7 @@ func (ic *imageChecker) refreshOverrides(ctx context.Context) {
 }
 
 // projectOverride returns the project-scoped override for a project name, if any
-// (the resolver-selection input for the Phase-3.5 update engine). Service-scoped
+// (the resolver-selection input for the update engine). Service-scoped
 // rows (o.Service != "") are intentionally NOT returned here — the engine selects
 // ONE resolver per project; per-service tweaks ride the registry resolver via
 // resolveStrategy/matchOverride.
@@ -733,8 +734,8 @@ func (ic *imageChecker) resolveStrategy(c ContainerStatus, info imageInfo, ref i
 // update resolver by the compose image reference — so checkUnit classifies off the
 // image *reference* plus remote GitHub/registry lookups and treats an empty `info`
 // as non-fatal (current version falls back to the tag; only registry-digest needs
-// the local RepoDigest). This mirrors the ansible frigate model (reference-driven,
-// no hard ImageID dependency).
+// the local RepoDigest) — i.e. it is reference-driven, with no hard dependency on
+// the image being pulled locally.
 func (ic *imageChecker) checkUnit(ctx context.Context, c ContainerStatus, info imageInfo) imageCheck {
 	ref := parseImageReference(c.Image, "latest")
 	res := imageCheck{Image: c.Image, ImageStatus: statusUnknown, VersionStatus: statusUnknown, CheckedAt: time.Now().Unix()}

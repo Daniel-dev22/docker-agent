@@ -1,11 +1,10 @@
 package main
 
-// Network reconcile (Phase 3.5) — the collapsed, single-phase port of the
-// ansible manage_network_container_redeployment role. After an update recreates
+// Network reconcile — the last step of a stack update. After an update recreates
 // a stack, a container can occasionally come back attached to FEWER networks than
 // its compose service declares (most often when a shared/external network was
 // itself recreated during the deploy). This detects that drift and issues ONE
-// corrective `up --force-recreate` — no webhook phase, no out-of-band steps.
+// corrective `up --force-recreate`.
 //
 // Best-effort: it NEVER fails the update (the deploy already health-passed). It
 // compares the count of networks the compose service declares against the count

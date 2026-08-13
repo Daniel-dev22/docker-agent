@@ -10,7 +10,7 @@ import (
 // working dir is under ComposeRoot is agent-owned/editable; anything else (incl.
 // a sibling that merely shares a path prefix) is not.
 func TestUnderComposeRoot(t *testing.T) {
-	root := "/mnt/storage/srv/containers/docker-agent/data"
+	root := "/srv/containers/docker-agent/data"
 	cases := []struct {
 		name string
 		dir  string
@@ -18,7 +18,7 @@ func TestUnderComposeRoot(t *testing.T) {
 	}{
 		{"created-under-root", root + "/mystack", true},
 		{"root-itself", root, true},
-		{"ansible-sibling", "/mnt/storage/srv/containers/build-agent", false},
+		{"sibling-dir", "/srv/containers/other-agent", false},
 		{"prefix-not-subdir", root + "-evil/stack", false},
 		{"unrelated", "/opt/stacks/compose/42", false},
 		{"empty-dir", "", false},
@@ -47,7 +47,7 @@ func TestMergeKnownManaged(t *testing.T) {
 	reg := newComposeRegistry(filepath.Join(root, "projects.json"), root)
 
 	owned := ProjectEntry{Name: "owned", WorkingDir: filepath.Join(root, "owned")}
-	external := ProjectEntry{Name: "external", WorkingDir: "/mnt/elsewhere/build-agent"}
+	external := ProjectEntry{Name: "external", WorkingDir: "/mnt/elsewhere/other-stack"}
 	if err := reg.register(owned); err != nil {
 		t.Fatal(err)
 	}
@@ -81,8 +81,8 @@ func TestReadBundleGraceful(t *testing.T) {
 	t.Run("unreadable-skips-no-error", func(t *testing.T) {
 		e := ProjectEntry{
 			Name:         "external",
-			WorkingDir:   "/mnt/elsewhere/build-agent",
-			ComposeFiles: []string{"/mnt/elsewhere/build-agent/docker-compose.yml"},
+			WorkingDir:   "/mnt/elsewhere/other-stack",
+			ComposeFiles: []string{"/mnt/elsewhere/other-stack/docker-compose.yml"},
 		}
 		b, err := a.readBundle(e)
 		if err != nil {

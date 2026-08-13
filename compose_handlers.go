@@ -14,10 +14,9 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Compose project HTTP surface (Phase 2). Project ops are long async jobs
-// (202 + job id); logs stream over the existing /ws/jobs/:id/logs. Project CRUD
-// + copy/bundle are synchronous registry/file operations. All ride the router
-// ProxyHandler catch-all — no new router code.
+// Compose project HTTP surface. Project ops are long async jobs (202 + job id);
+// their logs stream over /ws/jobs/:id/logs. Project CRUD + copy/bundle are
+// synchronous registry/file operations.
 // ---------------------------------------------------------------------------
 
 // composeOpBody is the body for POST /v1/projects/:name/op.
@@ -25,8 +24,8 @@ type composeOpBody struct {
 	Op         string `json:"op"`                // up|down|pull|restart|recreate|update
 	Timeout    *int   `json:"timeout,omitempty"` // restart: container stop grace seconds
 	TriggerKey string `json:"trigger_key,omitempty"`
-	// Stack-update (op=update) options. OverrideImage deploys an exact image
-	// (traefik/manual); OverrideService targets a specific service for the override.
+	// Stack-update (op=update) options. OverrideImage deploys an exact image;
+	// OverrideService targets a specific service for the override.
 	OverrideImage   string `json:"override_image,omitempty"`
 	OverrideService string `json:"override_service,omitempty"`
 }
@@ -255,8 +254,8 @@ func (a *app) handleCopyProject(c *gin.Context) {
 }
 
 // readBundle reads a project's compose + env file contents off disk. Unreadable
-// compose files are SKIPPED (logged), not fatal: an externally-managed stack
-// (Ansible/Portainer) whose working dir is outside the agent's bind-mounted
+// compose files are SKIPPED (logged), not fatal: an externally-provisioned stack
+// whose working dir is outside the agent's bind-mounted
 // ComposeRoot returns an empty/partial bundle + its working_dir, so the UI shows
 // its graceful "not editable, files live at <working_dir>" notice instead of a
 // raw 500. (Such stacks are also flagged Managed=false up front — see mergeKnown.)

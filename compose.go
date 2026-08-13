@@ -18,8 +18,8 @@ import (
 
 // composeBackend is the in-process Docker Compose v5 SDK binding. Compose ops
 // (up/down/pull/restart/recreate) run as Go library calls over the same docker
-// socket the fleet uses — NO `docker compose` subprocess, no stdout scraping
-// (architectural decision #1). One command.Cli is built at startup and reused;
+// socket the fleet uses — NO `docker compose` subprocess, no stdout scraping.
+// One command.Cli is built at startup and reused;
 // each mutating op gets its OWN api.Compose instance so progress + stream output
 // route into that job's log ring (compose binds the EventProcessor/streams at
 // construction, so they can't be swapped per-call on a shared instance).
@@ -42,7 +42,7 @@ func newComposeBackend(cfg Config) (*composeBackend, error) {
 	if cfg.DockerHost != "" {
 		opts.Hosts = []string{cfg.DockerHost}
 	}
-	// Private-registry pulls (Phase 3) read auth from the mounted config.json;
+	// Private-registry pulls read auth from the mounted config.json;
 	// its directory is the docker config dir. Harmless when unset.
 	if cfg.RegistryAuthFile != "" {
 		opts.ConfigDir = filepath.Dir(cfg.RegistryAuthFile)
@@ -93,7 +93,7 @@ func (b *composeBackend) execute(ctx context.Context, j *Job, op string, e Proje
 	switch op {
 	case opComposeUp:
 		// Detached `up` (create + start, return after start) — the deploy
-		// posture. Health-wait + rollback is the Phase-3.5 `update` op.
+		// posture. Health-wait + rollback is the `update` op (stackengine.go).
 		return svc.Up(ctx, project, api.UpOptions{
 			Create: api.CreateOptions{RemoveOrphans: true},
 			Start:  api.StartOptions{Project: project},
@@ -111,7 +111,7 @@ func (b *composeBackend) execute(ctx context.Context, j *Job, op string, e Proje
 
 // pullProject pulls the images for an ALREADY-LOADED (and possibly image-mutated)
 // project via a per-job compose service, so progress lands in the job log. Used
-// by the Phase-3.5 update engine, which mutates project.Services[*].Image
+// by the update engine, which mutates project.Services[*].Image
 // in-memory before deploying — it must NOT reload from disk (loadProject) or the
 // resolver's target tags would be lost.
 func (b *composeBackend) pullProject(ctx context.Context, j *Job, project *types.Project, fleetTrigger func()) error {
@@ -206,7 +206,7 @@ func (p *jobEventProcessor) On(events ...api.Resource) {
 // second arg is INVERTED relative to its `success bool` name (true on FAILURE).
 // So never trust it: the engine derives the authoritative result from the op's
 // returned error and appends the terminal "compose <op> <name> ok" / "error:"
-// line itself. (Phase 3.5: same caveat for the update engine.)
+// line itself. The update engine carries the same caveat.
 func (p *jobEventProcessor) Done(string, bool) {}
 
 // renderResource turns one compose Resource event into a compact log line:

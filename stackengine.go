@@ -1,28 +1,28 @@
 package main
 
-// Stack-update engine (Phase 3.5) — the Portainer fold-in. The Go replacement
-// for manage_portainer_stack_update.yaml's orchestration: ONE shared pipeline
+// Stack-update engine — ONE shared pipeline for "bring this stack up to date"
 // (the only pluggable step is image resolution, resolvers.go), driven as a long
 // async compose job (streamed logs, durable events, reconcile) like any other op.
 //
 // updateProject pipeline:
 //   1. resolve  → target {service: imageRef} (resolvers.go).
-//   2. snapshot → pre-update container IDs + per-service image IDs (rollback
-//      baseline = the playbook's monitored_data).
+//   2. snapshot → pre-update container IDs + per-service image IDs (the rollback
+//      baseline).
 //   3. apply    → mutate the in-memory project + persist tags to on-host
 //      compose/.env (reversible per service — tagwrite.go).
 //   4. pull + up --force-recreate (in-process compose-v2; compose.go).
 //   5. health-wait — swap detection + health poll + crash-loop (healthwait.go).
 //   6. rollback on failure — redeploy the snapshot image IDs (pull=never), scope
-//      per-container (default) or whole-stack (immich); revert persisted tags.
-//   7. reconcile networks + clear status (netreconcile.go).
+//      per-container (default) or whole-stack; revert persisted tags.
+//   7. reconcile networks (netreconcile.go).
 //
-// The inverted compose `Done(op, err)` bool (Phase 2 trap) bites here too: every
-// step's verdict comes from the returned error, never compose's success flag.
+// The inverted compose `Done(op, err)` bool (see compose.go) bites here too:
+// every step's verdict comes from the returned error, never compose's flag.
 
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -138,15 +138,30 @@ func (e *engine) snapshotProject(ctx context.Context, name string) projectBaseli
 	return b
 }
 
-// healthTimeouts returns (swap, health) per host class — Pi gets the longer waits
-// (slow SD-card I/O), mirroring manage_portainer_stack_update.yaml. Env-overridable.
+// slowHostClasses are node-name classes that get the longer health-wait budget
+// because their storage/CPU makes a recreate genuinely slower (the default,
+// "pi", is a single-board computer on an SD card). It is a CONVENTION over the
+// node name, not a measurement: node names are "<class><ordinal>" (e.g. "pi01",
+// "nuc02"), so the class is the name minus its trailing digits. Override with
+// DOCKER_SLOW_HOST_CLASSES (comma-separated; empty string = no slow classes).
+func slowHostClasses() []string {
+	if v, ok := os.LookupEnv("DOCKER_SLOW_HOST_CLASSES"); ok {
+		return splitCSV(v)
+	}
+	return []string{"pi"}
+}
+
+// healthTimeouts returns the (swap, health) budget for this node: the longer pair
+// on a slow host class, the standard pair otherwise. Both are env-overridable
+// outright with DOCKER_HEALTH_SWAP_TIMEOUT / DOCKER_HEALTH_TIMEOUT.
 func (e *engine) healthTimeouts() (swap, health time.Duration) {
 	s, h := 120*time.Second, 180*time.Second
-	// Compare the host CLASS, not the full node name: the node is now the suffixed
-	// identity ("pi01"), so strip the trailing numeric suffix before matching "pi"
-	// (same rule as the router's dockerDeriveServerType).
-	if strings.EqualFold(strings.TrimRight(e.cfg.NodeName, "0123456789"), "pi") {
-		s, h = 300*time.Second, 360*time.Second
+	class := strings.TrimRight(e.cfg.NodeName, "0123456789")
+	for _, slow := range slowHostClasses() {
+		if strings.EqualFold(class, slow) {
+			s, h = 300*time.Second, 360*time.Second
+			break
+		}
 	}
 	return getEnvDuration("DOCKER_HEALTH_SWAP_TIMEOUT", s), getEnvDuration("DOCKER_HEALTH_TIMEOUT", h)
 }
@@ -338,9 +353,9 @@ func (e *engine) revertDisk(j *Job, entry ProjectEntry, diskOld map[string]strin
 }
 
 // rollback redeploys the scope services pinned to their pre-update image IDs
-// (pull=never), then re-health-waits. Faithful to the playbook rescue block:
-// per-container rolls back only the unhealthy services (leaving healthy updated
-// ones), whole-stack rolls back everything (immich's coupled services).
+// (pull=never), then re-health-waits. Scope per-container rolls back only the
+// unhealthy services (leaving healthy updated ones); whole-stack rolls back
+// everything, which is what a version-locked (coupled) stack needs.
 func (e *engine) rollback(ctx context.Context, j *Job, entry ProjectEntry, base projectBaseline, scope []string, diskOld map[string]string, fleetTrigger func()) {
 	if len(scope) == 0 {
 		j.appendLine("rollback: no services in scope")
@@ -407,7 +422,7 @@ func (e *engine) rollback(ctx context.Context, j *Job, entry ProjectEntry, base 
 }
 
 // dumpFailedLogs appends the tail of each unhealthy container's logs to the job
-// log (the playbook's failed_container_logs, but inline in the job stream).
+// log, so the failure is diagnosable from the job stream alone.
 func (e *engine) dumpFailedLogs(ctx context.Context, j *Job, unhealthy []string) {
 	for _, name := range unhealthy {
 		j.appendLine("--- logs: " + name + " ---")

@@ -38,8 +38,8 @@ type fleetHub struct {
 
 func newFleetHub(a *app) *fleetHub {
 	build := func(ctx context.Context) (fleetEnvelope, error) {
-		// runtime.NumCPU is cgroup-accurate on Go 1.25+, so it reflects the Pi's
-		// real CPU quota. The container list is one bounded Engine API call.
+		// runtime.NumCPU is cgroup-accurate on Go 1.25+, so it reflects the
+		// container's real CPU quota. The container list is one bounded Engine API call.
 		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 		containers, projects, err := a.docker.snapshot(cctx)
@@ -47,7 +47,7 @@ func newFleetHub(a *app) *fleetHub {
 			return fleetEnvelope{}, err
 		}
 		// Stamp cached image-outdated results onto containers + roll up to
-		// projects (Phase 3). The checks come from the imageChecker's slow capped
+		// projects. The checks come from the imageChecker's slow capped
 		// pass — this merge is O(n) map lookups, never a registry/GitHub call.
 		if a.images != nil {
 			stampImageStatus(containers, projects, a.images)

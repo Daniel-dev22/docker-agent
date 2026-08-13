@@ -1,15 +1,11 @@
 package main
 
-// Process-global pooled HTTP client for every agent → controller call
-// (event push via the kit outbox, reconcile).
+// Process-global pooled HTTP client for every agent → controller call (job event
+// push via the kit outbox, reconcile, discovery, GitHub-token vend).
 //
-// Auth model (identical to duplicacy/gdrive/build): transport mTLS is handled at
-// the Traefik boundary on each side; the agent presents NO client cert. Per-node
-// identity is the BearerToken header attached by the round-tripper below.
-//
-// (No GitHub-token vend here — that is build-agent's concern. Image-status
-// version polling in Phase 3 will reuse build-agent's GitHub App token vend via
-// the controller, not a local copy.)
+// Auth model (shared with the sibling agents): transport mTLS is handled at the
+// reverse-proxy boundary on each side; the agent presents NO client cert.
+// Per-node identity is the BearerToken header attached by the round-tripper below.
 
 import (
 	"context"
@@ -34,11 +30,11 @@ func (b *bearerAuthRoundTripper) RoundTrip(r *http.Request) (*http.Response, err
 	return b.rt.RoundTrip(r)
 }
 
-// buildControlCenterClient returns the pooled HTTP client. Direct mode (k3s,
-// TraefikDockerDNS=="") dials the URL host normally; Traefik-rewrite mode (NAS,
-// TraefikDockerDNS!="") rewrites the dial target to the local docker Traefik
-// while keeping the URL host as TLS SNI, so the host's mTLS ServersTransport
-// attaches the cluster identity.
+// buildControlCenterClient returns the pooled HTTP client. Direct mode
+// (TraefikDockerDNS=="") dials the URL host normally; rewrite mode
+// (TraefikDockerDNS!="") rewrites the dial TARGET to the host's local Traefik
+// while keeping the URL host as the Host header and TLS SNI, so that proxy can
+// match its routing rule and attach the mTLS client identity on the way out.
 func buildControlCenterClient(cfg Config) *http.Client {
 	dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 15 * time.Second}
 	transport := &http.Transport{
