@@ -1,22 +1,22 @@
 package main
 
-// Container health-wait + crash-loop detection (Phase 3.5).
+// Container health-wait + crash-loop detection, used by the stack-update engine.
 //
-// Faithful Go port of plugins/modules/docker_health_wait.py — same two-phase
-// algorithm, but over the docker SDK (one ContainerInspect per container) with
-// NO subprocess and NO format-string parsing:
+// Two stages, both over the docker SDK (one ContainerInspect per container),
+// with NO subprocess and NO format-string parsing:
 //
-//   Phase 1 — swap detection: after a recreate, wait for container IDs to change.
+//   Stage 1 — swap detection: after a recreate, wait for container IDs to change.
 //     Partial-update tolerant: succeed once ≥1 container has swapped + a 20s grace
 //     for the rest, or immediately when all have swapped. Missing containers
 //     (mid-recreation) are expected. 0 swaps at timeout = failure (the recreate
-//     didn't take). A no-diff update (previousIDs empty) skips this phase.
-//   Phase 2 — health poll: wait for every monitored container to reach
+//     didn't take). A no-diff update (previousIDs empty) skips this stage.
+//   Stage 2 — health poll: wait for every monitored container to reach
 //     healthy/none, failing fast on a crash loop (restart count climbed past the
 //     baseline by restart_threshold) or a stopped container.
 //
-// Per-host-type timeouts (pi gets the longer waits) and the health_excludes /
-// health_containers subset come from the strategy (resolvers.go) or defaults.
+// The timeouts (longer on a slow host class — see engine.healthTimeouts) and the
+// health_excludes / health_containers subset come from the strategy
+// (resolvers.go) or from the defaults.
 
 import (
 	"context"
@@ -28,7 +28,7 @@ import (
 )
 
 // swapGracePeriod is the window granted to the remaining containers after the
-// first one swaps (mirrors the python's grace_period=20).
+// first one swaps.
 const swapGracePeriod = 20 * time.Second
 
 // healthWaitParams configures one health-wait over a project's containers.
@@ -36,8 +36,8 @@ type healthWaitParams struct {
 	containers  []string          // actual container names to monitor
 	previousIDs map[string]string // name → prior container ID; empty/nil = skip swap phase
 	excluded    map[string]bool   // names to skip in the health phase (no shell/healthcheck)
-	// onlyHealth, when non-empty, restricts the health phase to this subset
-	// (frigate checks only "frigate"); every other container is treated excluded.
+	// onlyHealth, when non-empty, restricts the health phase to this subset (a
+	// stack may only have one meaningful probe); every other container is excluded.
 	onlyHealth       []string
 	swapTimeout      time.Duration
 	healthTimeout    time.Duration

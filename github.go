@@ -1,20 +1,20 @@
 package main
 
-// GitHub version sources (Phase 3).
+// GitHub version sources — two lookups behind one client:
 //
-// Ports two ansible modules into one in-agent client:
-//   - github_releases.py  → githubClient.latestRelease  (release-tagged stacks:
-//     traefik/immich/genmon/portainer — semver sort, prerelease/draft filter,
-//     name_filter, tag_exclude)
-//   - github_package_versions.py → githubClient.latestPackageVersion (frigate
-//     github-branch: GH Packages versions minus the filter-branch CI SHAs, custom
-//     branch head, registry-existence verify of candidates)
+//   - githubClient.latestRelease — for an image versioned by its project's GitHub
+//     releases: semver sort, prerelease/draft filter, name_filter, tag_exclude.
+//   - githubClient.latestPackageVersion — for an image versioned by a GitHub
+//     Packages tag stream keyed off a branch's CI builds: package versions minus
+//     the excluded branch's commit SHAs, the tracked branch head, and a
+//     registry-existence verify of each candidate.
 //
-// GitHub auth = reuse build-agent's GitHub App installation-token vend through the
-// controller (POST /api/docker/github-token). Unauthenticated GitHub is 60/hr →
-// a fleet would 429 immediately, so a token is required. The token is cached
-// per-agent (the router/minter caches too); 300s result TTL + bounded concurrency
-// (imagecheck.go) keep us far under the ~15k/hr ceiling.
+// GitHub auth is a GitHub App installation token vended by the controller
+// (POST /api/docker/github-token) — the agent holds no App private key.
+// Unauthenticated GitHub is 60 requests/hr, so a whole fleet would 429
+// immediately and a token is required. The token is cached per agent; a 300s
+// result TTL + bounded concurrency (imagecheck.go) keep a fleet far under the
+// authenticated ceiling.
 
 import (
 	"bytes"
@@ -41,9 +41,7 @@ const (
 )
 
 // ---------------------------------------------------------------------------
-// Token vend (agent → controller). build-agent keeps this in network.go; the
-// docker-agent's network.go was cloned without it, so it lives here pointed at
-// the docker backend's endpoint.
+// Token vend (agent → controller).
 // ---------------------------------------------------------------------------
 
 type githubTokenResp struct {
@@ -57,8 +55,8 @@ func readErrorBody(r io.Reader) string {
 }
 
 // githubClient mints + caches an installation token and queries the GitHub API
-// directly (public internet egress; NOT through the cc dial-rewriter — that path
-// is only for controller). registry is shared for the existence gate.
+// directly (public internet egress; NOT through the controller dial-rewriter —
+// that path is only for the controller). registry is shared for the existence gate.
 type githubClient struct {
 	cc       *http.Client // controller client (bearer + dial rewrite) — token vend only
 	ccURL    string
@@ -383,7 +381,7 @@ func (a semver) cmp(b semver) int {
 }
 
 // ---------------------------------------------------------------------------
-// github-release source (traefik/immich/genmon/portainer).
+// github-release source — "what is the newest release tag of this repo?".
 // ---------------------------------------------------------------------------
 
 type ghRelease struct {
@@ -393,13 +391,12 @@ type ghRelease struct {
 	Prerelease bool   `json:"prerelease"`
 }
 
-// releaseQuery configures a github-release lookup (mirrors the ansible repo
-// config dict).
+// releaseQuery configures a github-release lookup.
 type releaseQuery struct {
 	Repo        string // owner/repo
 	ReleaseType string // "latest" (default) | "stable"
-	NameFilter  string // e.g. "STS" (portainer)
-	TagExclude  string // regex, e.g. "-ea" (traefik)
+	NameFilter  string // substring a release NAME must contain, e.g. "LTS"
+	TagExclude  string // regex a release TAG must not match, e.g. "-ea"
 	FetchCount  int    // releases to scan when filtering (default 30)
 }
 
@@ -473,7 +470,8 @@ func (g *githubClient) latestRelease(ctx context.Context, q releaseQuery) (strin
 }
 
 // ---------------------------------------------------------------------------
-// github-branch source (frigate) — port of github_package_versions.py.
+// github-branch source — "what is the newest CI build of this GitHub Packages
+// image that belongs to the branch I track?".
 // ---------------------------------------------------------------------------
 
 // customBranchRe matches a custom/dev tag like "0.15-abc1234-amd64".

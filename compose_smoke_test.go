@@ -1,6 +1,6 @@
 //go:build smoke
 
-// Phase 2 smoke test — exercises the in-process compose-v2 binding against a
+// Smoke test — exercises the in-process compose binding against a
 // LIVE docker socket with a throwaway project (real stacks untouched). Gated
 // behind the `smoke` build tag so normal `go test ./...` never runs it.
 //

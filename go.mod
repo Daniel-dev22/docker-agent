@@ -1,4 +1,4 @@
-module docker-agent
+module github.com/Daniel-dev22/docker-agent
 
 go 1.26
 

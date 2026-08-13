@@ -72,15 +72,13 @@ func registerRoutes(r *gin.Engine, app *app) {
 	r.GET("/health/live", app.handleLiveness)
 	r.GET("/health/ready", app.handleReadiness)
 
-	// Job introspection. Phase 1 wires the container-lifecycle producers below;
-	// Phase 2 adds the compose-op routes.
+	// Job introspection — every mutation below is tracked as a Job.
 	r.GET("/v1/jobs", app.handleListJobs)
 	r.GET("/v1/jobs/:id", app.handleGetJob)
 	r.GET("/v1/jobs/:id/log", app.handleGetJobLog)
 	r.POST("/v1/jobs/:id/cancel", app.handleCancelJob)
 
-	// Container lifecycle mutations (Phase 1) — short async jobs (202 + job id);
-	// reached through the router ProxyHandler catch-all (no new router code).
+	// Container lifecycle mutations — short async jobs (202 + job id).
 	r.POST("/v1/containers/:id/start", app.handleContainerStart)
 	r.POST("/v1/containers/:id/stop", app.handleContainerStop)
 	r.POST("/v1/containers/:id/restart", app.handleContainerRestart)
@@ -90,9 +88,8 @@ func registerRoutes(r *gin.Engine, app *app) {
 	// backwards via ?until=<oldest-ts>; the live tail is the WS route below.
 	r.GET("/v1/containers/:id/logs", app.handleContainerLogsHistory)
 
-	// Compose project ops + registry (Phase 2) — ops are long async jobs
-	// (202 + job id), CRUD/copy are synchronous. All ride the ProxyHandler
-	// catch-all (no new router code). Project name is the path param.
+	// Compose project ops + registry — ops are long async jobs (202 + job id);
+	// CRUD/copy/bundle are synchronous. Project name is the path param.
 	r.GET("/v1/projects", app.handleListProjects)
 	r.POST("/v1/projects", app.handleRegisterProject)
 	r.DELETE("/v1/projects/:name", app.handleDeregisterProject)
@@ -100,8 +97,8 @@ func registerRoutes(r *gin.Engine, app *app) {
 	r.GET("/v1/projects/:name/bundle", app.handleProjectBundle)
 	r.POST("/v1/projects/:name/copy", app.handleCopyProject)
 
-	// Image-outdated detection (Phase 3) — raw cache + manual refresh; the live
-	// status normally rides the /ws/fleet snapshot.
+	// Image-outdated detection — raw cache + manual refresh; the live status
+	// normally rides the /ws/fleet snapshot.
 	r.GET("/v1/images/checks", app.handleImageChecks)
 	r.POST("/v1/images/refresh", app.handleImageCheckRefresh)
 

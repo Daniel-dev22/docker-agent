@@ -4,10 +4,9 @@ package main
 //
 // The durable projects.json (under the bind-mounted ComposeRoot) is the SOLE
 // source of truth for which projects exist when stopped — NEVER a filesystem
-// crawl (the duplicacy repos-from-registry lesson). It is seeded by the one-time
-// Portainer export and by explicit register calls. Currently-RUNNING projects
-// are additionally auto-adopted from their `com.docker.compose.project*` labels
-// on boot, so an operator never has to register a project that's already up.
+// crawl. It is seeded by explicit register calls. Currently-RUNNING projects are
+// additionally auto-adopted from their `com.docker.compose.project*` labels on
+// boot, so an operator never has to register a project that's already up.
 //
 // projects.json carries NO secrets — only names, working dirs, compose-file
 // paths, profiles, env files. Compose data (the files themselves) lives on host
@@ -69,7 +68,7 @@ type composeRegistry struct {
 	mu     sync.RWMutex
 	byName map[string]*ProjectEntry
 
-	persistMu sync.Mutex // serializes the write-tmp/rename pair (duplicacy posture)
+	persistMu sync.Mutex // serializes the write-tmp/rename pair
 }
 
 func newComposeRegistry(path, composeRoot string) *composeRegistry {
@@ -79,8 +78,8 @@ func newComposeRegistry(path, composeRoot string) *composeRegistry {
 // underComposeRoot reports whether workingDir lives inside root. The agent's own
 // register/copy is the ONLY writer under ComposeRoot (writeProjectFiles), so a
 // stack whose working dir is under it is one the agent created and can read/write
-// (editable in place). Externally-managed stacks (Ansible/Portainer/ad-hoc) live
-// elsewhere on the host — outside the agent's mount — and are NOT editable here.
+// (editable in place). Externally-provisioned stacks live elsewhere on the host
+// — outside the agent's mount — and are NOT editable here.
 // Structural (no I/O) and self-correcting: it needs no migration of existing
 // projects.json entries and never depends on a persisted provenance flag.
 func underComposeRoot(workingDir, root string) bool {
@@ -227,8 +226,8 @@ func (r *composeRegistry) enrichFromLive(live []ComposeProject) {
 // grouping) to the fleet snapshot as zero-container entries, and flags each
 // returned project Managed only when the agent actually owns its compose files
 // (working dir under ComposeRoot → created via register/copy → editable here).
-// Externally-managed stacks (Ansible/Portainer/ad-hoc) appear but Managed=false,
-// so the UI greys out Edit instead of offering an edit that can't read the files.
+// Externally-provisioned stacks appear but Managed=false, so a UI greys out Edit
+// instead of offering an edit that cannot read the files.
 func (r *composeRegistry) mergeKnown(live []ComposeProject) []ComposeProject {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

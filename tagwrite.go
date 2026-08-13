@@ -1,19 +1,16 @@
 package main
 
-// Durable image-tag persistence for the stack-update engine (Phase 3.5).
+// Durable image-tag persistence for the stack-update engine.
 //
-// When a resolver bumps a service's image to a concrete new tag (immich pinned
-// bump, traefik/manual override), the change is written back to the on-host
-// compose/.env so it survives an agent restart or a manual `docker compose up`
-// — replacing Portainer's CURRENT_*/ORIGINAL_* env-pinning hack with the plain
-// on-host source of truth (master plan step 3). Moving-tag (registry-digest)
-// services are NOT written here — their tag is unchanged; `pull` fetches the new
-// digest.
+// When a resolver bumps a service's image to a concrete new tag, the change is
+// written back to the on-host compose/.env so it survives an agent restart or a
+// manual `docker compose up` — the on-host files stay the source of truth, with
+// no side-channel state. Moving-tag (registry-digest) services are NOT written
+// here — their tag is unchanged; `pull` fetches the new digest.
 //
-// Two faithful cases, mirroring the ansible (update_traefik_compose.yaml rewrote
-// the inline `image:`; the immich/genmon paths set CURRENT_* in the env):
+// Two cases:
 //   - `image: ${VAR}` in the compose file → update VAR in the project's .env
-//     (the var holds the full image ref, exactly like Portainer's CURRENT_*).
+//     (the var holds the full image ref).
 //   - `image: literal:tag` → rewrite the scalar in the compose file, preserving
 //     comments + key order (yaml.v3 Node round-trip).
 //
@@ -50,8 +47,8 @@ func setServiceImage(entry ProjectEntry, service, newImage string) (oldImage str
 			continue
 		}
 		if varName != "" {
-			// Image is ${VAR}: persist into the .env var (the Portainer CURRENT_*
-			// model). Keep the compose scalar as-is.
+			// Image is ${VAR}: persist the full ref into the .env var. Keep the
+			// compose scalar as-is.
 			old, eerr := setEnvVar(entry, varName, newImage)
 			if eerr != nil {
 				return "", eerr
@@ -184,7 +181,7 @@ func setEnvVar(entry ProjectEntry, key, value string) (old string, err error) {
 }
 
 // writeFileAtomic writes via a temp file + rename so a crash mid-write can't
-// corrupt the compose/.env file (the duplicacy atomic-write posture).
+// corrupt the compose/.env file.
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	dir := filepath.Dir(path)
 	tmp := filepath.Join(dir, "."+filepath.Base(path)+".tmp")

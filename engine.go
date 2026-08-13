@@ -11,9 +11,9 @@ import (
 	"time"
 )
 
-// Operation names. Container-scoped lifecycle ops (Phase 1) act on a single
-// Target; the bulk variants ("container.bulk.<verb>") fan out over Targets.
-// Compose ops (Phase 2) and the update engine (Phase 3.5) add more.
+// Operation names. Container-scoped lifecycle ops act on a single Target; the
+// bulk variants ("container.bulk.<verb>") fan out over Targets. Compose ops and
+// the stack-update op are project-scoped.
 const (
 	opContainerStart      = "container.start"
 	opContainerStop       = "container.stop"
@@ -22,17 +22,17 @@ const (
 	opContainerKill       = "container.kill"
 	opContainerBulkPrefix = "container.bulk." // + verb (start|stop|restart|kill|remove)
 
-	// Compose project ops (Phase 2) — project-scoped, run via the in-process
-	// compose-v2 library (compose.go). The Job's Project names the target stack.
+	// Compose project ops — project-scoped, run via the in-process compose
+	// library (compose.go). The Job's Project names the target stack.
 	opComposeUp       = "up"
 	opComposeDown     = "down"
 	opComposePull     = "pull"
 	opComposeRestart  = "restart"
 	opComposeRecreate = "recreate"
 
-	// Stack-update engine (Phase 3.5) — the Portainer fold-in. Resolves each
-	// service's target image, snapshots for rollback, pull+up, health-waits, and
-	// rolls back on failure. Project-scoped like the compose ops, but driven by
+	// Stack-update engine — resolves each service's target image, snapshots for
+	// rollback, pulls + recreates, health-waits, and rolls back on failure.
+	// Project-scoped like the compose ops, but driven by
 	// stackengine.go (updateProject), not the plain compose.execute path.
 	opComposeUpdate = "update"
 )
@@ -54,36 +54,35 @@ var projectOps = map[string]bool{
 
 // engine executes a Job's operation against the docker engine, streaming output
 // to the job's log ring (j.appendLine) and emitting lifecycle events via
-// onChange. It holds the SDK client + compose registry needed by later phases.
+// onChange. It holds the SDK client + the durable compose registry.
 //
-// Operation handlers are added per phase:
-//   - Phase 1: container lifecycle (start/stop/restart/remove/kill, bulk).
-//   - Phase 2: compose ops (up/down/pull/restart/recreate) via the compose-v2
-//     Go library, with progress events fed into j.appendLine.
-//   - Phase 3.5: the stack-update engine (resolve→snapshot→pull+up→health-wait→
-//     rollback).
+// Three operation families:
+//   - container lifecycle (start/stop/restart/remove/kill, bulk).
+//   - compose ops (up/down/pull/restart/recreate) via the compose Go library,
+//     with progress events fed into j.appendLine.
+//   - the stack-update engine (resolve→snapshot→pull+up→health-wait→rollback).
 type engine struct {
 	cfg      Config
 	docker   *dockerClient
 	compose  *composeBackend  // in-process compose-v2 SDK (nil if init failed)
 	projects *composeRegistry // durable project index
-	// images is the Phase-3 image-outdated checker, reused by the Phase-3.5
-	// stack-update engine for strategy resolution (central overrides + auto-detect)
+	// images is the image-outdated checker, reused by the stack-update engine
+	// for strategy resolution (central overrides + auto-detect)
 	// and its registry/github clients. Set via setImageChecker after construction
 	// (app.go wires it once the checker exists). nil → update falls back to a
 	// pull-only deploy with no version resolution.
 	images *imageChecker
 
-	// bulkConcurrency caps simultaneous container ops in a bulk fan-out (the
-	// duplicacy DUPLICACY_MAX_CONCURRENT_* posture — keep the Pi from thrashing).
+	// bulkConcurrency caps simultaneous container ops in a bulk fan-out so a
+	// low-power host is not thrashed by a wide fan-out.
 	bulkConcurrency int
 	// composeOpTimeout bounds one compose op so a wedged pull/up can't run
 	// forever; cancellation still works via the job context.
 	composeOpTimeout time.Duration
 }
 
-// setImageChecker wires the Phase-3 checker into the engine for the Phase-3.5
-// update path (strategy resolution + shared registry/github clients).
+// setImageChecker wires the image checker into the engine for the update path
+// (strategy resolution + shared registry/github clients).
 func (e *engine) setImageChecker(ic *imageChecker) { e.images = ic }
 
 func newEngine(cfg Config, dc *dockerClient, cb *composeBackend, reg *composeRegistry) *engine {
@@ -102,7 +101,8 @@ func newEngine(cfg Config, dc *dockerClient, cb *composeBackend, reg *composeReg
 }
 
 // defaultBulkConcurrency derives from the (cgroup-accurate, Go 1.25) GOMAXPROCS
-// and is clamped to [2,4] so a NAS doesn't fan out wildly and a Pi stays gentle.
+// and is clamped to [2,4]: a big host doesn't fan out wildly and a small one
+// stays gentle.
 func defaultBulkConcurrency() int {
 	n := runtime.GOMAXPROCS(0)
 	switch {

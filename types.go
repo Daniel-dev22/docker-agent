@@ -9,17 +9,12 @@ import (
 // ---------------------------------------------------------------------------
 // Job model — one async operation against the docker engine.
 //
-// Unlike build-agent (whose Build fans out to N services with buildx sub-steps),
-// a docker-agent Job is a single operation: a container lifecycle op (Phase 1)
-// or a compose op / stack update (Phase 2+). Operation names the verb
+// A Job is a single operation against the local engine: a container lifecycle
+// op, a compose op, or a stack update. Operation names the verb
 // ("up"|"down"|"pull"|"restart"|"recreate"|"update"|"container.start"|
 // "container.stop"|"container.restart"|"container.remove"|"bulk"); Project is the
 // compose project for project-scoped ops; Target is the container id/name for
 // container-scoped ops. Every mutation is async + tracked (nothing is "fast").
-//
-// Phase 0 ships NO producers (read-only fleet only) — the registry, engine
-// dispatch, and durable event/reconcile plumbing are present and ready so later
-// phases add only the operation handlers + their HTTP routes.
 // ---------------------------------------------------------------------------
 
 type JobState string
@@ -52,8 +47,7 @@ const (
 	subscriberBuffer   = 256
 )
 
-// JobRequest is the wire body that starts a job. Phase 1 adds the container
-// lifecycle routes; Phase 2 the compose routes.
+// JobRequest is the wire body that starts a job.
 //
 // Target is the single container id for a container-scoped op; Targets carries
 // the id list for a bulk op (Operation "container.bulk.<verb>"). Force/Timeout
@@ -68,8 +62,8 @@ type JobRequest struct {
 	Force      bool     `json:"force,omitempty"`
 	Timeout    *int     `json:"timeout,omitempty"`
 	TriggerKey string   `json:"trigger_key,omitempty"`
-	// Stack-update (Phase 3.5) options. OverrideImage deploys an exact image (the
-	// traefik/manual path); OverrideService names the target service when a
+	// Stack-update options. OverrideImage deploys an exact image (the manual
+	// "deploy this tag" path); OverrideService names the target service when a
 	// multi-service project's override target can't be inferred. In-memory only.
 	OverrideImage   string `json:"override_image,omitempty"`
 	OverrideService string `json:"override_service,omitempty"`
@@ -103,7 +97,7 @@ type Job struct {
 	targets []string
 	force   bool
 	timeout *int
-	// Stack-update (Phase 3.5) op params — in-memory, set at construction.
+	// Stack-update op params — in-memory, set at construction.
 	overrideImage   string
 	overrideService string
 

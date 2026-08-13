@@ -1,8 +1,8 @@
 package main
 
-// Per-stack image resolvers (Phase 3.5) — the only pluggable step in the shared
-// update engine (stackengine.go). VersionSource (Phase 3, imagecheck.go) answers
-// "is something newer?"; an ImageResolver answers "what do I deploy?".
+// Per-stack image resolvers — the only pluggable step in the shared update engine
+// (stackengine.go). A VersionSource (imagecheck.go) answers "is something
+// newer?"; an ImageResolver answers "what do I deploy?".
 //
 // Strategy selection mirrors imagecheck's `central_override ?? auto-detect`:
 //   - The DEFAULT path (registryResolver) reuses imagecheck.checkUnit per service,
@@ -10,11 +10,12 @@ package main
 //     and image-scoped overrides all behave EXACTLY as the status check — no
 //     second implementation to drift.
 //   - A PROJECT-scoped central override whose image_resolver can't be expressed
-//     per-service selects a dedicated resolver: upstream-compose (immich's coupled
-//     multi-service tags), build-agent (genmon/frigate-custom — build stays in
-//     build-agent), or override (an explicit pinned image for the whole stack).
-//   - A request-level override_image (the traefik/manual "deploy this exact tag"
-//     path) wins over everything for the targeted service.
+//     per-service selects a dedicated resolver: upstream-compose (a project whose
+//     services share one coupled upstream tag set, e.g. immich), build-agent (the
+//     image is built rather than pulled — a stub, see below), or override (an
+//     explicit pinned image for the whole stack).
+//   - A request-level override_image (the manual "deploy this exact tag" path)
+//     wins over everything for the targeted service.
 //
 // A resolver returns ONLY the services whose image should change. Services absent
 // from the map keep their compose image and are still `pull`ed — so a moving-tag
@@ -26,6 +27,7 @@ import (
 	"fmt"
 	"log/slog"
 	neturl "net/url"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -54,13 +56,28 @@ type ImageResolver interface {
 type resolveMeta struct {
 	rollbackScope    string   // per-container (default) | whole-stack
 	healthStrategy   string   // docker-health-wait (default) | http-probe
-	healthContainers []string // only-check subset (frigate)
-	healthExcludes   []string // no-shell containers (portainer, adguardhome-sync)
+	healthContainers []string // when set, health-check ONLY these containers
+	healthExcludes   []string // containers to skip in the health phase (see defaultHealthExcludes)
 }
 
-// defaultHealthExcludes mirror manage_portainer_stack_update.yaml's
-// excluded_container_health_statuses (no builtin shell → no healthcheck).
-var defaultHealthExcludes = []string{"portainer", "adguardhome-sync"}
+// builtinHealthExcludes are containers the health phase skips by default.
+//
+// Both ship images with no shell, so a compose healthcheck (which docker executes
+// via /bin/sh) can never report anything but "none" — waiting on them would just
+// burn the health timeout on every update. Override the list with
+// DOCKER_HEALTH_EXCLUDES (comma-separated; empty string = exclude nothing), or
+// per-project via a strategy override's health_excludes.
+var builtinHealthExcludes = []string{"portainer", "adguardhome-sync"}
+
+// defaultHealthExcludes returns the effective default exclude list: the
+// DOCKER_HEALTH_EXCLUDES override when the env var is SET (even to empty), else
+// builtinHealthExcludes.
+func defaultHealthExcludes() []string {
+	if v, ok := os.LookupEnv("DOCKER_HEALTH_EXCLUDES"); ok {
+		return splitCSV(v)
+	}
+	return builtinHealthExcludes
+}
 
 // selectResolver picks the resolver + project-level meta for an update. The
 // imageChecker (e.images) supplies overrides + the shared registry/github clients;
@@ -69,10 +86,10 @@ func (e *engine) selectResolver(projectName, overrideImage, overrideService stri
 	meta := resolveMeta{
 		rollbackScope:  "per-container",
 		healthStrategy: "docker-health-wait",
-		healthExcludes: defaultHealthExcludes,
+		healthExcludes: defaultHealthExcludes(),
 	}
 
-	// Request-level manual override wins (traefik "deploy this exact image").
+	// Request-level manual override wins ("deploy this exact image").
 	if strings.TrimSpace(overrideImage) != "" {
 		return &overrideResolver{e: e, image: overrideImage, service: overrideService}, meta
 	}
@@ -283,9 +300,10 @@ func (r *overrideResolver) plan(_ context.Context, project *types.Project, log f
 }
 
 // ---------------------------------------------------------------------------
-// upstreamComposeResolver — immich. Read the upstream release's docker-compose.yml
-// and map its coupled service tags onto our local services (we PULL, never build).
-// Ports get_immich_stack_image_versions.yaml.
+// upstreamComposeResolver — for a project whose services are version-locked to
+// one upstream release (immich is the canonical example). Reads the upstream
+// release's docker-compose.yml and maps its coupled service tags onto the local
+// services. We always PULL, never build.
 // ---------------------------------------------------------------------------
 
 type upstreamComposeResolver struct {
@@ -315,11 +333,12 @@ func (r *upstreamComposeResolver) plan(ctx context.Context, project *types.Proje
 		tmpl = "https://" + rawGithubHost + "/" + repo + "/{tag}/docker/docker-compose.yml"
 	}
 	url := strings.ReplaceAll(tmpl, "{tag}", tag)
-	log(fmt.Sprintf("immich: latest release %s — reading %s", tag, url))
+	log(fmt.Sprintf("upstream-compose: latest release %s — reading %s", tag, url))
 
-	// immich's compose templates the app images as ${IMMICH_VERSION:-release}; pin
-	// them to the concrete release tag (the whole point of the coupled update) so
-	// the rewrite is a real version, not the floating `release` tag.
+	// The upstream compose typically templates its app images as
+	// ${<PROJECT>_VERSION:-release}; pin them to the concrete release tag (the whole
+	// point of the coupled update) so the rewrite is a real version, not a floating
+	// tag. IMMICH_VERSION is passed because immich is the default upstream.
 	//
 	// The budget is wider than one round trip because composeImages retries
 	// transient 429/5xx with backoff before giving up.
@@ -345,10 +364,10 @@ func (r *upstreamComposeResolver) plan(ctx context.Context, project *types.Proje
 		if !ok || img == "" {
 			continue
 		}
-		// A service intentionally on a MOVING tag (immich-server ":release") is
+		// A service intentionally on a MOVING tag (e.g. ":release") is
 		// auto-tracking latest, so it is never "behind a release" — don't flag or
 		// rewrite it to the release's concrete pin (a plain `pull` refreshes it).
-		// Only concretely-pinned coupled services (redis/db @sha256, or a pinned
+		// Only concretely-pinned coupled services (a @sha256 dependency, or a pinned
 		// X.Y.Z) are driven by the release compose. This keeps the WHOLE-STACK
 		// status driven by the actual drivers, never by a coupled service's own
 		// independent upstream.
@@ -361,7 +380,7 @@ func (r *upstreamComposeResolver) plan(ctx context.Context, project *types.Proje
 		}
 	}
 	if len(targets) == 0 {
-		log("immich: already on the latest coupled image set")
+		log("upstream-compose: already on the latest coupled image set")
 	}
 	return targets, nil
 }
@@ -374,12 +393,12 @@ type composeImagesDoc struct {
 }
 
 // composeVarRe matches a compose interpolation `${VAR}`, `${VAR:-default}`, or
-// `${VAR-default}` (the forms immich's compose uses for image tags).
+// `${VAR-default}` — the forms an upstream compose uses for image tags.
 var composeVarRe = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)(?::?-([^}]*))?\}`)
 
 // interpolateComposeVars resolves `${VAR...}` against vars, falling back to the
 // `:-default` (or empty) when the var is absent — matching docker compose's own
-// substitution for the variables we know (e.g. IMMICH_VERSION).
+// substitution for the variables we know.
 func interpolateComposeVars(s string, vars map[string]string) string {
 	return composeVarRe.ReplaceAllStringFunc(s, func(m string) string {
 		sub := composeVarRe.FindStringSubmatch(m)
@@ -500,15 +519,15 @@ func interpolateImages(tmpl, vars map[string]string) map[string]string {
 }
 
 // ---------------------------------------------------------------------------
-// buildAgentResolver — genmon / frigate-custom. Building stays in build-agent
-// (agent-kit lockstep rule). Faithfully wiring the trigger requires the stack's
-// full build descriptor (build.json) + repo/ref — exactly what ansible's
-// build_genmon_image.yaml / deploy_custom_frigate_version.yaml already assemble —
-// so for now this is a DOCUMENTED deferral, not a guessed half-implementation.
+// buildAgentResolver — a STUB for stacks whose image is BUILT rather than pulled.
 //
-// genmon will auto-detect to github-release once its Dockerfile carries the OCI
-// source/version labels (master plan), so STATUS works without this; only the
-// actual rebuild stays in ansible until a follow-up threads the descriptor here.
+// Deploying one means triggering a build elsewhere (a build agent) and waiting
+// for the resulting image, which needs the stack's full build descriptor and its
+// repo/ref. That is not wired here, and the resolver fails loudly rather than
+// silently redeploying the existing image and reporting success.
+//
+// Detection still works for such a stack: give its image the OCI
+// source/version labels and it auto-detects to github-release like any other.
 // ---------------------------------------------------------------------------
 
 type buildAgentResolver struct {
@@ -519,6 +538,6 @@ type buildAgentResolver struct {
 func (r *buildAgentResolver) kind() string { return "build-agent" }
 
 func (r *buildAgentResolver) plan(_ context.Context, _ *types.Project, log func(string)) (map[string]string, error) {
-	log("build-agent resolver is not wired yet")
-	return nil, fmt.Errorf("build-agent resolver not yet wired: build %q via ansible (build_genmon_image.yaml / deploy_custom_frigate_version.yaml); see handoff-phase35", orDefault(r.o.BuildDescriptor, r.o.Key))
+	log("build-agent resolver is not implemented")
+	return nil, fmt.Errorf("image_resolver %q is not implemented: %q builds its image rather than pulling it, and this agent cannot trigger a build", r.kind(), orDefault(r.o.BuildDescriptor, r.o.Key))
 }

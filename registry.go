@@ -1,17 +1,16 @@
 package main
 
-// Container-registry digest client (Phase 3).
+// Container-registry digest client.
 //
-// Faithful Go port of plugins/module_utils/container_registry_client.py:
 //   - parseImageReference: split registry/repository:tag(@digest)
 //   - getRegistryDigest: HEAD /v2/<repo>/manifests/<tag> with OCI Accept headers,
 //     bearer re-auth on 401, Docker Hub library/ prefix for single-segment repos.
 //
-// Used three ways (one client, three uses — the plan): the registry-digest
-// VersionSource, and the registry-existence gate for repo-driven candidates.
-// Private-registry auth comes from the mounted ~/.docker/config.json
-// (RegistryAuthFile); anonymous bearer flow otherwise (Docker Hub / public ghcr /
-// the in-cluster unauthenticated v2 registry, exactly like build-agent).
+// One client, two uses: the registry-digest VersionSource ("has the digest behind
+// this moving tag changed?") and the registry-existence gate ("is the tag this
+// resolver wants actually pushed?"). Private-registry auth comes from the mounted
+// ~/.docker/config.json (RegistryAuthFile); anonymous bearer flow otherwise
+// (Docker Hub, public ghcr, an unauthenticated self-hosted v2 registry).
 
 import (
 	"context"
@@ -266,7 +265,7 @@ func (rc *registryClient) manifestHead(ctx context.Context, hc *http.Client, url
 	digest, status, wwwAuth, err = rc.manifestReq(ctx, hc, http.MethodHead, url, authz)
 	if err == nil && status == http.StatusMethodNotAllowed {
 		// Some registries reject HEAD on manifests — GET and hash the body if no
-		// digest header is present (matches the python fallback).
+		// digest header is present.
 		return rc.manifestReq(ctx, hc, http.MethodGet, url, authz)
 	}
 	return digest, status, wwwAuth, err

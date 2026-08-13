@@ -13,11 +13,11 @@ func (a *app) handleLiveness(c *gin.Context)  { c.JSON(http.StatusOK, gin.H{"sta
 func (a *app) handleReadiness(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ready"}) }
 
 // ---------------------------------------------------------------------------
-// Container lifecycle (Phase 1) — every op is a SHORT async job: it returns
-// 202 + job id, and the NEXT /ws/fleet snapshot confirms the new state. None are
-// synchronous (stop/restart/remove-running carry a SIGTERM grace). Jobs run on a
-// detached context (context.Background), like build-agent — the request context
-// would cancel the op the instant the 202 is written.
+// Container lifecycle — every op is a SHORT async job: it returns 202 + job id,
+// and the NEXT /ws/fleet snapshot confirms the new state. None are synchronous
+// (stop/restart/remove-running carry a SIGTERM grace). Jobs run on a DETACHED
+// context (context.Background) — the request context would cancel the op the
+// instant the 202 is written.
 // ---------------------------------------------------------------------------
 
 // containerOpBody is the optional JSON body for a single-container op.
@@ -28,7 +28,7 @@ type containerOpBody struct {
 }
 
 // bulkOpBody is the JSON body for POST /v1/containers/bulk — one call fans out to
-// a single bulk job over ids[], so the router proxies exactly one request.
+// a single bulk job over ids[], so a caller issues exactly one request.
 type bulkOpBody struct {
 	Action     string   `json:"action"` // start|stop|restart|kill|remove
 	IDs        []string `json:"ids"`
@@ -150,7 +150,7 @@ func (a *app) handleJobLogsWS(c *gin.Context) {
 }
 
 // ---------------------------------------------------------------------------
-// Image-outdated detection (Phase 3). The results normally ride the /ws/fleet
+// Image-outdated detection. The results normally ride the /ws/fleet
 // snapshot (stamped onto containers/projects). These endpoints expose the raw
 // cache for debugging + a manual refresh trigger.
 // ---------------------------------------------------------------------------

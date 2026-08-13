@@ -52,7 +52,7 @@ type ContainerStatus struct {
 	ComposeService string `json:"compose_service,omitempty"`
 	Ports          []Port `json:"ports,omitempty"`
 
-	// Image-outdated detection (Phase 3). Populated by the imageChecker's slow
+	// Image-outdated detection. Populated by the imageChecker's slow
 	// jittered pass (NEVER inline in this snapshot) and stamped onto the container
 	// during the fleet merge. Empty until the first check completes.
 	ImageStatus        string `json:"image_status,omitempty"`         // updated|outdated|unknown
@@ -61,9 +61,9 @@ type ContainerStatus struct {
 	CurrentVersion     string `json:"current_version,omitempty"`      // running version (OCI version label or tag)
 }
 
-// ComposeProject groups containers sharing a compose project label. Phase 0
-// derives this purely from RUNNING/known container labels; Phase 2 adds the
-// durable projects.json registry so stopped-but-known projects also appear.
+// ComposeProject groups containers sharing a compose project label. The grouping
+// is derived from live container labels; the durable projects.json registry is
+// merged in on top so stopped-but-known projects also appear.
 type ComposeProject struct {
 	Name           string   `json:"name"`
 	WorkingDir     string   `json:"working_dir,omitempty"`
@@ -73,21 +73,21 @@ type ComposeProject struct {
 	Containers     []string `json:"containers"`
 	// Managed is true when docker-agent owns this stack's compose files: it was
 	// created via register/copy and its working dir lives under ComposeRoot, so
-	// the agent can read/write it and the UI offers in-place Edit. False =
-	// externally-managed (Ansible/Portainer/ad-hoc) — discovered only, files live
-	// outside the agent's mount, so the UI greys out Edit. Set by
+	// the agent can read/write it and a UI can offer in-place editing. False =
+	// externally-provisioned (another tool, or ad-hoc) — discovered only, files
+	// live outside the agent's mount, so editing is not offered. Set by
 	// composeRegistry.mergeKnown when building the fleet snapshot.
 	Managed bool `json:"managed,omitempty"`
 
-	// Rolled-up image-outdated status (Phase 3), computed from the project's
+	// Rolled-up image-outdated status, computed from the project's
 	// containers during the fleet merge: outdated if ANY service is outdated.
 	ImageStatus   string `json:"image_status,omitempty"` // updated|outdated|unknown
 	OutdatedCount int    `json:"outdated_count,omitempty"`
 }
 
-// dockerClient wraps the moby Engine API client. Phase 0 uses it read-only
-// (listContainers); container lifecycle ops (start/stop/restart/remove,
-// ContainerLogs follow) land in Phase 1, image digest inspect in Phase 3.
+// dockerClient wraps the moby Engine API client: the read-only fleet snapshot,
+// the container lifecycle ops (start/stop/restart/remove/kill), log streaming,
+// and the inspects the image checker and update engine need.
 type dockerClient struct {
 	cli           *client.Client
 	serverVersion string // cached once at construction (rarely changes)
@@ -125,7 +125,7 @@ type imageInfo struct {
 	Labels      map[string]string
 }
 
-// inspectImage returns the local image's RepoDigests + OCI labels (Phase 3
+// inspectImage returns the local image's RepoDigests + OCI labels (for
 // image-outdated detection). One inspect per UNIQUE image, run only in the
 // imageChecker's slow capped pass — never in the fleet snapshot's single pass.
 func (d *dockerClient) inspectImage(ctx context.Context, id string) (imageInfo, error) {
@@ -184,15 +184,14 @@ func summaryToStatus(s container.Summary) ContainerStatus {
 	//
 	// The Docker API returns a container's port bindings in no particular order,
 	// and it genuinely reshuffles them between calls. The controller hashes the
-	// whole frame to decide whether the fleet changed (FleetCache.contentChanged
-	// in controller's router), so an unordered array makes an idle host look
-	// like it changed on almost every poll.
+	// whole frame to decide whether the fleet changed, so an unordered array makes
+	// an idle host look like it changed on almost every poll.
 	//
-	// Measured on the live estate: two docker snapshots 12s apart on an idle
+	// Measured on a live fleet: two docker snapshots 12s apart on an idle
 	// fleet differed in 45 of 1256 leaf fields — every one of them a port
 	// reshuffle, identical as a SET. That was ~69% of all docker fleet "changes",
-	// and each phantom change cost a full overview rebuild on both router
-	// replicas at both sites plus a push to every open dashboard.
+	// and each phantom change cost the controller a full snapshot rebuild on every
+	// replica plus a push to every open dashboard.
 	//
 	// Sorting here rather than in the controller: the agent owns its wire format,
 	// and a consumer cannot canonicalise a payload whose schema it deliberately
@@ -275,7 +274,7 @@ func parseHealth(status string) string {
 }
 
 // ---------------------------------------------------------------------------
-// Container lifecycle ops (Phase 1).
+// Container lifecycle ops.
 //
 // Each is a thin typed wrapper over the moby Engine API — no shell, no output
 // parsing. They are driven as short async jobs by the engine (start has no
@@ -456,14 +455,14 @@ func (d *dockerClient) containerLogsHistory(ctx context.Context, id string, q lo
 }
 
 // ---------------------------------------------------------------------------
-// Inspect helpers (Phase 3.5 stack-update engine: health-wait + net reconcile).
+// Inspect helpers for the stack-update engine (health-wait + net reconcile).
 // One ContainerInspect per container, used ONLY in the update pipeline (a
 // deliberate op), never in the fleet snapshot's single ContainerList pass.
 // ---------------------------------------------------------------------------
 
-// containerState is the slice of a container inspect the health-wait needs —
-// the Go equivalent of docker_health_wait.py's
-// `Id|health|restart_count|running` format string (no subprocess, no parsing).
+// containerState is the slice of a container inspect the health-wait needs:
+// id, health status, restart count and running flag — read from the typed API,
+// with no subprocess and no format-string parsing.
 type containerState struct {
 	ID           string
 	Health       string // healthy|unhealthy|starting|none
@@ -473,7 +472,7 @@ type containerState struct {
 
 // inspectState returns a container's id, health status, restart count, and
 // running flag. A missing container surfaces as an error (the caller treats it
-// as "being recreated" during swap detection, exactly like the python).
+// as "being recreated" during swap detection).
 func (d *dockerClient) inspectState(ctx context.Context, nameOrID string) (containerState, error) {
 	resp, err := d.cli.ContainerInspect(ctx, nameOrID)
 	if err != nil {
@@ -490,7 +489,7 @@ func (d *dockerClient) inspectState(ctx context.Context, nameOrID string) (conta
 }
 
 // containerNetworks returns the set of network names a container is currently
-// attached to (Phase 3.5 net reconcile: detect containers detached from a
+// attached to (the network reconcile detects containers left detached from a
 // recreated network).
 func (d *dockerClient) containerNetworks(ctx context.Context, nameOrID string) (map[string]struct{}, error) {
 	resp, err := d.cli.ContainerInspect(ctx, nameOrID)
@@ -507,8 +506,8 @@ func (d *dockerClient) containerNetworks(ctx context.Context, nameOrID string) (
 }
 
 // containerLogsTail returns the last `tail` lines of a container's combined
-// stdout+stderr (Phase 3.5: dump an unhealthy container's logs into the update
-// job log on rollback). Non-following, no timestamps, empty lines dropped — a
+// stdout+stderr — used to dump an unhealthy container's logs into the update
+// job log on rollback. Non-following, no timestamps, empty lines dropped — a
 // thin filter over the shared historical-window fetch, byte-compatible with its
 // previous behaviour (TTY handling now via authoritative inspect, not a retry).
 func (d *dockerClient) containerLogsTail(ctx context.Context, nameOrID, tail string) ([]string, error) {

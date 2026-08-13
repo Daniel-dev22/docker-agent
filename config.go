@@ -10,34 +10,35 @@ import (
 
 // Config is the docker-agent runtime config, loaded from env at startup.
 //
-// The agent reaches controller exactly like duplicacy/gdrive/build: transport
-// mTLS is attached by the local docker Traefik (NAS) or k3s Traefik (cluster
-// node); app-layer identity is the per-host BearerToken. It NEVER holds a client
-// cert. The docker socket is mounted (never on TCP) — root-equivalent, the
-// standard Portainer-agent posture (we replace the holder, not widen trust).
+// The agent reaches the controller the way every sibling agent does: transport
+// mTLS is terminated by the reverse proxy in front of it on each side, and
+// app-layer identity is the per-host BearerToken. It NEVER holds a client cert.
+// The docker socket is mounted (never exposed on TCP) — root-equivalent, the
+// standard container-agent posture.
 type Config struct {
-	NodeName string // full node identity (e.g. "nas01", "nuc01", "pi01", "vm01", "nuc02"),
+	NodeName string // node identity within the site (e.g. "nas01", "nuc01", "pi01"),
 	// derived from the container hostname ("<site>-<node>") minus the SiteID prefix.
-	SiteID string // "kd" | "ng"
+	SiteID string // deployment site identifier, e.g. "site-a" | "site-b"
 
 	ConfigDir string // persistent state dir (events.sqlite, heartbeat) — bind-mounted
 
 	// Docker engine + compose state.
 	DockerHost string // docker endpoint (default unix:///var/run/docker.sock)
-	// ComposeRoot is the BIND-MOUNTED agent data dir (host==container path) under
-	// which this node's compose stacks live (<ComposeRoot>/<stack>/). Phase 2 uses
-	// it; declared here so the contract is stable from Phase 0.
+	// ComposeRoot is the BIND-MOUNTED agent data dir under which this node's
+	// compose stacks live (<ComposeRoot>/<stack>/). The host path and the container
+	// path MUST be identical: compose records host-resolved paths in its labels and
+	// writes them back, so a rewritten path would point at nothing on the host.
 	ComposeRoot string
-	// ComposeRegistryPath is the durable projects.json (Phase 2 source of truth) —
-	// under ComposeRoot so it survives restarts (the "output must be bind-mounted"
-	// lesson), NOT container-internal /var/lib.
+	// ComposeRegistryPath is the durable projects.json — the source of truth for
+	// which projects exist. It lives under ComposeRoot so it survives restarts,
+	// NOT in a container-internal /var/lib.
 	ComposeRegistryPath string
-	// RegistryAuthFile is the mounted ~/.docker/config.json for private-registry
-	// digest checks (Phase 3). Declared early for a stable env contract.
+	// RegistryAuthFile is the mounted ~/.docker/config.json used for private-registry
+	// digest checks.
 	RegistryAuthFile string
 
-	ControlCenterURL string // https://controller-api.<domain>:1443
-	TraefikDockerDNS string // docker DNS name → local Traefik ("traefik" on NAS; "" = direct on k3s)
+	ControlCenterURL string // https://<controller-host>:1443
+	TraefikDockerDNS string // docker DNS name of the host's local proxy ("traefik"); "" = dial the URL host directly
 	TraefikDialPort  string // port on the resolved Traefik IP (default "1443")
 
 	BearerTokenFile string // per-host bearer token file (mode 0600, bind-mounted)
@@ -48,10 +49,10 @@ func loadConfig() Config {
 	site := requireEnv("SITE_ID")
 	cfg := Config{
 		// The node identity is the container hostname ("<site>-<node>", e.g.
-		// "kd-pi01") minus the "<site>-" prefix → "pi01". This is the SINGLE source
-		// of truth — there is no NODE_NAME env (the hostname already encodes it, and
-		// it must match the per-host server_name the rest of the system uses so a
-		// host has ONE identity across all discovery platforms).
+		// "site-a-pi01") minus the "<site>-" prefix → "pi01". This is the SINGLE
+		// source of truth — there is no NODE_NAME env (the hostname already encodes
+		// it, and it must match the per-host name the rest of the system uses so a
+		// host has ONE identity across every inventory source).
 		NodeName: deriveNodeName(site),
 		SiteID:   site,
 
@@ -61,9 +62,10 @@ func loadConfig() Config {
 		ComposeRoot:      getEnv("COMPOSE_ROOT", "/srv/containers/docker-agent/data"),
 		RegistryAuthFile: getEnv("REGISTRY_AUTH_FILE", ""),
 		ControlCenterURL: requireEnv("CONTROL_CENTER_URL"),
-		// Empty default — k3s nodes use direct mode; NAS hosts set "traefik" to
-		// opt into rewrite mode (see network.go). A non-empty default would break
-		// k3s nodes the way it did for the other agents.
+		// Empty default — a host that can reach the controller directly leaves this
+		// unset; a host that must egress through its own local Traefik sets "traefik"
+		// to opt into rewrite mode (see network.go). A non-empty default would break
+		// every direct-dial host.
 		TraefikDockerDNS: getEnv("TRAEFIK_DOCKER_DNS", ""),
 		TraefikDialPort:  getEnv("TRAEFIK_DIAL_PORT", "1443"),
 
@@ -98,11 +100,11 @@ type emptyTokenErr struct{ path string }
 func (e *emptyTokenErr) Error() string { return "bearer token file " + e.path + " is empty" }
 
 // deriveNodeName resolves this agent's node identity from the container hostname
-// ("<site>-<node>") by stripping the "<site>-" prefix — e.g. "kd-pi01" → "pi01".
-// Mirrors the prefix strip the router does in agentkit/agentproxy.go. The
-// hostname is required (set by the deploy to inventory_hostname); a hostname that
-// doesn't carry the site prefix is a misconfiguration we refuse to start on
-// rather than silently report a wrong/ambiguous node name.
+// ("<site>-<node>") by stripping the "<site>-" prefix — e.g. "site-a-pi01" →
+// "pi01". It mirrors the prefix strip the controller does when it routes a call
+// to a node, so the two always agree. The hostname is REQUIRED (the deployment
+// sets it); a hostname that doesn't carry the site prefix is a misconfiguration
+// we refuse to start on rather than silently report a wrong/ambiguous node name.
 func deriveNodeName(site string) string {
 	host, err := os.Hostname()
 	if err != nil || strings.TrimSpace(host) == "" {
