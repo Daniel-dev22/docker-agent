@@ -67,6 +67,13 @@ type JobRequest struct {
 	// multi-service project's override target can't be inferred. In-memory only.
 	OverrideImage   string `json:"override_image,omitempty"`
 	OverrideService string `json:"override_service,omitempty"`
+	// One-shot health budget for THIS job only, in seconds. It outranks the
+	// project's strategy row, which outranks the node-class default. This is for
+	// a known one-off slow boot (a first-run data migration, say) — putting that
+	// number on the row instead would slow every future ROLLBACK on the stack by
+	// the same amount, for a delay that happens once.
+	HealthTimeoutS int `json:"health_timeout_s,omitempty"`
+	SwapTimeoutS   int `json:"swap_timeout_s,omitempty"`
 }
 
 // jobPublic carries the JSON-serializable fields of a Job, split out so
@@ -100,6 +107,8 @@ type Job struct {
 	// Stack-update op params — in-memory, set at construction.
 	overrideImage   string
 	overrideService string
+	healthTimeoutS  int
+	swapTimeoutS    int
 
 	mu          sync.Mutex
 	cancel      context.CancelFunc
