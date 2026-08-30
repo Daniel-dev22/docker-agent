@@ -54,10 +54,13 @@ func (r *jobRegistry) onChange(j *Job) func(JobEvent) {
 
 // start registers a new job and runs it in the background. Returns immediately
 // with the job id so the trigger caller can poll.
-func (r *jobRegistry) start(parentCtx context.Context, req JobRequest) *Job {
-	id := uuid.NewString()
-	jobCtx, cancel := context.WithCancel(parentCtx)
-	j := &Job{
+// newJob builds the in-memory Job from a request. Split out of start so the
+// request→job field mapping is reachable from a test without launching the run
+// goroutine: every in-memory op parameter enters the engine through exactly these
+// assignments, so a dropped or crossed one here silently disables a whole feature
+// while every unit test that hand-builds a Job still passes.
+func newJob(id string, req JobRequest, cancel context.CancelFunc) *Job {
+	return &Job{
 		jobPublic: jobPublic{
 			ID: id, Project: req.Project, Operation: req.Operation,
 			Target: req.Target, State: JobPending, TriggerKey: req.TriggerKey,
@@ -67,9 +70,17 @@ func (r *jobRegistry) start(parentCtx context.Context, req JobRequest) *Job {
 		timeout:         req.Timeout,
 		overrideImage:   req.OverrideImage,
 		overrideService: req.OverrideService,
+		healthTimeoutS:  req.HealthTimeoutS,
+		swapTimeoutS:    req.SwapTimeoutS,
 		cancel:          cancel,
 		subscribers:     map[chan string]struct{}{},
 	}
+}
+
+func (r *jobRegistry) start(parentCtx context.Context, req JobRequest) *Job {
+	id := uuid.NewString()
+	jobCtx, cancel := context.WithCancel(parentCtx)
+	j := newJob(id, req, cancel)
 
 	r.mu.Lock()
 	r.jobs[id] = j

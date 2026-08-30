@@ -91,6 +91,12 @@ type strategyOverride struct {
 	HealthStrategy   string            `json:"health_strategy,omitempty"`   // docker-health-wait (default) | http-probe
 	HealthContainers []string          `json:"health_containers,omitempty"` // subset of containers to health-check
 	HealthExcludes   []string          `json:"health_excludes,omitempty"`   // containers with no shell, so no healthcheck can ever report
+	// Per-project health budget in SECONDS, overriding the node-class default
+	// (engine.healthTimeouts). 0 / absent ⇒ the default. A one-off slow boot
+	// belongs on the REQUEST instead (JobRequest.HealthTimeoutS): a number parked
+	// here also slows every future rollback of this stack by the same amount.
+	HealthTimeoutS int `json:"health_timeout_s,omitempty"`
+	SwapTimeoutS   int `json:"swap_timeout_s,omitempty"`
 }
 
 // effStrategy is the resolved per-image strategy (auto or override).

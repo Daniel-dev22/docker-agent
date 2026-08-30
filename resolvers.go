@@ -58,6 +58,11 @@ type resolveMeta struct {
 	healthStrategy   string   // docker-health-wait (default) | http-probe
 	healthContainers []string // when set, health-check ONLY these containers
 	healthExcludes   []string // containers to skip in the health phase (see defaultHealthExcludes)
+	// Per-project health budget from the strategy row, in seconds. 0 ⇒ the
+	// node-class default. Resolved against the request and the default by
+	// engine.effectiveHealthTimeouts, which is the ONE place precedence lives.
+	healthTimeoutS int
+	swapTimeoutS   int
 }
 
 // builtinHealthExcludes are containers the health phase skips by default.
@@ -89,11 +94,16 @@ func (e *engine) selectResolver(projectName, overrideImage, overrideService stri
 		healthExcludes: defaultHealthExcludes(),
 	}
 
-	// Request-level manual override wins ("deploy this exact image").
-	if strings.TrimSpace(overrideImage) != "" {
-		return &overrideResolver{e: e, image: overrideImage, service: overrideService}, meta
-	}
-
+	// The project row is read FIRST, unconditionally, because it carries two
+	// different kinds of thing: which resolver to use, and the deploy POLICY
+	// (rollback scope, health subset/excludes, health budget). A request-level
+	// override_image replaces the former and has nothing to say about the latter.
+	//
+	// This used to return early on override_image, before the row was read — so a
+	// pinned-image deploy silently ran on the node-class defaults. That is not an
+	// edge case: override_image is how a freshly BUILT image is deployed, i.e. the
+	// exact path whose long first boot motivated the per-project budget. The stack
+	// with a 600s budget got 180s precisely when it needed the 600.
 	var o strategyOverride
 	var ok bool
 	if e.images != nil {
@@ -112,6 +122,21 @@ func (e *engine) selectResolver(projectName, overrideImage, overrideService stri
 		if len(o.HealthExcludes) > 0 {
 			meta.healthExcludes = o.HealthExcludes
 		}
+		if o.HealthTimeoutS > 0 {
+			meta.healthTimeoutS = o.HealthTimeoutS
+		}
+		if o.SwapTimeoutS > 0 {
+			meta.swapTimeoutS = o.SwapTimeoutS
+		}
+	}
+
+	// Request-level manual override wins on the RESOLVER ("deploy this exact
+	// image") — but meta above already carries the project's policy.
+	if strings.TrimSpace(overrideImage) != "" {
+		return &overrideResolver{e: e, image: overrideImage, service: overrideService}, meta
+	}
+
+	if ok {
 		switch resolverKind(o) {
 		case "upstream-compose":
 			return &upstreamComposeResolver{e: e, o: o}, meta

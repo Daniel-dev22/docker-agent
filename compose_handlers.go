@@ -28,6 +28,9 @@ type composeOpBody struct {
 	// OverrideService targets a specific service for the override.
 	OverrideImage   string `json:"override_image,omitempty"`
 	OverrideService string `json:"override_service,omitempty"`
+	// One-shot health/swap budget in seconds for this job only (see JobRequest).
+	HealthTimeoutS int `json:"health_timeout_s,omitempty"`
+	SwapTimeoutS   int `json:"swap_timeout_s,omitempty"`
 }
 
 func (a *app) handleComposeOp(c *gin.Context) {
@@ -53,15 +56,37 @@ func (a *app) handleComposeOp(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "unknown project: " + name})
 		return
 	}
+	// Bound the one-shot budgets HERE, not only at the router. The router validates
+	// the strategy row, but it is not a gate on this path: the per-node proxy replays
+	// method and body verbatim, and the agent is reachable in-process on the docker
+	// network with no bearer or mTLS. An unbounded value overflows time.Duration into
+	// a negative deadline, which the budget clamp cannot see. Refusing is better than
+	// silently ignoring — the caller asked for something and deserves to be told it
+	// was not honoured.
+	if !validBudgetSeconds(body.HealthTimeoutS) || !validBudgetSeconds(body.SwapTimeoutS) {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": fmt.Sprintf("health_timeout_s and swap_timeout_s must be between 0 and %d seconds (0 = use the project/node default)",
+				int(maxBudget/time.Second))})
+		return
+	}
 	j := a.reg.start(context.Background(), JobRequest{
 		Operation:       body.Op,
 		Project:         name,
 		Timeout:         body.Timeout,
 		OverrideImage:   body.OverrideImage,
 		OverrideService: body.OverrideService,
+		HealthTimeoutS:  body.HealthTimeoutS,
+		SwapTimeoutS:    body.SwapTimeoutS,
 		TriggerKey:      orDefault(body.TriggerKey, "ui"),
 	})
 	c.JSON(http.StatusAccepted, gin.H{"job_id": j.ID, "state": j.snapshot().State})
+}
+
+// validBudgetSeconds reports whether a request-supplied budget is one the agent
+// will honour. 0 stays legal — it is how a caller says "use the configured
+// default" — so this rejects only negatives and anything past maxBudget.
+func validBudgetSeconds(v int) bool {
+	return v == 0 || (v > 0 && time.Duration(v)*time.Second > 0 && time.Duration(v)*time.Second <= maxBudget)
 }
 
 // projectKnown reports whether the name is in the durable registry or among the

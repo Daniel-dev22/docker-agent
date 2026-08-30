@@ -50,7 +50,13 @@ type healthWaitResult struct {
 	healthMap map[string]string
 	unhealthy []string
 	crashLoop bool
-	elapsed   time.Duration
+	// aborted marks a wait cut short by context cancellation or the op deadline
+	// rather than by reaching a verdict. It must be reported as a FAILURE: on the
+	// very first iteration healthMap is still empty, so notHealthy returns nothing,
+	// and without this the caller reads "no unhealthy containers" as success and
+	// marks an update completed having verified nothing at all.
+	aborted bool
+	elapsed time.Duration
 }
 
 // inspectAll inspects every name concurrently, returning a state map and an
@@ -119,10 +125,32 @@ func (e *engine) healthWait(ctx context.Context, j *Job, p healthWaitParams) (he
 
 	res = e.waitForHealth(ctx, j, p, excluded, p.restartThreshold)
 	res.elapsed = time.Since(start)
-	if len(res.unhealthy) > 0 {
-		return res, fmt.Errorf("unhealthy after update: %s", strings.Join(res.unhealthy, ", "))
+	return res, healthVerdict(res, ctx.Err())
+}
+
+// healthVerdict turns a completed wait into the engine's pass/fail decision.
+//
+// Pure, and separate from the polling, because this is the decision that says
+// whether a deploy is verified — and the polling around it cannot be unit-tested
+// (it inspects live containers), so without the split the decision could only be
+// checked by reading it.
+//
+// The `aborted` arm is the one that matters. A wait cut short by cancellation or
+// the op deadline leaves an EMPTY healthMap on the first iteration, so `unhealthy`
+// is empty too — and an empty unhealthy set is indistinguishable from "everything
+// came up healthy". Without this arm the engine marks an update completed having
+// verified nothing.
+func healthVerdict(res healthWaitResult, ctxErr error) error {
+	if res.aborted {
+		if ctxErr == nil {
+			ctxErr = context.Canceled
+		}
+		return fmt.Errorf("health wait did not complete: %w", ctxErr)
 	}
-	return res, nil
+	if len(res.unhealthy) > 0 {
+		return fmt.Errorf("unhealthy after update: %s", strings.Join(res.unhealthy, ", "))
+	}
+	return nil
 }
 
 // waitForSwap waits for container IDs to change after a recreate (partial-update
@@ -220,14 +248,42 @@ func (e *engine) waitForHealth(ctx context.Context, j *Job, p healthWaitParams, 
 	j.appendLine(fmt.Sprintf("waiting for health (timeout %s, restart threshold %d)", p.healthTimeout, threshold))
 	for {
 		if ctx.Err() != nil {
-			return healthWaitResult{healthMap: healthMap, unhealthy: notHealthy(healthMap, excluded)}
+			// Say so. Without this the log jumps straight from "waiting for health"
+			// to "rolling back", and nothing distinguishes a wait that was cut off
+			// by the op deadline from one that genuinely observed an unhealthy
+			// container — the two want completely different fixes.
+			j.appendLine("health wait cut short: " + ctx.Err().Error())
+			return healthWaitResult{healthMap: healthMap, unhealthy: notHealthy(healthMap, excluded), aborted: true}
 		}
 		states, errs := e.inspectAll(ctx, p.containers)
 		allHealthy := true
 		crashLoop := false
 		for _, name := range p.containers {
+			// An exclusion means "this container cannot report a health verdict"
+			// (no shell, so docker's healthcheck can only ever say "none"). It does
+			// NOT mean "do not look at this container": a crash-looping or stopped
+			// excluded container is still a broken deploy. Skipping the liveness
+			// checks here let a rollback that failed to restart an excluded
+			// container report "rollback healthy".
 			if excluded[name] {
-				healthMap[name] = "excluded"
+				st, bad := states[name], false
+				if _, e := errs[name]; e {
+					bad = true
+				}
+				switch {
+				case bad:
+					healthMap[name] = "error"
+					allHealthy = false
+				case st.RestartCount > initialRestarts[name]+threshold:
+					healthMap[name] = "crash_loop"
+					crashLoop = true
+					allHealthy = false
+				case !st.Running:
+					healthMap[name] = "not_running"
+					allHealthy = false
+				default:
+					healthMap[name] = "excluded"
+				}
 				continue
 			}
 			if err, bad := errs[name]; bad {
@@ -267,7 +323,8 @@ func (e *engine) waitForHealth(ctx context.Context, j *Job, p healthWaitParams, 
 			break
 		}
 		if !sleepCtx(ctx, time.Second) {
-			return healthWaitResult{healthMap: healthMap, unhealthy: notHealthy(healthMap, excluded)}
+			j.appendLine("health wait cut short: " + ctx.Err().Error())
+			return healthWaitResult{healthMap: healthMap, unhealthy: notHealthy(healthMap, excluded), aborted: true}
 		}
 	}
 
@@ -281,7 +338,14 @@ func (e *engine) waitForHealth(ctx context.Context, j *Job, p healthWaitParams, 
 func notHealthy(healthMap map[string]string, excluded map[string]bool) []string {
 	var out []string
 	for name, status := range healthMap {
-		if excluded[name] {
+		// Filter on the STATUS, not on membership of the excluded set. "excluded"
+		// is the status waitForHealth writes for a container that is alive but
+		// cannot report a health verdict; an excluded container that is crash-
+		// looping or stopped gets "crash_loop"/"not_running" instead and must still
+		// appear here. Skipping by name dropped those, so the loop could never
+		// reach allHealthy, ran to the deadline, and then reported an EMPTY
+		// unhealthy set — which the caller reads as success.
+		if status == "excluded" {
 			continue
 		}
 		if status != "healthy" && status != "none" {
