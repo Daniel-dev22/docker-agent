@@ -9,13 +9,24 @@ Previous: `build-agent/docs/BUILD_PROVENANCE_PHASE1_HANDOFF.md` — read it, it 
 |---|---|
 | Built | yes — `provenance.go` (new), `dockerclient.go` + `imagecheck.go` (wiring), `provenance_test.go` (new) |
 | Reviewed | **four independent lenses, every finding verified then fixed.** See *The review* |
-| Merged | check `git log main` |
-| Tagged / deployed | **no.** Neither this nor phase 1 has run anywhere |
+| Merged | yes, `main` |
+| Tagged | **`0.1.15`** |
+| Deployed | **kdhome: 4 of 5 hosts.** kd-pi01 blocked (see Traps). nghome built but NOT rolled — parked behind a peer's DR-harness deploy hold |
 
-**Nothing has been observed end to end.** No image carries the labels yet, because
-build-agent 0.1.6 is not tagged or deployed. Phase 2 is therefore written entirely
-against a contract, not against observed data — the first rollout is the first time
-any of it meets a real label.
+**Observed end to end on kdhome, 2026-09-03.** Five `compose_projects` discovery
+rows carry provenance, and they are exactly the five stacks whose images were
+rebuilt with labels:
+
+```
+kd/nas01  build-agent   source_ref=0.1.6   source_revision=b38676d0…  built_from_source=true  rebuildable_from_ref=true
+kd/nas01  docker-agent  source_ref=0.1.15  source_revision=c8b926f8…  built_from_source=true  rebuildable_from_ref=true
+kd/nuc01, kd/nuc02, kd/vm01  docker-agent — identical
+— 5 of 77 rows carry provenance —
+```
+
+📏 **The other 72 rows carrying nothing is the result, not a gap.** Those are
+pre-phase-1 images with no labels, and absent-not-empty is the degradation phase 3
+depends on. A run where all 77 carried something would mean the gate had failed.
 
 ## What ships
 
@@ -91,14 +102,17 @@ touch a project row before it reaches both the fleet frame and the discovery pus
 It mutates matched rows in place today; a rebuild of the struct there would drop
 this entire phase with every other test in the file still green.
 
-**Assumed, NOT measured:**
-- That any image anywhere carries these labels. None does yet.
-- That the router and discovery-api pass the new fields through untouched. Phase 0
-  read the code and found verbatim pass-through (`attributes = []byte(raw)` →
-  `map[string]interface{}`), but no row has actually carried them.
-- Everything phase 1 left unverified (buildx accepting the argv, cache behaviour,
-  multi-arch manifests) still gates this: if a label does not land, this reads empty
-  and looks exactly like "nothing rebuilt yet".
+**Now measured, having been assumed:**
+- Images carry the labels — on **both** children of the multi-arch manifest.
+- The router and discovery-api pass the new fields through untouched. Phase 0 read
+  this from the code; the five rows above are the observation.
+- `built_from_source` and `rebuildable_from_ref` both arrive as the **string**
+  `"true"` through the whole chain into JSONB.
+
+**Still assumed:**
+- The unanimity rule has only been exercised by single-service stacks in
+  production. The mixed-stack and partial-pass paths are unit-tested but have not
+  occurred on a real host yet.
 
 ## The review changed three things about the design
 
@@ -191,5 +205,12 @@ pipeline is broken.
 - **The rollup is silent by design when a stack is mixed.** That is correct and it
   has no counter — if someone reports "frigate stopped pre-filling", check for a new
   sidecar container in the project before suspecting the labels.
-- **docker-agent is at 0.1.14.** Same two-playbook deploy shape as build-agent; it
+- **docker-agent is at 0.1.15.** Same two-playbook deploy shape as build-agent; it
   has no k8s deployment, so `build-deploy.yml` alone leaves the old container running.
+- 🔴 **kd-pi01 is NOT on this version and will report no provenance indefinitely.**
+  It gets HTTP 502 from the registry on every request including `/v2/`, while other
+  kdhome hosts pull fine from the same IP, so it cannot pull any image. Pre-existing
+  (its agent predates this work by days) and unrelated to provenance. This is the
+  live instance of the trap above: on that host "no provenance" means "the agent was
+  never upgraded", not "the labels do not work" — and only per-host image state
+  distinguishes them.
