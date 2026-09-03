@@ -59,6 +59,18 @@ type ContainerStatus struct {
 	LatestImageVersion string `json:"latest_image_version,omitempty"` // full name:tag of the newest available
 	VersionSource      string `json:"version_source,omitempty"`       // auto:registry-digest|auto:github-release|override:…
 	CurrentVersion     string `json:"current_version,omitempty"`      // running version (OCI version label or tag)
+
+	// Build provenance, read off the image's own OCI labels during the same slow
+	// pass that computes ImageStatus (no extra inspect). Present only for images
+	// build-agent produced — see provenanceFromLabels for why a third party's
+	// standard OCI labels must not land here. omitempty throughout: an absent
+	// field means "unknown", and an empty source_ref downstream would read as a
+	// branch named empty string.
+	SourceRepo      string `json:"source_repo,omitempty"`
+	SourceRef       string `json:"source_ref,omitempty"`
+	SourceRevision  string `json:"source_revision,omitempty"`
+	BuildContext    string `json:"build_context,omitempty"`     // git|upload
+	BuiltFromSource string `json:"built_from_source,omitempty"` // "true" — STRING, see builtFromSource
 }
 
 // ComposeProject groups containers sharing a compose project label. The grouping
@@ -83,6 +95,16 @@ type ComposeProject struct {
 	// containers during the fleet merge: outdated if ANY service is outdated.
 	ImageStatus   string `json:"image_status,omitempty"` // updated|outdated|unknown
 	OutdatedCount int    `json:"outdated_count,omitempty"`
+
+	// Build provenance rolled up from the project's containers. A field is set
+	// only when EVERY container in the project agrees on it — a mixed stack has
+	// no single ref, and pre-filling one would be a confident wrong answer. See
+	// provFold.
+	SourceRepo      string `json:"source_repo,omitempty"`
+	SourceRef       string `json:"source_ref,omitempty"`
+	SourceRevision  string `json:"source_revision,omitempty"`
+	BuildContext    string `json:"build_context,omitempty"`
+	BuiltFromSource string `json:"built_from_source,omitempty"`
 }
 
 // dockerClient wraps the moby Engine API client: the read-only fleet snapshot,

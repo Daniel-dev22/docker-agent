@@ -49,6 +49,14 @@ type imageCheck struct {
 	VersionSource      string `json:"version_source,omitempty"` // auto:…|override:…
 	Error              string `json:"error,omitempty"`
 	CheckedAt          int64  `json:"checked_at"`
+
+	// Provenance carried on the cached result so the fleet hot path can stamp it
+	// with a map lookup, exactly like ImageStatus. Read from the same image
+	// inspect the check already performs — zero additional Engine API calls.
+	SourceRepo     string `json:"source_repo,omitempty"`
+	SourceRef      string `json:"source_ref,omitempty"`
+	SourceRevision string `json:"source_revision,omitempty"`
+	BuildContext   string `json:"build_context,omitempty"`
 }
 
 const (
@@ -461,6 +469,7 @@ func stampImageStatus(containers []ContainerStatus, projects []ComposeProject, i
 	}
 	type roll struct{ outdated, checked int }
 	rollups := map[string]*roll{}
+	provs := map[string]*projectProvenance{}
 
 	for i := range containers {
 		c := &containers[i]
@@ -468,6 +477,20 @@ func stampImageStatus(containers []ContainerStatus, projects []ComposeProject, i
 		if !ok {
 			continue
 		}
+		// Only checked containers fold; an unchecked one is caught by the
+		// denominator in provFold.result, which compares the number of votes
+		// against the project's own container count.
+		if c.ComposeProject != "" {
+			pa := provs[c.ComposeProject]
+			if pa == nil {
+				pa = &projectProvenance{}
+				provs[c.ComposeProject] = pa
+			}
+			pa.add(sourceProvenance{Repo: r.SourceRepo, Ref: r.SourceRef, Revision: r.SourceRevision, Context: r.BuildContext})
+		}
+		c.SourceRepo, c.SourceRef = r.SourceRepo, r.SourceRef
+		c.SourceRevision, c.BuildContext = r.SourceRevision, r.BuildContext
+		c.BuiltFromSource = builtFromSource(sourceProvenance{Context: r.BuildContext})
 		c.ImageStatus = r.ImageStatus
 		c.LatestImageVersion = r.LatestImageVersion
 		c.VersionSource = r.VersionSource
@@ -486,6 +509,17 @@ func stampImageStatus(containers []ContainerStatus, projects []ComposeProject, i
 		if r.ImageStatus == statusOutdated {
 			rl.outdated++
 		}
+	}
+
+	for name, pa := range provs {
+		p := byProject[name]
+		if p == nil {
+			continue
+		}
+		fold := pa.result(p.ContainerCount)
+		p.SourceRepo, p.SourceRef = fold.Repo, fold.Ref
+		p.SourceRevision, p.BuildContext = fold.Revision, fold.Context
+		p.BuiltFromSource = builtFromSource(fold)
 	}
 
 	for name, rl := range rollups {
@@ -751,6 +785,13 @@ func (ic *imageChecker) checkUnit(ctx context.Context, c ContainerStatus, info i
 		current = ref.Tag
 	}
 	res.CurrentVersion = current
+
+	// Provenance rides along on the same inspect. Unlike everything else in this
+	// function it needs no remote lookup and cannot fail, so it is recorded before
+	// any strategy branch — a check that errors out still carries the source.
+	prov := provenanceFromLabels(info.Labels)
+	res.SourceRepo, res.SourceRef = prov.Repo, prov.Ref
+	res.SourceRevision, res.BuildContext = prov.Revision, prov.Context
 
 	strat := ic.resolveStrategy(c, info, ref)
 	res.VersionSource = strat.label()
