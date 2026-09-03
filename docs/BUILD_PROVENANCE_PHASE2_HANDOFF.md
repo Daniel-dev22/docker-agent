@@ -8,7 +8,7 @@ Previous: `build-agent/docs/BUILD_PROVENANCE_PHASE1_HANDOFF.md` — read it, it 
 | | |
 |---|---|
 | Built | yes — `provenance.go` (new), `dockerclient.go` + `imagecheck.go` (wiring), `provenance_test.go` (new) |
-| Reviewed | **self-review + a 19-mutation campaign.** The four independent lenses were NOT run (this session cannot spawn subagents) |
+| Reviewed | **four independent lenses, every finding verified then fixed.** See *The review* |
 | Merged | check `git log main` |
 | Tagged / deployed | **no.** Neither this nor phase 1 has run anywhere |
 
@@ -21,7 +21,8 @@ any of it meets a real label.
 
 `compose_projects` and `containers` discovery rows gain, all `omitempty`:
 
-`source_repo` · `source_ref` · `source_revision` · `build_context` · `built_from_source`
+`source_repo` · `source_ref` · `source_revision` · `build_context` · `built_from_source` ·
+`rebuildable_from_ref`
 
 ## Two places this departs from the plan, both deliberate
 
@@ -99,6 +100,61 @@ this entire phase with every other test in the file still green.
   multi-arch manifests) still gates this: if a label does not land, this reads empty
   and looks exactly like "nothing rebuilt yet".
 
+## The review changed three things about the design
+
+**1. The reader now sanitises what it republishes.** The writer bounds what it
+writes, but it runs in another process on another host — and these labels come off
+whatever image is on *this* host. An invariant the reader does not re-establish is
+not an invariant. Concretely: the container inserts share one transaction with a
+`DELETE`, so a single value PostgreSQL cannot store in `jsonb` fails the whole push
+and **freezes that node's docker discovery** at its last good snapshot, with a 500
+in a log as the only symptom. The unbounded-length half needs no crafted image.
+
+**2. Provenance is only believed while the cached result still describes the image
+the container is running.** `compositeKey` is `(project, service, image REFERENCE)`.
+Every other field on `imageCheck` is a status *about that reference* and tolerates
+a moving tag; provenance is a claim about **content**. A `compose pull && up -d` on
+`:latest` — how ansible ships every first-party image — leaves the key valid while
+the content changes, so the previous image's commit would have been published as the
+project's unanimous revision for up to a full 15-minute interval. The cached result
+now carries the `ImageID` it was computed from.
+
+**3. `built_from_source` and "rebuildable" were conflated, and phase 3 would have
+shown it.** An uploaded context (genmon) and a git build with no explicit ref both
+give `built_from_source="true"` with `source_ref` absent — so the form would
+pre-fill "build a custom branch" **with no branch**. `built_from_source` stays
+honest about origin; **`rebuildable_from_ref` is what the phase-3 toggle must key
+on**, and the two are present together or not at all.
+
+Also fixed: `sourceRepoFromLabels`, the *pre-existing* other reader of
+`org.opencontainers.image.source`, never stripped `.git` (so `o/r.git` 404s every
+release lookup) and accepted scp syntax as a slug. That is a fix to behaviour that
+predates this work, and it is how the coupling was found.
+
+## The review
+
+Four independent lenses ran against the frozen merged SHA. 📏 The verification lens
+ran **41 mutations and found 22 genuine survivors**, against my own campaign's
+19/19 — because an author mutates the lines he wrote and a lens mutates the
+properties he *claimed*. Two lenses independently found the label-key coupling.
+
+The survivors were all *shape*, not weakness:
+
+- **Every project fixture had `ContainerCount == RunningCount`**, so the denominator
+  this document calls "the ONLY thing enforcing" the rule could be pointed at the
+  wrong field with the suite green. On the one axis no fixture varied.
+- `SourceRepo`, `SourceRevision` and `BuildContext` were **written but never read**.
+- **No fixture anywhere had a context with an empty ref** — the genmon case the
+  `built_from_source` rule exists for.
+- Four of the five wire names were free to change: asserting "absent when unknown"
+  passes for a renamed tag too, and phase 3 reads `source_ref` **by name**.
+- `empty()` was production-dead and the flagship gate test asserted only
+  `!empty()`, so making it return `true` unconditionally left the phase's
+  "most important line" passing. Deleted; the gate asserts fields.
+
+Final canary: **21 mutations, 21 caught**, including two more found while
+re-canarying the fixes.
+
 ## Decisions
 
 - **Label keys duplicated, not hoisted into `agent-kit-go`.** Both agents depend on
@@ -115,8 +171,9 @@ this entire phase with every other test in the file still green.
 Phase 3, in `control-center/schema-api/main.go`, the `docker-stack-update` schema
 (~line 1217): add `"populateFields": true` to `stack_name`'s `x-discovery`, then
 `x-discovery-field` on `override_image_name` (`latest_image_version`),
-`frigate_custom_branch` (`built_from_source`) and `frigate_branch_name`
-(`source_ref`), and delete the inert `x-auto-populate` block. Phase 0's answer 1 has
+`frigate_custom_branch` (**`rebuildable_from_ref`**, NOT `built_from_source` — see
+the review, item 3) and `frigate_branch_name` (`source_ref`), and delete the inert
+`x-auto-populate` block. Phase 0's answer 1 has
 the mechanism and the three frontend traps.
 
 **Do not ship phase 3 before phase 1+2 are deployed and a discovery row is observed

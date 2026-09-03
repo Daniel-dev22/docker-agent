@@ -1,5 +1,10 @@
 package main
 
+import (
+	"strings"
+	"unicode/utf8"
+)
+
 // Image provenance: reading back the labels build-agent stamps, so a discovery
 // row can answer "what source is this stack running?".
 //
@@ -27,8 +32,6 @@ type sourceProvenance struct {
 	Context  string // "git" | "upload"
 }
 
-func (p sourceProvenance) empty() bool { return p == sourceProvenance{} }
-
 // provenanceFromLabels reads provenance off an image's OCI labels.
 //
 // 🔴 It returns NOTHING unless the namespaced build.context label is present, and
@@ -52,11 +55,52 @@ func provenanceFromLabels(labels map[string]string) sourceProvenance {
 		return sourceProvenance{}
 	}
 	return sourceProvenance{
-		Repo:     labels[labelSource],
-		Ref:      labels[labelRef],
-		Revision: labels[labelRevision],
+		Repo:     sanitizeLabelValue(labels[labelSource]),
+		Ref:      sanitizeLabelValue(labels[labelRef]),
+		Revision: sanitizeLabelValue(labels[labelRevision]),
 		Context:  ctx,
 	}
+}
+
+// Label values are re-published: onto every fleet websocket frame, and into the
+// controller's discovery row, which the router inserts into a JSONB column.
+//
+// 🔴 THE WRITER'S SANITISING IS NOT A SYSTEM PROPERTY. build-agent bounds what it
+// writes, but it runs in a different process on a different host, and these labels
+// come off whatever image is on THIS host — the gate above makes the claim
+// namespaced, not trusted. An invariant the reader does not re-establish is not an
+// invariant.
+//
+// Concretely: the container inserts share one transaction with a DELETE, so a
+// single value PostgreSQL cannot store in jsonb (a NUL is the cheap case) fails
+// the whole push and freezes that node's docker discovery at its last good
+// snapshot, with a 500 in a log as the only symptom. An unbounded value needs no
+// crafting at all — it just inflates every frame and every row, forever.
+//
+// Same rules as the writer, deliberately: drop rather than repair, because a
+// silently-edited ref is a wrong answer and being trusted is this value's only job.
+const maxLabelValue = 512
+
+func sanitizeLabelValue(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" || len(s) > maxLabelValue || !utf8.ValidString(s) {
+		return ""
+	}
+	for _, r := range s {
+		switch {
+		case r < 0x20, r == 0x7f:
+			return ""
+		case r >= 0x80 && r <= 0x9f: // C1
+			return ""
+		case r == 0x2028 || r == 0x2029: // line / paragraph separator
+			return ""
+		case r >= 0x202a && r <= 0x202e, r >= 0x2066 && r <= 0x2069: // bidi
+			return ""
+		case r == 0xfeff:
+			return ""
+		}
+	}
+	return s
 }
 
 const (
@@ -149,4 +193,40 @@ func builtFromSource(p sourceProvenance) string {
 		return ""
 	}
 	return "true"
+}
+
+// rebuildableFromRef answers the question the rebuild FORM asks, which is not the
+// question builtFromSource answers.
+//
+// Review found the two had been conflated: an uploaded-context build (genmon) and
+// a git build with no explicit ref both yield built_from_source="true" with
+// source_ref structurally absent. Phase 3 maps the custom-branch toggle from one
+// field and the branch name from the other, so those stacks would pre-fill a form
+// that says "build a custom branch" with no branch — self-contradictory, and with
+// no explanation available to whoever is looking at it.
+//
+// So: built_from_source stays honest about origin ("we built this"), and this
+// field is what the toggle keys on. Both are present together or not at all.
+func rebuildableFromRef(p sourceProvenance) string {
+	if p.Context != contextGit || p.Ref == "" {
+		return ""
+	}
+	return "true"
+}
+
+// provenanceOf returns the provenance a cached check may contribute for one
+// container, or the zero value if the cache entry describes a different image.
+//
+// compositeKey is (project, service, image REFERENCE) and deliberately excludes
+// the image ID, because every other field on imageCheck is a status about that
+// reference. Provenance is not: it is a claim about content. A redeploy that
+// leaves the reference unchanged (`compose pull && up -d` on :latest, which is how
+// ansible ships every first-party image) keeps the key valid while the content
+// underneath it changes, and the stale commit would then be published as the
+// project's unanimous revision.
+func provenanceOf(r imageCheck, c ContainerStatus) sourceProvenance {
+	if r.ImageID == "" || c.ImageID == "" || r.ImageID != c.ImageID {
+		return sourceProvenance{}
+	}
+	return sourceProvenance{Repo: r.SourceRepo, Ref: r.SourceRef, Revision: r.SourceRevision, Context: r.BuildContext}
 }
