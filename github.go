@@ -628,6 +628,28 @@ func (g *githubClient) verifyImage(ctx context.Context, q branchQuery, tag strin
 	return g.registry.imageExists(vctx, ref)
 }
 
+// resolveRef returns the full commit SHA a ref currently points at.
+//
+// Uses /repos/{repo}/commits/{ref}, which resolves a branch, a tag OR a raw SHA
+// — unlike branchHead below, whose /branches/{branch} endpoint 404s on a tag.
+// One call answers "what would I get if I built this ref right now?" without the
+// caller having to know which kind of ref it holds.
+//
+// Returns the full SHA rather than 7 chars: the caller compares against an
+// image's org.opencontainers.image.revision label, which is the full 40.
+func (g *githubClient) resolveRef(ctx context.Context, repo, ref string) (string, error) {
+	var out struct {
+		SHA string `json:"sha"`
+	}
+	// g.apiBase, not the package const: it is what makes the endpoint testable, and
+	// pinning WHICH endpoint matters — /branches/{ref} 404s on a tag, so a silent
+	// swap would turn every tag-built image into "unknown" with nothing failing.
+	if _, err := g.apiGet(ctx, fmt.Sprintf("%s/repos/%s/commits/%s", g.apiBase, repo, ref), &out); err != nil {
+		return "", err
+	}
+	return out.SHA, nil
+}
+
 // branchHead returns the latest commit SHA (7 chars) for a custom branch.
 func (g *githubClient) branchHead(ctx context.Context, repo, branch string) (string, error) {
 	var out struct {

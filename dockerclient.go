@@ -74,6 +74,9 @@ type ContainerStatus struct {
 	// "true" only when a rebuild from a named ref is actually possible. Distinct
 	// from BuiltFromSource on purpose — see rebuildableFromRef.
 	RebuildableFromRef string `json:"rebuildable_from_ref,omitempty"`
+	// "current" | "behind": has the ref this image was built from moved since?
+	// Distinct from ImageStatus, which only sees images already in the registry.
+	SourceStatus string `json:"source_status,omitempty"`
 }
 
 // ComposeProject groups containers sharing a compose project label. The grouping
@@ -109,6 +112,7 @@ type ComposeProject struct {
 	BuildContext       string `json:"build_context,omitempty"`
 	BuiltFromSource    string `json:"built_from_source,omitempty"`
 	RebuildableFromRef string `json:"rebuildable_from_ref,omitempty"`
+	SourceStatus       string `json:"source_status,omitempty"`
 }
 
 // dockerClient wraps the moby Engine API client: the read-only fleet snapshot,

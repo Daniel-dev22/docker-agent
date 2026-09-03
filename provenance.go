@@ -230,3 +230,78 @@ func provenanceOf(r imageCheck, c ContainerStatus) sourceProvenance {
 	}
 	return sourceProvenance{Repo: r.SourceRepo, Ref: r.SourceRef, Revision: r.SourceRevision, Context: r.BuildContext}
 }
+
+// Source freshness: "would rebuilding this image's ref give me a different commit
+// than the one it was built from?"
+//
+// This is a DIFFERENT question from ImageStatus. ImageStatus compares what is
+// deployed against what is in the registry, so it answers "has a newer image been
+// pushed?". For an image we built ourselves from a moving ref, nobody pushes
+// anything until someone rebuilds — so ImageStatus reports `updated` forever while
+// the source it was built from moves out from under it. That gap is the whole
+// reason this exists.
+const (
+	sourceCurrent = "current" // the ref still points at the commit we built
+	sourceBehind  = "behind"  // the ref has moved; a rebuild would change the image
+)
+
+// sourceFreshness decides whether a remote lookup is even needed, and what an
+// answer means. Split from the lookup so every branch is testable without a
+// network: `need` false means the verdict is already known.
+//
+// 🔴 A version-pinned tag is treated as immutable and never looked up. That is the
+// estate's own convention, already encoded in isPinnedTag and relied on by the
+// update-strategy code — and it is what makes this feature free today: every
+// source_ref in production is a pinned tag (0.1.6, 0.1.15), so the steady-state
+// cost is zero API calls. It activates for a moving ref (a branch like 0.19, dev,
+// main), which is exactly the custom-build case it was written for.
+func sourceFreshness(p sourceProvenance) (verdict, slug string, need bool) {
+	if p.Context != contextGit || p.Ref == "" || p.Revision == "" {
+		return "", "", false // not ours, or nothing to compare
+	}
+	if isPinnedTag(p.Ref) {
+		return sourceCurrent, "", false
+	}
+	slug = githubSlugFromURL(p.Repo)
+	if slug == "" {
+		return "", "", false // not a GitHub source we can resolve
+	}
+	return "", slug, true
+}
+
+// compareRevision turns a resolved head into a verdict.
+//
+// Prefix-compares in both directions because the two sides are different lengths
+// by design: the image label carries the full 40-char SHA, while some GitHub
+// helpers in this package truncate to 7. An equality test would report every
+// image as behind — silently, and in the alarming direction.
+func compareRevision(builtRevision, head string) string {
+	if builtRevision == "" || head == "" {
+		return "" // unknown, never a claim
+	}
+	if strings.HasPrefix(builtRevision, head) || strings.HasPrefix(head, builtRevision) {
+		return sourceCurrent
+	}
+	return sourceBehind
+}
+
+// rollupSourceStatus folds a project's containers. ANY container behind means a
+// rebuild of the project would change something, which mirrors how ImageStatus
+// rolls up "outdated". Absent unless at least one container had a verdict, so
+// "no answer" and "checked and current" stay distinguishable — an empty string
+// here means unknown, not fine.
+func rollupSourceStatus(verdicts []string) string {
+	seen := false
+	for _, v := range verdicts {
+		switch v {
+		case sourceBehind:
+			return sourceBehind
+		case sourceCurrent:
+			seen = true
+		}
+	}
+	if seen {
+		return sourceCurrent
+	}
+	return ""
+}
