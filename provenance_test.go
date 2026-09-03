@@ -1,9 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The four keys are a contract with build-agent (build-agent/provenance.go).
@@ -177,6 +182,8 @@ func TestStampImageStatusPublishesProvenance(t *testing.T) {
 		mk("partial", "p2", "reg/p2:latest", "sha256:eee"),
 		mk("genmon", "genmon", "reg/genmon:1.4.0", "sha256:fff"),
 		mk("moved", "moved", "reg/moved:latest", "sha256:NEW"),
+		mk("stale", "s1", "reg/s1:latest", "sha256:111"),
+		mk("stale", "s2", "reg/s2:latest", "sha256:222"),
 	}
 	projects := []ComposeProject{
 		{Name: "frigate", ContainerCount: 1, RunningCount: 1},
@@ -187,12 +194,14 @@ func TestStampImageStatusPublishesProvenance(t *testing.T) {
 		{Name: "partial", ContainerCount: 2, RunningCount: 1},
 		{Name: "genmon", ContainerCount: 1, RunningCount: 1},
 		{Name: "moved", ContainerCount: 1, RunningCount: 1},
+		{Name: "stale", ContainerCount: 2, RunningCount: 2},
 	}
 	ic := &imageChecker{cache: map[string]imageCheck{}}
 	ic.cache[compositeKey(containers[0])] = imageCheck{
 		ImageStatus: statusUpdated, ImageID: "sha256:aaa",
 		SourceRepo: "https://github.com/blakeblackshear/frigate",
 		SourceRef:  "0.19", SourceRevision: "deadbeef", BuildContext: contextGit,
+		SourceStatus: sourceCurrent,
 	}
 	ic.cache[compositeKey(containers[1])] = imageCheck{
 		ImageStatus: statusUpdated, ImageID: "sha256:bbb",
@@ -210,6 +219,19 @@ func TestStampImageStatusPublishesProvenance(t *testing.T) {
 	// case the built_from_source rule exists for, and no fixture had it.
 	ic.cache[compositeKey(containers[5])] = imageCheck{
 		ImageStatus: statusUpdated, ImageID: "sha256:fff", BuildContext: contextUpload,
+	}
+	// "stale": one of two services is behind its source. The rollup is ANY, not
+	// unanimous — a rebuild of the project WOULD change something, which is the
+	// question this signal answers.
+	ic.cache[compositeKey(containers[7])] = imageCheck{
+		ImageStatus: statusUpdated, ImageID: "sha256:111",
+		SourceRepo: "https://github.com/o/s1", SourceRef: "dev",
+		SourceRevision: "aaa", BuildContext: contextGit, SourceStatus: sourceCurrent,
+	}
+	ic.cache[compositeKey(containers[8])] = imageCheck{
+		ImageStatus: statusUpdated, ImageID: "sha256:222",
+		SourceRepo: "https://github.com/o/s2", SourceRef: "dev",
+		SourceRevision: "bbb", BuildContext: contextGit, SourceStatus: sourceBehind,
 	}
 	// "moved": the cached result describes the image this container USED to run.
 	ic.cache[compositeKey(containers[6])] = imageCheck{
@@ -262,9 +284,28 @@ func TestStampImageStatusPublishesProvenance(t *testing.T) {
 		t.Errorf("a stale cache entry must contribute nothing; got %+v", containers[6])
 	}
 
+	if containers[0].SourceStatus != sourceCurrent {
+		t.Errorf("container source_status not stamped; got %q", containers[0].SourceStatus)
+	}
+	if containers[2].SourceStatus != "" {
+		t.Errorf("a pulled image has no source to be behind; got %q", containers[2].SourceStatus)
+	}
+	if containers[6].SourceStatus != "" {
+		t.Errorf("a stale cache entry must not stamp a source verdict; got %q", containers[6].SourceStatus)
+	}
+
 	byName := map[string]ComposeProject{}
 	for _, p := range projects {
 		byName[p.Name] = p
+	}
+	if g := byName["stale"]; g.SourceStatus != sourceBehind {
+		t.Errorf("ANY container behind => project behind; got %q", g.SourceStatus)
+	}
+	if g := byName["frigate"]; g.SourceStatus != sourceCurrent {
+		t.Errorf("all current => project current; got %q", g.SourceStatus)
+	}
+	if g := byName["mixed"]; g.SourceStatus != "" {
+		t.Errorf("no verdicts => unknown, not current; got %q", g.SourceStatus)
 	}
 	if g := byName["frigate"]; g.SourceRef != "0.19" || g.SourceRevision != "deadbeef" ||
 		g.SourceRepo != "https://github.com/blakeblackshear/frigate" || g.BuildContext != contextGit ||
@@ -414,7 +455,7 @@ func TestUnknownProvenanceIsAbsentFromTheWireNotEmpty(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, key := range []string{"source_repo", "source_ref", "source_revision", "build_context", "built_from_source"} {
+		for _, key := range []string{"source_repo", "source_ref", "source_revision", "build_context", "built_from_source", "source_status"} {
 			if strings.Contains(string(b), key) {
 				t.Errorf("%T: %s must be absent when unknown, got %s", v, key, b)
 			}
@@ -525,5 +566,198 @@ func TestProvenanceSurvivesTheMergeKnownStep(t *testing.T) {
 	}
 	if s := byName["stopped"]; s.SourceRef != "" || s.BuiltFromSource != "" || s.RebuildableFromRef != "" {
 		t.Errorf("a project with no containers must claim nothing; got %+v", s)
+	}
+}
+
+// Phase 5: "a build is required" — has the ref this image was built from moved?
+
+// 🔴 The decision that makes this feature free today. Every source_ref in
+// production is a version-pinned tag, which is immutable by this estate's own
+// convention (isPinnedTag, already relied on by the update-strategy code), so no
+// remote lookup happens at all. It activates for a moving ref, which is the
+// custom-build case it exists for.
+func TestSourceFreshnessDecidesWhetherToLookUpAtAll(t *testing.T) {
+	git := func(repo, ref, rev string) sourceProvenance {
+		return sourceProvenance{Context: contextGit, Repo: repo, Ref: ref, Revision: rev}
+	}
+	const url = "https://github.com/Daniel-dev22/docker-agent"
+	cases := []struct {
+		name          string
+		in            sourceProvenance
+		wantVerdict   string
+		wantSlug      string
+		wantNeedsCall bool
+	}{
+		{"pinned tag is immutable — no call", git(url, "0.1.15", "abc"), sourceCurrent, "", false},
+		{"pinned tag with v prefix", git(url, "v2.3.4", "abc"), sourceCurrent, "", false},
+		{"a branch must be resolved", git(url, "0.19", "abc"), "", "Daniel-dev22/docker-agent", true},
+		{"dev branch must be resolved", git(url, "dev", "abc"), "", "Daniel-dev22/docker-agent", true},
+		{"upload build has no ref", sourceProvenance{Context: contextUpload}, "", "", false},
+		{"no provenance at all", sourceProvenance{}, "", "", false},
+		{"git build with no revision", git(url, "dev", ""), "", "", false},
+		{"non-GitHub source cannot be resolved", git("https://gitlab.invalid/o/r", "dev", "abc"), "", "", false},
+	}
+	for _, c := range cases {
+		v, slug, need := sourceFreshness(c.in)
+		if v != c.wantVerdict || slug != c.wantSlug || need != c.wantNeedsCall {
+			t.Errorf("%s: got (%q,%q,%v) want (%q,%q,%v)", c.name, v, slug, need, c.wantVerdict, c.wantSlug, c.wantNeedsCall)
+		}
+	}
+	// The property, stated directly: nothing in production triggers a lookup.
+	for _, ref := range []string{"0.1.6", "0.1.15"} {
+		if _, _, need := sourceFreshness(git(url, ref, "abc")); need {
+			t.Errorf("production ref %q must not cost an API call", ref)
+		}
+	}
+}
+
+// The two sides are different lengths BY DESIGN — the image label carries the full
+// 40-char SHA and some helpers in this package truncate to 7. An equality test
+// would report every image as behind, in the alarming direction.
+func TestCompareRevisionHandlesShortAndLongSHAs(t *testing.T) {
+	const full = "c8b926f833968cbd12a06fa074eacf434fe2948f"
+	cases := []struct{ built, head, want, why string }{
+		{full, full, sourceCurrent, "identical"},
+		{full, "c8b926f", sourceCurrent, "head truncated to 7"},
+		{"c8b926f", full, sourceCurrent, "built revision short"},
+		{full, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", sourceBehind, "genuinely moved"},
+		{full, "deadbee", sourceBehind, "moved, short head"},
+		{"", full, "", "no built revision => unknown, not a claim"},
+		{full, "", "", "no head => unknown, not a claim"},
+	}
+	for _, c := range cases {
+		if got := compareRevision(c.built, c.head); got != c.want {
+			t.Errorf("%s: compareRevision(%.8s,%.8s) = %q want %q", c.why, c.built, c.head, got, c.want)
+		}
+	}
+}
+
+func TestRollupSourceStatus(t *testing.T) {
+	cases := []struct {
+		in        []string
+		want, why string
+	}{
+		{[]string{sourceCurrent, sourceCurrent}, sourceCurrent, "all current"},
+		{[]string{sourceCurrent, sourceBehind}, sourceBehind, "ANY behind means a rebuild changes something"},
+		{[]string{sourceBehind}, sourceBehind, "single behind"},
+		{[]string{"", ""}, "", "no verdicts => unknown, not current"},
+		{[]string{"", sourceCurrent}, sourceCurrent, "one known verdict is enough to report"},
+		{nil, "", "no containers => unknown"},
+	}
+	for _, c := range cases {
+		if got := rollupSourceStatus(c.in); got != c.want {
+			t.Errorf("%s: got %q want %q", c.why, got, c.want)
+		}
+	}
+	// 🔴 unknown must not read as fine: "" and "current" are different answers.
+	if rollupSourceStatus([]string{"", ""}) == sourceCurrent {
+		t.Error("an unchecked project must not report current")
+	}
+}
+
+// sourceStatus is best effort: an agent with no github client, or a lookup that
+// fails, yields unknown rather than a claim in either direction.
+func TestSourceStatusFailsToUnknownNotToAClaim(t *testing.T) {
+	ic := &imageChecker{} // github == nil
+	p := sourceProvenance{Context: contextGit, Repo: "https://github.com/o/r", Ref: "dev", Revision: "abc"}
+	if got := ic.sourceStatus(context.Background(), p); got != "" {
+		t.Errorf("no github client => unknown; got %q", got)
+	}
+	// A pinned tag still resolves without any client, because it needs no call.
+	pinned := sourceProvenance{Context: contextGit, Repo: "https://github.com/o/r", Ref: "1.2.3", Revision: "abc"}
+	if got := ic.sourceStatus(context.Background(), pinned); got != sourceCurrent {
+		t.Errorf("pinned tag needs no client; got %q", got)
+	}
+}
+
+// A failing lookup must yield unknown, never a verdict. This is the direction that
+// matters: claiming "current" when the check failed tells an operator their image
+// is up to date with a source nobody managed to read.
+func TestSourceStatusOnALookupFailureIsUnknown(t *testing.T) {
+	for _, code := range []int{http.StatusNotFound, http.StatusInternalServerError, http.StatusForbidden} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(code)
+		}))
+		g := newTestGithubClient()
+		g.apiBase = srv.URL
+		g.token, g.tokenExp = "test-token", time.Now().Add(time.Hour)
+		ic := &imageChecker{github: g}
+		got := ic.sourceStatus(context.Background(), sourceProvenance{
+			Context: contextGit, Repo: "https://github.com/o/r", Ref: "dev", Revision: "abc",
+		})
+		srv.Close()
+		if got != "" {
+			t.Errorf("HTTP %d must yield unknown, got %q", code, got)
+		}
+	}
+	// Positive control: the same wiring DOES produce a verdict when the call works,
+	// so the empties above mean "failed", not "never called".
+	ok := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"sha":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}`)
+	}))
+	defer ok.Close()
+	g := newTestGithubClient()
+	g.apiBase = ok.URL
+	g.token, g.tokenExp = "test-token", time.Now().Add(time.Hour)
+	ic := &imageChecker{github: g}
+	if got := ic.sourceStatus(context.Background(), sourceProvenance{
+		Context: contextGit, Repo: "https://github.com/o/r", Ref: "dev", Revision: "abc123",
+	}); got != sourceBehind {
+		t.Errorf("a working lookup with a different head must report behind; got %q", got)
+	}
+}
+
+func TestGithubSlugFromURLIsSharedByBothReaders(t *testing.T) {
+	for _, c := range []struct{ in, want string }{
+		{"https://github.com/Daniel-dev22/docker-agent", "Daniel-dev22/docker-agent"},
+		{"https://github.com/o/r.git", "o/r"},
+		{"git@github.com:o/r.git", ""},
+		{"https://gitlab.invalid/o/r", ""},
+		{"", ""},
+	} {
+		if got := githubSlugFromURL(c.in); got != c.want {
+			t.Errorf("githubSlugFromURL(%q) = %q want %q", c.in, got, c.want)
+		}
+	}
+	// The extraction must not have changed the strategy reader's behaviour.
+	if got := sourceRepoFromLabels(map[string]string{"org.opencontainers.image.source": "https://github.com/o/r.git"}, imageRef{}); got != "o/r" {
+		t.Errorf("sourceRepoFromLabels regressed: %q", got)
+	}
+	if got := sourceRepoFromLabels(nil, imageRef{Registry: "ghcr.io", Repository: "owner/pkg/extra"}); got != "owner/pkg" {
+		t.Errorf("ghcr fallback regressed: %q", got)
+	}
+}
+
+// Drives resolveRef against a real HTTP server so the ENDPOINT is pinned, not just
+// the parsing. /repos/{repo}/commits/{ref} resolves a branch, a tag or a SHA;
+// /repos/{repo}/branches/{ref} — the neighbouring helper in this package — 404s on
+// a tag. Swapping one for the other is a one-word edit that turns every tag-built
+// image into "unknown" with no test failing.
+func TestResolveRefUsesTheCommitsEndpoint(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		fmt.Fprint(w, `{"sha":"c8b926f833968cbd12a06fa074eacf434fe2948f"}`)
+	}))
+	defer srv.Close()
+
+	g := newTestGithubClient()
+	g.apiBase = srv.URL
+	// Seed the cached installation token so ensureToken short-circuits; the
+	// controller vend is not what this test is about.
+	g.token, g.tokenExp = "test-token", time.Now().Add(time.Hour)
+	sha, err := g.resolveRef(context.Background(), "o/r", "0.19")
+	if err != nil {
+		t.Fatalf("resolveRef: %v", err)
+	}
+	if gotPath != "/repos/o/r/commits/0.19" {
+		t.Errorf("wrong endpoint %q — /commits/ resolves a tag, /branches/ does not", gotPath)
+	}
+	if sha != "c8b926f833968cbd12a06fa074eacf434fe2948f" {
+		t.Errorf("full SHA must be returned for comparison against the image label; got %q", sha)
+	}
+	// End to end through the verdict, so the truncation contract is exercised too.
+	if v := compareRevision(sha, "c8b926f"); v != sourceCurrent {
+		t.Errorf("resolved head must compare current against its own short form; got %q", v)
 	}
 }

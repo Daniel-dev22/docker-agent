@@ -61,6 +61,9 @@ type imageCheck struct {
 	// The image content this result was computed from. Provenance is only stamped
 	// when it still matches the container's current ImageID.
 	ImageID string `json:"image_id,omitempty"`
+
+	// "current" | "behind" — whether the ref this image was built from has moved.
+	SourceStatus string `json:"source_status,omitempty"`
 }
 
 const (
@@ -481,6 +484,7 @@ func stampImageStatus(containers []ContainerStatus, projects []ComposeProject, i
 	type roll struct{ outdated, checked int }
 	rollups := map[string]*roll{}
 	provs := map[string]*projectProvenance{}
+	srcVerdicts := map[string][]string{}
 
 	for i := range containers {
 		c := &containers[i]
@@ -500,9 +504,15 @@ func stampImageStatus(containers []ContainerStatus, projects []ComposeProject, i
 				provs[c.ComposeProject] = pa
 			}
 			pa.add(prov)
+			if prov != (sourceProvenance{}) {
+				srcVerdicts[c.ComposeProject] = append(srcVerdicts[c.ComposeProject], r.SourceStatus)
+			}
 		}
 		c.SourceRepo, c.SourceRef = prov.Repo, prov.Ref
 		c.SourceRevision, c.BuildContext = prov.Revision, prov.Context
+		if prov != (sourceProvenance{}) {
+			c.SourceStatus = r.SourceStatus
+		}
 		c.BuiltFromSource = builtFromSource(prov)
 		c.RebuildableFromRef = rebuildableFromRef(prov)
 		c.ImageStatus = r.ImageStatus
@@ -535,6 +545,7 @@ func stampImageStatus(containers []ContainerStatus, projects []ComposeProject, i
 		p.SourceRevision, p.BuildContext = fold.Revision, fold.Context
 		p.BuiltFromSource = builtFromSource(fold)
 		p.RebuildableFromRef = rebuildableFromRef(fold)
+		p.SourceStatus = rollupSourceStatus(srcVerdicts[name])
 	}
 
 	for name, rl := range rollups {
@@ -733,7 +744,23 @@ func splitOwnerPackage(repository string) (owner, pkg string) {
 // sourceRepoFromLabels reads org.opencontainers.image.source (a github URL) and
 // falls back to a ghcr image path. Returns owner/repo or "".
 func sourceRepoFromLabels(labels map[string]string, ref imageRef) string {
-	if s := labels["org.opencontainers.image.source"]; s != "" {
+	if slug := githubSlugFromURL(labels["org.opencontainers.image.source"]); slug != "" {
+		return slug
+	}
+	if ref.Registry == "ghcr.io" {
+		parts := strings.SplitN(ref.Repository, "/", 3)
+		if len(parts) >= 2 {
+			return parts[0] + "/" + parts[1]
+		}
+	}
+	return ""
+}
+
+// githubSlugFromURL turns an image.source URL into "owner/repo", or "" when it is
+// not a GitHub URL we can parse. Extracted so the provenance reader and the
+// update-strategy reader cannot disagree about what a source label means.
+func githubSlugFromURL(raw string) string {
+	if s := raw; s != "" {
 		s = strings.TrimSuffix(strings.TrimSpace(s), "/")
 		s = strings.TrimPrefix(s, "https://github.com/")
 		s = strings.TrimPrefix(s, "http://github.com/")
@@ -748,12 +775,6 @@ func sourceRepoFromLabels(labels map[string]string, ref imageRef) string {
 		s = strings.TrimSuffix(s, ".git")
 		if strings.Count(s, "/") == 1 && s != "" && !strings.ContainsAny(s, "@: \t") {
 			return s
-		}
-	}
-	if ref.Registry == "ghcr.io" {
-		parts := strings.SplitN(ref.Repository, "/", 3)
-		if len(parts) >= 2 {
-			return parts[0] + "/" + parts[1]
 		}
 	}
 	return ""
@@ -815,6 +836,7 @@ func (ic *imageChecker) checkUnit(ctx context.Context, c ContainerStatus, info i
 	prov := provenanceFromLabels(info.Labels)
 	res.SourceRepo, res.SourceRef = prov.Repo, prov.Ref
 	res.SourceRevision, res.BuildContext = prov.Revision, prov.Context
+	res.SourceStatus = ic.sourceStatus(ctx, prov)
 
 	strat := ic.resolveStrategy(c, info, ref)
 	res.VersionSource = strat.label()
@@ -1005,4 +1027,24 @@ func firstNonEmpty(a, b string) string {
 		return a
 	}
 	return b
+}
+
+// sourceStatus resolves whether an image's ref has moved past the commit it was
+// built from. Best effort: an unresolvable ref, a non-GitHub source or a failed
+// lookup all yield "" (unknown), never a claim in either direction.
+func (ic *imageChecker) sourceStatus(ctx context.Context, p sourceProvenance) string {
+	verdict, slug, need := sourceFreshness(p)
+	if !need {
+		return verdict
+	}
+	if ic.github == nil {
+		return ""
+	}
+	rctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	head, err := ic.github.resolveRef(rctx, slug, p.Ref)
+	if err != nil {
+		return ""
+	}
+	return compareRevision(p.Revision, head)
 }
