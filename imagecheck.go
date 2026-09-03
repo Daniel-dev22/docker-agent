@@ -57,6 +57,10 @@ type imageCheck struct {
 	SourceRef      string `json:"source_ref,omitempty"`
 	SourceRevision string `json:"source_revision,omitempty"`
 	BuildContext   string `json:"build_context,omitempty"`
+
+	// The image content this result was computed from. Provenance is only stamped
+	// when it still matches the container's current ImageID.
+	ImageID string `json:"image_id,omitempty"`
 }
 
 const (
@@ -372,6 +376,13 @@ func (ic *imageChecker) runOnce(ctx context.Context, ondemand bool) {
 			} else {
 				res = ic.checkUnit(gctx, rep, info)
 			}
+			// Which image content this result describes. compositeKey identifies a
+			// TAG, and a tag moves: everything else on imageCheck is a status about
+			// the tag and tolerates that, but provenance is an identity claim about
+			// content. Without this, a `compose pull && up -d` that leaves Image
+			// unchanged keeps serving the PREVIOUS image's commit for up to a full
+			// check interval.
+			res.ImageID = rep.ImageID
 			rmu.Lock()
 			results[k] = res
 			rmu.Unlock()
@@ -477,20 +488,23 @@ func stampImageStatus(containers []ContainerStatus, projects []ComposeProject, i
 		if !ok {
 			continue
 		}
-		// Only checked containers fold; an unchecked one is caught by the
-		// denominator in provFold.result, which compares the number of votes
-		// against the project's own container count.
+		// Provenance is only believed while the cached result still describes the
+		// image this container is actually running. A stale entry contributes
+		// nothing rather than something wrong — which the denominator then turns
+		// into an absent project field, not a confident wrong one.
+		prov := provenanceOf(r, *c)
 		if c.ComposeProject != "" {
 			pa := provs[c.ComposeProject]
 			if pa == nil {
 				pa = &projectProvenance{}
 				provs[c.ComposeProject] = pa
 			}
-			pa.add(sourceProvenance{Repo: r.SourceRepo, Ref: r.SourceRef, Revision: r.SourceRevision, Context: r.BuildContext})
+			pa.add(prov)
 		}
-		c.SourceRepo, c.SourceRef = r.SourceRepo, r.SourceRef
-		c.SourceRevision, c.BuildContext = r.SourceRevision, r.BuildContext
-		c.BuiltFromSource = builtFromSource(sourceProvenance{Context: r.BuildContext})
+		c.SourceRepo, c.SourceRef = prov.Repo, prov.Ref
+		c.SourceRevision, c.BuildContext = prov.Revision, prov.Context
+		c.BuiltFromSource = builtFromSource(prov)
+		c.RebuildableFromRef = rebuildableFromRef(prov)
 		c.ImageStatus = r.ImageStatus
 		c.LatestImageVersion = r.LatestImageVersion
 		c.VersionSource = r.VersionSource
@@ -520,6 +534,7 @@ func stampImageStatus(containers []ContainerStatus, projects []ComposeProject, i
 		p.SourceRepo, p.SourceRef = fold.Repo, fold.Ref
 		p.SourceRevision, p.BuildContext = fold.Revision, fold.Context
 		p.BuiltFromSource = builtFromSource(fold)
+		p.RebuildableFromRef = rebuildableFromRef(fold)
 	}
 
 	for name, rl := range rollups {
@@ -723,7 +738,15 @@ func sourceRepoFromLabels(labels map[string]string, ref imageRef) string {
 		s = strings.TrimPrefix(s, "https://github.com/")
 		s = strings.TrimPrefix(s, "http://github.com/")
 		s = strings.TrimPrefix(s, "github.com/")
-		if strings.Count(s, "/") == 1 && s != "" {
+		// A clone URL, not a slug: nothing here stripped ".git", so an image
+		// labelled https://github.com/o/r.git yielded "o/r.git" and every release
+		// lookup for it 404s. And scp syntax (git@github.com:o/r.git) contains
+		// exactly one "/", so it satisfied the check below and was returned whole
+		// — which is what build-agent would have started emitting for every
+		// first-party image. Reject anything still carrying URL punctuation
+		// instead of guessing.
+		s = strings.TrimSuffix(s, ".git")
+		if strings.Count(s, "/") == 1 && s != "" && !strings.ContainsAny(s, "@: \t") {
 			return s
 		}
 	}

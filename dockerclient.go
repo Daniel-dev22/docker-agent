@@ -71,6 +71,9 @@ type ContainerStatus struct {
 	SourceRevision  string `json:"source_revision,omitempty"`
 	BuildContext    string `json:"build_context,omitempty"`     // git|upload
 	BuiltFromSource string `json:"built_from_source,omitempty"` // "true" — STRING, see builtFromSource
+	// "true" only when a rebuild from a named ref is actually possible. Distinct
+	// from BuiltFromSource on purpose — see rebuildableFromRef.
+	RebuildableFromRef string `json:"rebuildable_from_ref,omitempty"`
 }
 
 // ComposeProject groups containers sharing a compose project label. The grouping
@@ -100,11 +103,12 @@ type ComposeProject struct {
 	// only when EVERY container in the project agrees on it — a mixed stack has
 	// no single ref, and pre-filling one would be a confident wrong answer. See
 	// provFold.
-	SourceRepo      string `json:"source_repo,omitempty"`
-	SourceRef       string `json:"source_ref,omitempty"`
-	SourceRevision  string `json:"source_revision,omitempty"`
-	BuildContext    string `json:"build_context,omitempty"`
-	BuiltFromSource string `json:"built_from_source,omitempty"`
+	SourceRepo         string `json:"source_repo,omitempty"`
+	SourceRef          string `json:"source_ref,omitempty"`
+	SourceRevision     string `json:"source_revision,omitempty"`
+	BuildContext       string `json:"build_context,omitempty"`
+	BuiltFromSource    string `json:"built_from_source,omitempty"`
+	RebuildableFromRef string `json:"rebuildable_from_ref,omitempty"`
 }
 
 // dockerClient wraps the moby Engine API client: the read-only fleet snapshot,
