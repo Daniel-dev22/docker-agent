@@ -148,6 +148,13 @@ func setEnvVar(entry ProjectEntry, key, value string) (old string, err error) {
 	if path == "" {
 		return "", fmt.Errorf("no .env path for project %q", entry.Name)
 	}
+	// 🔴 Refuse before touching the file. A newline in the value would append
+	// further KEY=value lines that compose honours on the next `up`, and this
+	// writer must hold for every caller rather than trusting the one boundary that
+	// happens to validate today.
+	if !safeEnvLineValue(key) || !safeEnvLineValue(value) {
+		return "", fmt.Errorf("refusing to write %s: value contains a newline or control character", key)
+	}
 	var lines []string
 	if data, rerr := os.ReadFile(path); rerr == nil {
 		lines = strings.Split(string(data), "\n")
