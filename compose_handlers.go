@@ -69,6 +69,17 @@ func (a *app) handleComposeOp(c *gin.Context) {
 				int(maxBudget/time.Second))})
 		return
 	}
+	// An override image is written into the project's compose file or .env and then
+	// pulled. Same reasoning as the budget check above — this endpoint takes a
+	// replayed body with no bearer or mTLS of its own — but the consequence is
+	// worse than a bad deadline: an unchecked value with a newline appends lines to
+	// the stack's .env, and compose honours every one of them on the next `up`.
+	if body.OverrideImage != "" && !validImageRef(body.OverrideImage) {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "override_image must be a plain image reference (registry/name:tag[@sha256:…]); " +
+				"whitespace, control characters and shell or interpolation metacharacters are refused"})
+		return
+	}
 	j := a.reg.start(context.Background(), JobRequest{
 		Operation:       body.Op,
 		Project:         name,
