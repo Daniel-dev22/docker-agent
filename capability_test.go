@@ -619,6 +619,7 @@ func TestListFailureFailsClosed(t *testing.T) {
 	e := newCapEnv(t, testSelfID, defaultContainers)
 	e.writeCompose(t, "owned", "services: {}\n")
 	must(t, e.a.projects.register(ProjectEntry{Name: "owned", WorkingDir: filepath.Join(e.root, "owned"), ComposeFiles: []string{"docker-compose.yml"}}))
+	must(t, e.a.projects.register(ProjectEntry{Name: "docker-agent", WorkingDir: filepath.Join(e.root, "docker-agent")}))
 	e.eng.set(func(f *fakeEngine) { f.listErr = true })
 
 	requests := []struct {
@@ -627,7 +628,7 @@ func TestListFailureFailsClosed(t *testing.T) {
 	}{
 		{"compose-op", http.MethodPost, "/v1/projects/owned/op", map[string]any{"op": "restart"}},
 		{"register", http.MethodPost, "/v1/projects", map[string]any{"name": "docker-agent", "files": map[string]string{"docker-compose.yml": "services: {}\n"}}},
-		{"copy", http.MethodPost, "/v1/projects/owned/copy", map[string]any{"new_name": "docker-agent"}},
+		{"copy", http.MethodPost, "/v1/projects/owned/copy", map[string]any{"new_name": "owned-copy"}},
 		{"container-stop", http.MethodPost, "/v1/containers/docker-agent/stop", nil},
 		{"container-remove", http.MethodDelete, "/v1/containers/" + testSelfID[:12], nil},
 		{"bulk", http.MethodPost, "/v1/containers/bulk", map[string]any{"action": "restart", "ids": []string{"docker-agent"}}},
@@ -644,7 +645,7 @@ func TestListFailureFailsClosed(t *testing.T) {
 	if n := len(e.a.reg.list()); n != 0 {
 		t.Fatalf("no job may start blind; registry holds %d", n)
 	}
-	if _, ok := e.a.projects.get("docker-agent"); ok {
+	if p, _ := e.a.projects.get("docker-agent"); len(p.ComposeFiles) != 0 {
 		t.Fatal("a blind register was persisted")
 	}
 	if n := e.eng.mutationCount(); n != 0 {
@@ -657,9 +658,21 @@ func TestListFailureFailsClosed(t *testing.T) {
 			t.Fatalf("got %d", status)
 		}
 		e.eng.set(func(f *fakeEngine) { f.listErr = true })
-		status, body := e.do(t, http.MethodGet, "/v1/projects", nil)
-		if status != http.StatusOK {
-			t.Fatalf("got %d %v", status, body)
+		req := httptest.NewRequest(http.MethodGet, "/v1/projects", nil)
+		w := httptest.NewRecorder()
+		e.r.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("got %d %s", w.Code, w.Body.String())
+		}
+		// The stale view must still protect the agent's own stack — not read blind.
+		var resp struct {
+			Projects []map[string]any `json:"projects"`
+		}
+		must(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		for _, p := range resp.Projects {
+			if p["name"] == "docker-agent" && p["ops_blocked"] != "self" {
+				t.Fatalf("stale view lost the self guard: %v", p)
+			}
 		}
 	})
 }
@@ -683,7 +696,11 @@ func TestRegisterAndCopy(t *testing.T) {
 		{"copy-onto-case-alias", "/v1/projects/owned/copy", map[string]any{"new_name": "Docker-Agent"}, http.StatusBadRequest, "invalid_project_name"},
 		{"register-self-name-inline", "/v1/projects", map[string]any{"name": "docker-agent", "files": map[string]string{"docker-compose.yml": "EVIL\n"}}, http.StatusConflict, "self_project"},
 		{"register-self-name-path", "/v1/projects", map[string]any{"name": "docker-agent", "working_dir": filepath.Dir(selfFile)}, http.StatusConflict, "self_project"},
-		{"copy-onto-self-name", "/v1/projects/owned/copy", map[string]any{"new_name": "docker-agent", "deploy": true}, http.StatusConflict, "self_project"},
+		// Without deploy the deploy gate never runs: the self-name refusal alone must
+		// stop the write over the agent's own compose file.
+		{"copy-onto-self-name", "/v1/projects/owned/copy", map[string]any{"new_name": "docker-agent"}, http.StatusConflict, "self_project"},
+		{"copy-onto-self-name-deploy", "/v1/projects/owned/copy", map[string]any{"new_name": "docker-agent", "deploy": true}, http.StatusConflict, "self_project"},
+		{"register-self-name-inline-no-deploy", "/v1/projects", map[string]any{"name": "docker-agent", "files": map[string]string{"docker-compose.yml": "EVIL\n"}, "deploy": false}, http.StatusConflict, "self_project"},
 		{"copy-non-editable-source", "/v1/projects/gdrive-agent/copy", map[string]any{"new_name": "gdrive-copy"}, http.StatusConflict, "project_not_editable"},
 		{"register-outside-root-with-deploy", "/v1/projects", map[string]any{"name": "ext", "working_dir": "/elsewhere/ext", "deploy": true}, http.StatusConflict, "project_not_operable"},
 		{"register-under-root-missing-compose", "/v1/projects", map[string]any{"name": "ghost", "working_dir": filepath.Join(e.root, "ghost")}, http.StatusBadRequest, ""},
