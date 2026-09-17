@@ -57,7 +57,7 @@ func TestMergeKnownManaged(t *testing.T) {
 
 	// "owned" is also live (running); "external" is stopped (registry-only).
 	live := []ComposeProject{{Name: "owned", WorkingDir: owned.WorkingDir, RunningCount: 1}}
-	out := reg.mergeKnown(live, "")
+	out := reg.mergeKnown(live, nil)
 
 	got := map[string]bool{}
 	for _, p := range out {

@@ -42,10 +42,15 @@ func newFleetHub(a *app) *fleetHub {
 		// container's real CPU quota. The container list is one bounded Engine API call.
 		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
-		containers, projects, err := a.docker.snapshot(cctx)
+		summaries, err := a.docker.listContainers(cctx)
 		if err != nil {
+			a.self.observeFailed(err)
 			return fleetEnvelope{}, err
 		}
+		// The same list that feeds the frame refreshes self identity, so the flags a
+		// consumer reads were derived from exactly the containers it is shown.
+		view := a.self.observe(summaries)
+		containers, projects := snapshotFrom(summaries, view)
 		// Stamp cached image-outdated results onto containers + roll up to
 		// projects. The checks come from the imageChecker's slow capped
 		// pass — this merge is O(n) map lookups, never a registry/GitHub call.
@@ -55,7 +60,7 @@ func newFleetHub(a *app) *fleetHub {
 		// Merge stopped-but-registered projects so a known stack appears even when
 		// all its containers are down, and stamp every project's capabilities.
 		if a.projects != nil {
-			projects = a.projects.mergeKnown(projects, a.self.projectName(ctx))
+			projects = a.projects.mergeKnown(projects, view)
 		}
 		return fleetEnvelope{
 			Type: "snapshot",

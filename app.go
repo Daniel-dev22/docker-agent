@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -9,6 +10,8 @@ import (
 
 	"github.com/Daniel-dev22/agent-kit-go/jobstore"
 	"github.com/Daniel-dev22/agent-kit-go/reconcile"
+	"github.com/docker/docker/api/types/container"
+	"github.com/gin-gonic/gin"
 )
 
 // app wires the docker-agent's subsystems: the pooled controller client, the
@@ -26,8 +29,8 @@ type app struct {
 	fleet     *fleetHub
 	images    *imageChecker
 	discovery *discoveryPusher
-	// self is this agent's own container + compose project, which no endpoint
-	// may act on (selfid.go).
+	// self is this agent's own containers + compose projects, which no endpoint
+	// may act on, and its control-path container (selfid.go).
 	self *selfIdentity
 }
 
@@ -37,7 +40,7 @@ func newApp(ctx context.Context, cfg Config) (*app, error) {
 	if err != nil {
 		return nil, fmt.Errorf("docker client: %w", err)
 	}
-	self := newSelfIdentity(ctx, "/proc/self/mountinfo", dc)
+	self := newSelfIdentity(mountinfoPath, cfg.TraefikDockerDNS)
 	events, err := newEventBuffer(cfg, cc)
 	if err != nil {
 		return nil, fmt.Errorf("event buffer: %w", err)
@@ -103,12 +106,57 @@ func (a *app) startBackgroundWorkers(ctx context.Context) {
 func (a *app) enrichProjectsOnce(ctx context.Context) {
 	sctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	_, live, err := a.docker.snapshot(sctx)
+	summaries, err := a.docker.listContainers(sctx)
 	if err != nil {
+		a.self.observeFailed(err)
 		slog.Warn("project enrichment skipped — snapshot failed", "error", err)
 		return
 	}
-	a.projects.enrichFromLive(live)
+	// Publish self identity from this first list so readiness shows it before any
+	// dashboard has asked for a snapshot.
+	a.self.observe(summaries)
+	a.projects.enrichFromLive(groupComposeProjects(summaries))
+}
+
+// selfListTimeout bounds the container list a mutating request takes to learn what
+// it must not touch. It is derived from the request context, never held under a
+// lock, and a failure is a 503 the caller can retry.
+const selfListTimeout = 5 * time.Second
+
+// observeNow takes a fresh bounded container list and republishes self identity
+// from it.
+func (a *app) observeNow(ctx context.Context) ([]container.Summary, *selfView, error) {
+	if a.docker == nil {
+		return nil, nil, errors.New("docker client unavailable")
+	}
+	lctx, cancel := context.WithTimeout(ctx, selfListTimeout)
+	defer cancel()
+	summaries, err := a.docker.listContainers(lctx)
+	if err != nil {
+		a.self.observeFailed(err)
+		return nil, nil, err
+	}
+	return summaries, a.self.observe(summaries), nil
+}
+
+// selfForMutation is the gate every mutating handler passes first. It returns the
+// fresh container list and self view, or writes a 503 and returns ok=false when the
+// agent knows which container it is but cannot see the current list — allowing
+// the request then would be allowing it blind.
+//
+// When mountinfo named no container (not running under Docker), there is nothing
+// to protect by identity: a list failure is reported in readiness, and the request
+// proceeds with whatever the list could not tell it (summaries and view nil).
+func (a *app) selfForMutation(c *gin.Context) ([]container.Summary, *selfView, bool) {
+	summaries, view, err := a.observeNow(c.Request.Context())
+	if err != nil {
+		if a.self.known() {
+			refuseSelfUnavailable(c, err, nil)
+			return nil, nil, false
+		}
+		return nil, nil, true
+	}
+	return summaries, view, true
 }
 
 // startReconcile POSTs this agent's authoritative job set to the controller on

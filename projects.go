@@ -225,10 +225,10 @@ func (r *composeRegistry) enrichFromLive(live []ComposeProject) {
 // mergeKnown adds stopped-but-registered projects (absent from the live label
 // grouping) to the fleet snapshot as zero-container entries, and stamps EVERY
 // returned project — registered, registry-only and ad-hoc live — with its
-// capabilities (projectCapabilities). A registered entry's working dir wins over
-// the live label: it is the path an op would actually load. selfProject is the
-// agent's own compose project ("" when unknown).
-func (r *composeRegistry) mergeKnown(live []ComposeProject, selfProject string) []ComposeProject {
+// capabilities (projectCapabilities). A registered entry's working dir replaces
+// the live label on the row: it is the path an op loads and the one the
+// capability was decided on. v is the current self view (nil = unknown).
+func (r *composeRegistry) mergeKnown(live []ComposeProject, v *selfView) []ComposeProject {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	seen := make(map[string]int, len(live))
@@ -236,18 +236,17 @@ func (r *composeRegistry) mergeKnown(live []ComposeProject, selfProject string) 
 		seen[p.Name] = i
 	}
 	for i := range live {
-		wd := live[i].WorkingDir
 		if e, ok := r.byName[live[i].Name]; ok {
-			wd = e.WorkingDir
+			live[i].WorkingDir = e.WorkingDir
 		}
-		live[i].stampCapability(projectCapabilities(live[i].Name, wd, r.composeRoot, selfProject))
+		live[i].stampCapability(projectCapabilities(live[i].Name, live[i].WorkingDir, r.composeRoot, v))
 	}
 	for name, e := range r.byName {
 		if _, ok := seen[name]; ok {
 			continue
 		}
 		p := ComposeProject{Name: name, WorkingDir: e.WorkingDir}
-		p.stampCapability(projectCapabilities(name, e.WorkingDir, r.composeRoot, selfProject))
+		p.stampCapability(projectCapabilities(name, e.WorkingDir, r.composeRoot, v))
 		live = append(live, p)
 	}
 	sort.Slice(live, func(i, j int) bool { return live[i].Name < live[j].Name })
@@ -255,7 +254,7 @@ func (r *composeRegistry) mergeKnown(live []ComposeProject, selfProject string) 
 }
 
 func (p *ComposeProject) stampCapability(c projectCapability) {
-	p.Operable, p.Managed, p.OpsBlocked = c.Operable, c.Editable, c.Blocked
+	p.AllowedOps, p.Operable, p.Managed, p.OpsBlocked = c.Allowed, c.operable(), c.Editable, c.Blocked
 }
 
 // projectEntryFromLive builds an entry from a label-derived ComposeProject. The

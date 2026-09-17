@@ -145,9 +145,12 @@ written.
 | Method | Path | Response |
 |---|---|---|
 | `GET` | `/health/live` | `200 {"status":"ok"}` |
-| `GET` | `/health/ready` | `200 {"status":"ready"}` |
+| `GET` | `/health/ready` | `200 {"status":"ready", "self":{…}}` |
 
-Neither touches the Docker daemon. The image's `HEALTHCHECK` curls `/health/ready`.
+Neither touches the Docker daemon: readiness reports the last published self identity
+(`container_id`, `name`, `projects`, `ambiguous`, `control_path` / `control_path_error`,
+`observed_at`, `last_list_error`, or `error`) and never gates on it. The image's `HEALTHCHECK`
+curls `/health/ready`.
 
 ### Jobs (4)
 
@@ -171,6 +174,10 @@ error?, line_count, trigger_key?}` with `state` one of
 | `POST` | `/v1/containers/:id/restart` | optional `{timeout?, trigger_key?}` | `202` |
 | `DELETE` | `/v1/containers/:id` | optional `{force?, trigger_key?}` | `202` |
 | `POST` | `/v1/containers/bulk` | `{action, ids[], force?, timeout?, trigger_key?}` | `202 {"job_id":…, "state":…, "count":N}`; `400` on an unknown action or empty `ids` |
+
+Every container verb first refuses a protected target — `409 self_container`, `409
+control_path_container`, `503 self_identity_unavailable` — see "What the agent will do with a
+project, and why" under Mounts.
 | `GET` | `/v1/containers/:id/logs` | — | `200 {"lines":[…]}` |
 
 `timeout` is the SIGTERM grace in seconds (stop/restart); `force` kills a running container
@@ -187,7 +194,7 @@ front never relays a scary error and a viewer simply stops paging.
 
 | Method | Path | Body | Response |
 |---|---|---|---|
-| `GET` | `/v1/projects` | — | `200 {"projects":[…]}` — the durable registry, sorted by name. |
+| `GET` | `/v1/projects` | — | `200 {"projects":[…]}` — the durable registry, sorted by name, each entry with `allowed_ops`, `operable`, `managed`, `ops_blocked`. |
 | `POST` | `/v1/projects` | see below | `200 {"registered":name, "job_id"?:…}` |
 | `DELETE` | `/v1/projects/:name` | — | `200 {"deregistered":name}` |
 | `POST` | `/v1/projects/:name/op` | `{op, timeout?, override_image?, override_service?, trigger_key?}` | `202 {"job_id":…, "state":…}` |
@@ -199,8 +206,10 @@ front never relays a scary error and a viewer simply stops paging.
 `{name, files:{"<relpath>":"<content>"}, deploy:true}`, which writes the files under
 `$COMPOSE_ROOT/<name>/` (rejecting any path escaping that directory) and optionally `up`s them
 immediately. The inline form is how a stack is copied to a different host: `GET` the source's
-bundle, `POST` it to the target agent. `400` on a missing name or a bad path, `500` on a persist
-failure.
+bundle, `POST` it to the target agent. `400` on a missing name, a name compose would normalise
+(`invalid_project_name`), a bad path, or a path-only register under `$COMPOSE_ROOT` whose compose
+files are missing; `409` for the agent's own project name or a `deploy` the capability refuses;
+`500` on a persist failure. Every refusal happens before any file is written.
 
 **Op** accepts `up | down | pull | restart | recreate | update`. It returns:
 - `400` if `op` is not one of those,
@@ -208,6 +217,9 @@ failure.
   initialise at startup (the agent deliberately keeps running in that case — the read-only fleet
   and container lifecycle still work),
 - `404` if the project is neither in the registry nor currently running,
+- `409 project_not_operable` / `self_project` if the op is not in the project's `allowed_ops`
+  (checked before the `503`: retrying cannot fix a refusal),
+- `503 self_identity_unavailable` if the container list needed to decide that failed,
 - `202` otherwise.
 
 `down` never removes volumes. `update` runs the stack-update engine (next section).
@@ -216,7 +228,9 @@ failure.
 the running containers.
 
 **Copy** duplicates a project on the *same* host under a new name, returning `409` if that name
-already exists and `404` if the source is unknown.
+already exists, `404` if the source is unknown, `400 invalid_project_name`, and `409
+project_not_editable` / `self_project` when the source cannot be read or either name is the
+agent's own.
 
 Bundle reads are deliberately forgiving: a compose file the agent cannot read (an
 externally-provisioned stack living outside `$COMPOSE_ROOT`) is skipped with a warning, and the
@@ -407,24 +421,59 @@ provisioned by something else, its files are outside the agent's mount, and it i
 shares a path prefix is not "under" the root. It needs no migration and no persisted provenance
 flag, which is exactly why it is structural.
 
-**Operable vs editable, and the agent's own stack.** Every project in the snapshot carries three
-flags from one function (`projectCapabilities`, `capability.go`), and every mutating endpoint
-enforces the same function, so a UI keyed on the snapshot never offers an op the agent refuses:
+**What the agent will do with a project, and why.** Every project in the fleet snapshot and in
+`GET /v1/projects` carries its capability from one function (`projectCapabilities`,
+`capability.go`), and every mutating endpoint enforces the same function, so a consumer keyed on
+what the agent advertises never offers an op the endpoint refuses:
 
-| Field | Meaning | Refused with 409 when false |
+| Field | Meaning |
+|---|---|
+| `allowed_ops` | Sorted `POST /v1/projects/:name/op` values accepted now. Always present; `[]` means none. |
+| `operable` | `allowed_ops` includes the file-loading ops (`up`/`pull`/`recreate`/`update`). |
+| `managed` | The files can be read and rewritten here (edit, copy source). |
+| `ops_blocked` | Why `allowed_ops` is not every op, by priority: `self`, `invalid_name`, `outside_compose_root`, `control_path`. Absent when every op is allowed. |
+
+The rules, per op rather than per stack:
+
+- **`restart` and `down` do not read files** — compose rebuilds them from the containers' labels —
+  so they work on a stack outside `$COMPOSE_ROOT`. `up`/`pull`/`recreate`/`update` load the compose
+  model, so they need the files under the mount.
+- **The agent's own stack allows nothing**, wherever its files live, and its own container refuses
+  every verb: compose or the daemon would stop the container running the job, the process dies
+  mid-operation, and the host is left with no agent. Update the agent with whatever deployed it.
+  "Own" is keyed on the live containers' compose labels, not on a registry entry, so
+  re-registering a working dir cannot launder it.
+- **A name compose would normalise allows nothing** (`invalid_name`): compose lowercases the name
+  before `down`/`restart`, so `Docker-Agent` would act on `docker-agent`. Register and copy refuse
+  such a name with `400 invalid_project_name`.
+- **The control-path proxy** — the container `TRAEFIK_DOCKER_DNS` names — refuses `down` on its
+  stack and `stop`/`kill`/`remove` on the container: the agent would be alive but unreachable with
+  nothing able to start the proxy again. `restart`/`recreate`/`update` bring it back and are allowed.
+
+Self identity comes from `/proc/self/mountinfo` (the container ID) plus the container **list**
+(the compose project, and every container sharing the agent's network namespace, which is treated
+as self because Docker gives such a container the owner's mountinfo). There is no separate inspect
+and nothing waits under a lock: `GET /health/ready` reports the last published view in its `self`
+block and never gates on it. A mutating request takes a fresh bounded list first; if the agent knows
+its container ID but cannot list, the request is refused `503 self_identity_unavailable` rather
+than allowed blind. If mountinfo names no container (not running under Docker), nothing is
+protected by identity and readiness says so — that case cannot tell what to protect, and refusing
+every op would take the whole agent down with it. Container verbs resolve each target through the
+daemon (`inspect` → full ID), so a container named `db` is not the agent just because the agent's
+ID starts with `db`.
+
+| Refusal | Status | `code` |
 |---|---|---|
-| `operable` | Compose ops (`up`/`down`/`pull`/`restart`/`recreate`/`update`) can run | `code: project_not_operable` or `self_project` |
-| `managed` | The files can be read and rewritten (edit, copy) | `code: project_not_editable` |
-| `ops_blocked` | Why not operable: `outside_compose_root` or `self` | — |
+| Op not in `allowed_ops` (non-self reason) | 409 | `project_not_operable` |
+| Any op, register, copy source/target on the agent's own project | 409 | `self_project` |
+| Copy of a project whose files are not visible | 409 | `project_not_editable` |
+| Container verb on the agent's own container | 409 | `self_container` |
+| `stop`/`kill`/`remove` on the control-path container | 409 | `control_path_container` |
+| Register/copy with a name compose would normalise | 400 | `invalid_project_name` |
+| The container list or a target inspect failed | 503 | `self_identity_unavailable` |
 
-A stack outside `$COMPOSE_ROOT` is neither: compose must read the files to load the project, and
-the container cannot see them. The agent's **own** stack is never operable wherever its files
-live, and its own container refuses start/stop/restart/remove (`code: self_container`, bulk
-requests refused whole): compose or the daemon would stop the container running the job, the
-process dies mid-operation, and the host is left with no agent. The agent learns its container ID
-from `/proc/self/mountinfo` and its compose project from one inspect (retried, throttled); the
-result — or why it failed — is in the `self` block of `GET /health/ready`, which never gates on
-it. Update the agent with whatever deployed it.
+Project refusals carry `working_dir`; container refusals carry `targets`. A bulk request naming any
+protected container is refused whole.
 
 ---
 
@@ -506,6 +555,7 @@ on `/health/ready`.
 | `project_plan_test.go` | The plan-driven detection rule: a coupled stack whose driver is current reports *updated* even when a coupled dependency has its own newer upstream — and the converse when the driver does move. |
 | `movingtag_test.go` | Moving-tag recognition. |
 | `projects_managed_test.go` | `underComposeRoot` (including the prefix-but-not-subdirectory case), `mergeKnown`'s `managed` flag for owned vs external stacks, and `readBundle`'s graceful degradation on an unreadable compose file. |
+| `capability_test.go` | The mountinfo parser, self-view derivation (network-namespace dependents, control path by name/alias), the per-op capability table, the snapshot wire contract (`allowed_ops:[]`, `false` on the wire), and every refusal through the real routes and a real `dockerClient` against a fake Engine API — including the production `newApp` wiring, readiness under a hung daemon, list/inspect failure, and file-write-before-refusal. |
 | `logstream_test.go` | The line writer (including a line longer than any single read), `drainBatch` coalescing, and an end-to-end backlog-then-live delivery over a real WebSocket. |
 
 ### Suites that are not hermetic

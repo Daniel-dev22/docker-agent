@@ -48,7 +48,16 @@ func (a *app) handleComposeOp(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "op must be one of up|down|pull|restart|recreate|update"})
 		return
 	}
-	entry, ok := a.resolveProject(c.Request.Context(), name)
+	// One fresh list serves both the live-project fallback and the self view, so the
+	// entry and the protection were decided from the same moment.
+	summaries, view, proceed := a.selfForMutation(c)
+	if !proceed {
+		return
+	}
+	entry, ok := a.projects.get(name)
+	if !ok && summaries != nil {
+		entry, ok = a.projects.resolve(name, groupComposeProjects(summaries))
+	}
 	if !ok {
 		c.JSON(http.StatusNotFound, gin.H{"error": "unknown project: " + name})
 		return
@@ -56,8 +65,7 @@ func (a *app) handleComposeOp(c *gin.Context) {
 	// Refuse what can never run BEFORE anything that could create a job: a refusal
 	// is a decision, and a failed job row would read as an attempt that broke. It
 	// also outranks a transiently unavailable backend below — retrying cannot fix it.
-	capa := projectCapabilities(entry.Name, entry.WorkingDir, a.cfg.ComposeRoot, a.self.projectName(c.Request.Context()))
-	if refuseProject(c, entry.Name, entry.WorkingDir, a.cfg.ComposeRoot, capa, false) {
+	if refuseProjectOp(c, entry, a.cfg.ComposeRoot, a.capabilityOf(entry, view), body.Op) {
 		return
 	}
 	if a.compose == nil {
@@ -108,28 +116,48 @@ func validBudgetSeconds(v int) bool {
 	return v == 0 || (v > 0 && time.Duration(v)*time.Second > 0 && time.Duration(v)*time.Second <= maxBudget)
 }
 
-// resolveProject returns the entry an op would run against: the durable registry
-// first, then the currently-running compose projects (so an ad-hoc running stack
-// is still addressable). The engine resolves the same way at run time.
-func (a *app) resolveProject(ctx context.Context, name string) (ProjectEntry, bool) {
-	if e, ok := a.projects.get(name); ok {
-		return e, true
-	}
-	if a.docker == nil {
-		return ProjectEntry{}, false
-	}
-	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	if _, live, err := a.docker.snapshot(cctx); err == nil {
-		return a.projects.resolve(name, live)
-	}
-	return ProjectEntry{}, false
+// capabilityOf is projectCapabilities for an entry the handlers resolved.
+func (a *app) capabilityOf(e ProjectEntry, v *selfView) projectCapability {
+	return projectCapabilities(e.Name, e.WorkingDir, a.cfg.ComposeRoot, v)
 }
 
 // --- project registry CRUD ---
 
+// projectListEntry is one GET /v1/projects row: the durable entry plus the same
+// capability fields the fleet snapshot carries, so a consumer that works from this
+// list (system_monitor's network remediation) can ask before it acts.
+type projectListEntry struct {
+	ProjectEntry
+	AllowedOps []string `json:"allowed_ops"`
+	Operable   bool     `json:"operable"`
+	Managed    bool     `json:"managed"`
+	OpsBlocked string   `json:"ops_blocked,omitempty"`
+}
+
+// handleListProjects takes a fresh list for the self view. If that fails, the last
+// published view still describes the agent's own container — its ID and labels
+// cannot change for this process's lifetime — so it is used when it found that
+// container; with no such view the capability cannot be stated, and saying
+// "operable" blind is the over-claim this list exists to prevent.
 func (a *app) handleListProjects(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"projects": a.projects.list()})
+	_, view, err := a.observeNow(c.Request.Context())
+	if err != nil {
+		view = a.self.current()
+		if a.self.known() && (view == nil || !view.found) {
+			refuseSelfUnavailable(c, err, nil)
+			return
+		}
+	}
+	entries := a.projects.list()
+	out := make([]projectListEntry, 0, len(entries))
+	for _, e := range entries {
+		capa := a.capabilityOf(e, view)
+		out = append(out, projectListEntry{
+			ProjectEntry: e, AllowedOps: capa.Allowed, Operable: capa.operable(),
+			Managed: capa.Editable, OpsBlocked: capa.Blocked,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"projects": out})
 }
 
 // registerProjectBody registers a project. Two modes: (1) point at an existing
@@ -153,13 +181,21 @@ func (a *app) handleRegisterProject(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	// Input first: a malformed request is a 400 whatever the capability would be.
 	if body.Name == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
 	}
-	selfProject := a.self.projectName(c.Request.Context())
-	if selfProject != "" && body.Name == selfProject {
-		refuseProject(c, body.Name, body.WorkingDir, a.cfg.ComposeRoot, projectCapability{Blocked: blockedSelf}, false)
+	if !validProjectName(body.Name) {
+		refuseInvalidName(c, body.Name)
+		return
+	}
+	if len(body.Files) == 0 && body.WorkingDir == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "working_dir or files is required"})
+		return
+	}
+	_, view, proceed := a.selfForMutation(c)
+	if !proceed {
 		return
 	}
 	entry := ProjectEntry{
@@ -169,11 +205,27 @@ func (a *app) handleRegisterProject(c *gin.Context) {
 		Profiles:     body.Profiles,
 		EnvFiles:     body.EnvFiles,
 	}
-	// deploy=true is a compose op: refuse it before registering anything when the
-	// entry could not run one. Only a path-only register can point outside
-	// ComposeRoot — inline files are always written under it.
-	if body.Deploy && len(body.Files) == 0 && refuseProject(c, body.Name, entry.WorkingDir, a.cfg.ComposeRoot,
-		projectCapabilities(body.Name, entry.WorkingDir, a.cfg.ComposeRoot, selfProject), false) {
+	if len(body.Files) > 0 {
+		// Inline files always land under ComposeRoot; decide on that directory.
+		entry.WorkingDir = filepath.Join(a.cfg.ComposeRoot, body.Name)
+	}
+	// Every refusal happens BEFORE writeProjectFiles, which overwrites: a refused
+	// request must not have rewritten anything — least of all the agent's own
+	// compose file.
+	capa := a.capabilityOf(entry, view)
+	if capa.Blocked == blockedSelf {
+		refuseSelfProject(c, entry)
+		return
+	}
+	if len(body.Files) == 0 && capa.Editable {
+		// A path-only register under ComposeRoot claims managed:true. Make that claim
+		// true now, not an empty bundle discovered later.
+		if err := composeFilesPresent(entry); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error(), "working_dir": entry.WorkingDir})
+			return
+		}
+	}
+	if body.Deploy && refuseProjectOp(c, entry, a.cfg.ComposeRoot, capa, opComposeUp) {
 		return
 	}
 	if len(body.Files) > 0 {
@@ -187,10 +239,6 @@ func (a *app) handleRegisterProject(c *gin.Context) {
 			entry.ComposeFiles = composeFileNames(written)
 		}
 	}
-	if entry.WorkingDir == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "working_dir or files is required"})
-		return
-	}
 	if err := a.projects.register(entry); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -203,6 +251,38 @@ func (a *app) handleRegisterProject(c *gin.Context) {
 		resp["job_id"] = j.ID
 	}
 	c.JSON(http.StatusOK, resp)
+}
+
+// composeDefaultFiles are the names compose auto-discovers in a working dir, in its
+// own preference order.
+var composeDefaultFiles = []string{"compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"}
+
+// composeFilesPresent checks a path-only entry's compose files can be read: each
+// declared file, or — with none declared — one compose auto-discovery would find.
+func composeFilesPresent(e ProjectEntry) error {
+	readable := func(p string) bool {
+		f, err := os.Open(p)
+		if err != nil {
+			return false
+		}
+		defer f.Close()
+		st, err := f.Stat()
+		return err == nil && st.Mode().IsRegular()
+	}
+	if files := e.absComposeFiles(); len(files) > 0 {
+		for _, f := range files {
+			if !readable(f) {
+				return fmt.Errorf("compose file %s for %s is missing or unreadable", f, e.Name)
+			}
+		}
+		return nil
+	}
+	for _, name := range composeDefaultFiles {
+		if readable(filepath.Join(e.WorkingDir, name)) {
+			return nil
+		}
+	}
+	return fmt.Errorf("no compose file (%s) in %s for %s", strings.Join(composeDefaultFiles, ", "), e.WorkingDir, e.Name)
 }
 
 func (a *app) handleDeregisterProject(c *gin.Context) {
@@ -268,6 +348,10 @@ func (a *app) handleCopyProject(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "new_name is required"})
 		return
 	}
+	if !validProjectName(body.NewName) {
+		refuseInvalidName(c, body.NewName)
+		return
+	}
 	if _, exists := a.projects.get(body.NewName); exists {
 		c.JSON(http.StatusConflict, gin.H{"error": "project already exists: " + body.NewName})
 		return
@@ -277,16 +361,23 @@ func (a *app) handleCopyProject(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "unknown project: " + name})
 		return
 	}
-	// A copy reads the source's files, so the source must be editable; and the copy
-	// must not take the agent's own project name, whose `up` would recreate — or
-	// remove as an orphan — the agent itself.
-	selfProject := a.self.projectName(c.Request.Context())
-	if refuseProject(c, src.Name, src.WorkingDir, a.cfg.ComposeRoot,
-		projectCapabilities(src.Name, src.WorkingDir, a.cfg.ComposeRoot, selfProject), true) {
+	_, view, proceed := a.selfForMutation(c)
+	if !proceed {
 		return
 	}
-	if selfProject != "" && body.NewName == selfProject {
-		refuseProject(c, body.NewName, "", a.cfg.ComposeRoot, projectCapability{Blocked: blockedSelf}, false)
+	// A copy reads the source's files, so the source must be editable; and the copy
+	// must not take one of the agent's own project names, whose `up` would recreate
+	// — or remove as an orphan — the agent itself. Both refusals precede any write.
+	if refuseProjectEdit(c, src, a.cfg.ComposeRoot, a.capabilityOf(src, view)) {
+		return
+	}
+	dst := ProjectEntry{Name: body.NewName, WorkingDir: filepath.Join(a.cfg.ComposeRoot, body.NewName)}
+	dstCapa := a.capabilityOf(dst, view)
+	if dstCapa.Blocked == blockedSelf {
+		refuseSelfProject(c, dst)
+		return
+	}
+	if body.Deploy && refuseProjectOp(c, dst, a.cfg.ComposeRoot, dstCapa, opComposeUp) {
 		return
 	}
 	bundle, err := a.readBundle(src)
