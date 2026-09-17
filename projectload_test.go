@@ -211,6 +211,17 @@ func TestProjectLoadIsConfined(t *testing.T) {
 			t.Fatalf("the override was not applied: %q", p.Services["app"].Image)
 		}
 	})
+	// The real load's own guard, with the model pre-scan out of the way: each must
+	// refuse on its own.
+	t.Run("real-load-guard-holds-without-the-model-scan", func(t *testing.T) {
+		noScan, err := newComposeBackend(Config{DockerHost: newFakeEngine(t).host(), ComposeRoot: l.root})
+		must(t, err)
+		noScan.modelCheck = func(context.Context, ProjectEntry, loadPaths, *loadGuard) error { return nil }
+		for _, name := range []string{"incabs", "increl", "incdotenv", "extabs"} {
+			_, err := noScan.loadProject(ctx, ProjectEntry{Name: name, WorkingDir: filepath.Join(l.root, name)})
+			refused(t, err)
+		}
+	})
 	t.Run("no-compose-file-does-not-walk-up", func(t *testing.T) {
 		parent := l.project(t, "parent", map[string]string{"compose.yaml": "services:\n  parentsvc:\n    image: " + loadSecret + "\n"})
 		child := filepath.Join(parent, "child")

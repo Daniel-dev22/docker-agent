@@ -36,6 +36,11 @@ type composeBackend struct {
 	cli  command.Cli
 	base api.Compose // no per-job streams — used for LoadProject / queries only
 	root string      // ComposeRoot: every file a load reads must resolve under it
+	// modelCheck is the pre-load model scan (confineModelLabelFiles). The real load
+	// guards include/extends on its own as well — the two build their options
+	// separately, so each must hold without the other; a test swaps this out to
+	// prove it.
+	modelCheck func(ctx context.Context, e ProjectEntry, paths loadPaths, guard *loadGuard) error
 }
 
 func newComposeBackend(cfg Config) (*composeBackend, error) {
@@ -59,7 +64,9 @@ func newComposeBackend(cfg Config) (*composeBackend, error) {
 	if err != nil {
 		return nil, fmt.Errorf("compose service: %w", err)
 	}
-	return &composeBackend{cli: dockerCli, base: base, root: cfg.ComposeRoot}, nil
+	b := &composeBackend{cli: dockerCli, base: base, root: cfg.ComposeRoot}
+	b.modelCheck = b.confineModelLabelFiles
+	return b, nil
 }
 
 // serviceForJob returns an api.Compose whose progress events + Out/Err stream
@@ -187,7 +194,7 @@ func (b *composeBackend) loadProject(ctx context.Context, e ProjectEntry) (*type
 		}
 	}
 	guard := newLoadGuard(b.root, e.WorkingDir, b.remoteLoaders())
-	if err := b.confineModelLabelFiles(ctx, e, paths, guard); err != nil {
+	if err := b.modelCheck(ctx, e, paths, guard); err != nil {
 		return nil, err
 	}
 	project, err := b.base.LoadProject(ctx, api.ProjectLoadOptions{

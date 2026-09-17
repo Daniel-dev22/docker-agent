@@ -155,6 +155,24 @@ func TestRefusalEchoIsBounded(t *testing.T) {
 	}
 }
 
+// TestRefuseBoundsItsMessage: the one refusal writer bounds the whole message,
+// whatever a caller built it from.
+func TestRefuseBoundsItsMessage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	refuse(c, http.StatusBadRequest, "invalid_body", strings.Repeat("m", 100_000), gin.H{"targets": []string{strings.Repeat("t", 100_000)}})
+	if w.Code != http.StatusBadRequest || w.Body.Len() > refusalMessageMax+echoMax+200 {
+		t.Fatalf("a %d-byte refusal", w.Body.Len())
+	}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("a refusal without a code must not be writable")
+		}
+	}()
+	refuse(c, http.StatusBadRequest, "", "no code", nil)
+}
+
 func TestIdempotencyByteCeiling(t *testing.T) {
 	e := newCapEnv(t, testSelfID, defaultContainers)
 	withIdempotency(t, e, t.TempDir())
