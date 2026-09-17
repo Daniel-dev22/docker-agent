@@ -372,10 +372,19 @@ func auditRefusalCodes(t *testing.T) gin.HandlerFunc {
 			return
 		}
 		var body struct {
-			Code string `json:"code"`
+			Code      string `json:"code"`
+			Retryable *bool  `json:"retryable"`
 		}
 		if err := json.Unmarshal(aw.buf.Bytes(), &body); err != nil || body.Code == "" {
 			t.Errorf("%s %s answered %d without a code: %s", c.Request.Method, c.Request.URL.Path, status, clipTo(aw.buf.String(), 300))
+			return
+		}
+		// A coded 4xx is final unless it says otherwise, and only an allowlisted code
+		// may say otherwise — both ways: an allowlisted code must say it.
+		retryable := body.Retryable != nil && *body.Retryable
+		if retryable != retryableCodes[body.Code] {
+			t.Errorf("%s %s answered %d %s with retryable=%v; retryableCodes says %v",
+				c.Request.Method, c.Request.URL.Path, status, body.Code, retryable, retryableCodes[body.Code])
 		}
 	}
 }

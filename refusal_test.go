@@ -5,12 +5,14 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -167,6 +169,90 @@ func TestEveryBodyIsBounded(t *testing.T) {
 		t.Fatalf("oversized requests acted: %d mutations", n)
 	}
 	e.waitJobs(t)
+}
+
+// TestRetryableContract pins which refusals are not final. A coded 4xx is
+// dead-lettered by consumers; only these codes may say "retry".
+func TestRetryableContract(t *testing.T) {
+	if want := map[string]bool{"idempotency_key_in_flight": true}; !reflect.DeepEqual(retryableCodes, want) {
+		t.Fatalf("retryableCodes = %v: a new retryable 4xx is a contract change for every consumer", retryableCodes)
+	}
+
+	gin.SetMode(gin.TestMode)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("marking a non-allowlisted code retryable must not be writable")
+			}
+		}()
+		refuse(c, http.StatusConflict, "project_exists", "x", gin.H{"retryable": true})
+	}()
+
+	t.Run("in-flight-says-retryable", func(t *testing.T) {
+		e := newCapEnv(t, testSelfID, defaultContainers)
+		withIdempotency(t, e, t.TempDir())
+		scope := pathSHA("/v1/containers/gdrive-agent/stop")
+		_, _, err := e.a.idem.claim(context.Background(), "POST", scope, "k-busy", bodyFingerprint(nil))
+		must(t, err)
+		r := e.doKeyed(t, "POST", "/v1/containers/gdrive-agent/stop", "k-busy", "")
+		var body map[string]any
+		must(t, json.Unmarshal(r.body, &body))
+		if r.status != http.StatusConflict || body["code"] != "idempotency_key_in_flight" || body["retryable"] != true {
+			t.Fatalf("got %d %s", r.status, r.body)
+		}
+	})
+	t.Run("final-refusals-do-not", func(t *testing.T) {
+		e := newCapEnv(t, testSelfID, defaultContainers)
+		r := e.doKeyed(t, "POST", "/v1/projects/nope/op", "", `{"op":"up"}`)
+		if r.status != 404 || strings.Contains(string(r.body), "retryable") {
+			t.Fatalf("got %d %s", r.status, r.body)
+		}
+	})
+}
+
+// failingReader returns some bytes and then an I/O error.
+type failingReader struct{ sent bool }
+
+func (r *failingReader) Read(p []byte) (int, error) {
+	if !r.sent {
+		r.sent = true
+		return copy(p, `{"op":`), nil
+	}
+	return 0, errors.New("connection reset by peer")
+}
+
+// TestBodyReadFailureIsTransient: a body that cannot be READ is an I/O fault —
+// a code-less 500 — while a malformed body stays a final 400 invalid_body.
+func TestBodyReadFailureIsTransient(t *testing.T) {
+	e := newCapEnv(t, testSelfID, defaultContainers)
+	check := func(t *testing.T, h http.Handler) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/v1/projects/owned/op", &failingReader{})
+		req.ContentLength = -1
+		req.Header.Set("Idempotency-Key", "k-io")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != http.StatusInternalServerError || strings.Contains(w.Body.String(), `"code"`) {
+			t.Fatalf("got %d %s, want a code-less 500", w.Code, w.Body.String())
+		}
+	}
+	t.Run("body-limit-middleware", func(t *testing.T) { check(t, e.r) })
+	t.Run("idempotency-middleware-alone", func(t *testing.T) {
+		withIdempotency(t, e, t.TempDir())
+		r := gin.New()
+		r.POST("/v1/projects/:name/op", e.a.idempotent(), func(c *gin.Context) { c.Status(http.StatusAccepted) })
+		check(t, r)
+		if n := idemRows(t, e.a.events.DB(), "key = 'k-io'"); n != 0 {
+			t.Fatalf("a failed read was claimed (%d rows)", n)
+		}
+	})
+	t.Run("malformed-body-stays-final", func(t *testing.T) {
+		r := e.doKeyed(t, "POST", "/v1/containers/bulk", "", `{"ids":`)
+		if r.status != 400 || r.code() != "invalid_body" {
+			t.Fatalf("got %d %s", r.status, r.body)
+		}
+	})
 }
 
 // TestRegisterWriteFailureIsTransient: once the request is validated, a failing

@@ -4,9 +4,12 @@ package main
 //
 // Two rules live here, in one place, because every refusal must obey both:
 //
-//   - A refusal carries a machine-readable `code`. Consumers treat a 4xx WITHOUT
-//     one as transient (the controller's shared refusal rule retries it ~100x), so
-//     a code-less refusal is a retry storm with a friendly message.
+//   - A refusal carries a machine-readable `code`, and a coded 4xx is FINAL:
+//     consumers dead-letter it (the controller's shared refusal rule), and treat a
+//     4xx WITHOUT a code as transient (retried ~100x). A refusal whose answer can
+//     change on retry says so with "retryable": true, and only the codes in
+//     retryableCodes may; a failure that is not the caller's fault (I/O) is a 5xx
+//     with no code.
 //   - A refusal never echoes caller input unbounded. Refusals are recorded verbatim
 //     by the idempotency store, and a request naming a 1 MB project got a 2 MB 400
 //     back — recorded, twice, per request. Every echoed value is clipped to
@@ -35,6 +38,12 @@ const (
 	maxPathLen = 4096
 )
 
+// retryableCodes are the only codes a 4xx may mark "retryable": true.
+var retryableCodes = map[string]bool{
+	// The same key is still being handled; a retry gets its recorded answer.
+	"idempotency_key_in_flight": true,
+}
+
 // echo clips a caller-supplied value for inclusion in a refusal.
 func echo(s string) string { return clipTo(s, echoMax) }
 
@@ -55,6 +64,9 @@ func refuse(c *gin.Context, status int, code, msg string, fields gin.H) {
 	if code == "" {
 		// A programming error, and the one kind of refusal that must not ship.
 		panic("refuse: empty code for " + http.StatusText(status))
+	}
+	if fields["retryable"] == true && !retryableCodes[code] {
+		panic("refuse: " + code + " is not a retryable code")
 	}
 	body := gin.H{"error": clipTo(msg, refusalMessageMax), "code": code}
 	for k, v := range fields {

@@ -160,8 +160,8 @@ timeout, a dropped connection) can resend without running the operation twice.
   whitespace do not matter.
 - The same key with a different body: `422 {"code":"idempotency_key_reused"}`.
 - The same key while the first request is still being handled: `409
-  {"code":"idempotency_key_in_flight"}` — the claim is atomic and taken before anything runs, so
-  the duplicate never executes. Retry for the answer.
+  {"code":"idempotency_key_in_flight","retryable":true}` — the claim is atomic and taken before
+  anything runs, so the duplicate never executes. Retry (poll) for the answer.
 - Only deterministic answers are recorded (2xx and 4xx). A 5xx — notably `503
   self_identity_unavailable` — releases the key, so a retry can succeed once the daemon answers.
 - A claim still in flight when the agent died is released at boot: any job it had started was
@@ -526,8 +526,13 @@ ID starts with `db`.
 | An ambiguous, malformed, or >255-byte container reference | 400 | `invalid_target` |
 | The container list or a target inspect failed | 503 | `self_identity_unavailable` |
 
-Every deterministic 4xx carries a `code` — a consumer may treat a code-less 4xx as transient — and
-echoes caller input clipped to 512 bytes. Project refusals carry `working_dir`; container refusals
+**Refusal semantics.** Every 4xx carries a `code`, and a coded 4xx is **final**: retrying the same
+request gets the same answer. The one exception says so with `"retryable": true` — currently only
+`idempotency_key_in_flight`, whose answer is still coming; a new retryable code is a contract change
+for every consumer (the test suite pins the set). A failure that is not the caller's — a request
+body that could not be read, a write that failed, the Docker daemon not answering — is a 5xx, and
+only `503 self_identity_unavailable` carries a code there. Refusals echo caller input clipped to 512
+bytes. Project refusals carry `working_dir`; container refusals
 carry `targets`. A bulk request naming any protected container is refused whole. The idempotency
 codes are under Idempotency-Key.
 

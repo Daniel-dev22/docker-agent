@@ -51,7 +51,9 @@ func boundedBody() gin.HandlerFunc {
 				refuseTooLarge(c)
 				return
 			}
-			refuse(c, http.StatusBadRequest, "invalid_body", "read request body: "+echo(err.Error()), nil)
+			// The body could not be READ — the connection failed, not the caller's
+			// input. A coded 4xx would be a final refusal; this is transient.
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "read request body: " + echo(err.Error())})
 			return
 		}
 		c.Request.Body = io.NopCloser(bytes.NewReader(raw))

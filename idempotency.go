@@ -510,7 +510,8 @@ func (a *app) idempotent() gin.HandlerFunc {
 		// boundedBody has already read at most maxRequestBodyBytes into memory.
 		raw, err := io.ReadAll(c.Request.Body)
 		if err != nil {
-			refuse(c, http.StatusBadRequest, "invalid_body", "read request body: "+echo(err.Error()), nil)
+			// An I/O failure, not a malformed body: transient, so no code.
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "read request body: " + echo(err.Error())})
 			return
 		}
 		c.Request.Body = io.NopCloser(bytes.NewReader(raw))
@@ -535,8 +536,10 @@ func (a *app) idempotent() gin.HandlerFunc {
 				idempotencyHeader+" was already used for a different request body on this endpoint", nil)
 			return
 		case idemInFlight:
+			// The one refusal that is NOT final: the answer is coming. See retryableCodes.
 			refuse(c, http.StatusConflict, "idempotency_key_in_flight",
-				"a request with this "+idempotencyHeader+" is still being handled; retry for its answer", nil)
+				"a request with this "+idempotencyHeader+" is still being handled; retry for its answer",
+				gin.H{"retryable": true})
 			return
 		}
 
