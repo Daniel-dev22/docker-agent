@@ -524,6 +524,7 @@ ID starts with `db`.
 | Bulk `action` not one of start/stop/restart/kill/remove | 400 | `invalid_action` |
 | More than 100 distinct targets | 400 | `too_many_targets` |
 | An ambiguous, malformed, or >255-byte container reference | 400 | `invalid_target` |
+| Cancel of a job that is unknown or already finished | 409 | `job_not_cancellable` |
 | The container list or a target inspect failed | 503 | `self_identity_unavailable` |
 
 **Refusal semantics.** Every 4xx carries a `code`, and a coded 4xx is **final**: retrying the same

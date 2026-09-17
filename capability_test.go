@@ -342,6 +342,7 @@ var refusalRoutes = map[string]bool{
 	"POST /v1/containers/:id/restart": true,
 	"DELETE /v1/containers/:id":       true,
 	"POST /v1/containers/bulk":        true,
+	"POST /v1/jobs/:id/cancel":        true,
 }
 
 type auditWriter struct {

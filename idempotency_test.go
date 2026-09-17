@@ -29,6 +29,7 @@ func withIdempotency(t *testing.T, e *capEnv, configDir string) {
 	t.Cleanup(events.close)
 	store, err := newIdempotencyStore(events.DB())
 	must(t, err)
+	t.Cleanup(store.close) // runs before events.close: cleanups are LIFO
 	e.a.events = events
 	e.a.idem = store
 	e.a.sweepIdempotency(context.Background())
@@ -401,6 +402,86 @@ func TestEveryJobStartingRouteIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestIdempotencyPendingAnswersSurviveShutdown: an answer still waiting for its
+// durable write when the agent shuts down is written by close(), so after the
+// restart a retry replays it instead of re-running the request.
+func TestIdempotencyPendingAnswersSurviveShutdown(t *testing.T) {
+	dir := t.TempDir()
+	e := newCapEnv(t, testSelfID, defaultContainers)
+	withIdempotency(t, e, dir)
+	db, store := e.a.events.DB(), e.a.idem
+	store.retryBase = time.Hour // the background writer must not get there first
+	_, err := db.Exec(`CREATE TRIGGER fail_record BEFORE UPDATE ON idempotency_keys BEGIN SELECT RAISE(ABORT, 'disk full'); END`)
+	must(t, err)
+	first := e.doKeyed(t, http.MethodPost, "/v1/containers/gdrive-agent/stop", "k-shutdown", "")
+	if first.status != http.StatusAccepted {
+		t.Fatalf("got %d %s", first.status, first.body)
+	}
+	if idemRows(t, db, "key = 'k-shutdown' AND state = 'done'") != 0 {
+		t.Fatal("precondition: the answer is only pending")
+	}
+	_, err = db.Exec(`DROP TRIGGER fail_record`)
+	must(t, err)
+
+	start := time.Now()
+	store.close()
+	if elapsed := time.Since(start); elapsed > idempotencyCloseBudget+time.Second {
+		t.Fatalf("close took %v", elapsed)
+	}
+	store.mu.Lock()
+	left := len(store.pending)
+	store.mu.Unlock()
+	if left != 0 || idemRows(t, db, "key = 'k-shutdown' AND state = 'done'") != 1 {
+		t.Fatalf("close did not store the pending answer (%d still pending)", left)
+	}
+	e.waitJobs(t)
+	e.a.events.close()
+
+	e2 := newCapEnv(t, testSelfID, defaultContainers)
+	withIdempotency(t, e2, dir)
+	again := e2.doKeyed(t, http.MethodPost, "/v1/containers/gdrive-agent/stop", "k-shutdown", "")
+	if again.replayed != "true" || !bytes.Equal(again.body, first.body) {
+		t.Fatalf("after restart: %d %s replayed=%q", again.status, again.body, again.replayed)
+	}
+	if n := e2.eng.mutationCount(); n != 0 {
+		t.Fatalf("the request re-ran after restart (%d mutations)", n)
+	}
+}
+
+// TestIdempotencyCloseIsBounded: with another connection holding the database's
+// write lock, the final writes block — close must still return within its budget.
+func TestIdempotencyCloseIsBounded(t *testing.T) {
+	dir := t.TempDir()
+	e := newCapEnv(t, testSelfID, defaultContainers)
+	withIdempotency(t, e, dir)
+	store := e.a.idem
+	store.retryBase = time.Hour
+	_, err := e.a.events.DB().Exec(`CREATE TRIGGER fail_record BEFORE UPDATE ON idempotency_keys BEGIN SELECT RAISE(ABORT, 'disk full'); END`)
+	must(t, err)
+	if r := e.doKeyed(t, http.MethodPost, "/v1/containers/gdrive-agent/stop", "k-stuck", ""); r.status != http.StatusAccepted {
+		t.Fatalf("got %d", r.status)
+	}
+	e.waitJobs(t)
+	_, err = e.a.events.DB().Exec(`DROP TRIGGER fail_record`)
+	must(t, err)
+
+	holder, err := sql.Open("sqlite", filepath.Join(dir, "events.sqlite")+"?_pragma=journal_mode(WAL)")
+	must(t, err)
+	defer holder.Close()
+	tx, err := holder.Begin()
+	must(t, err)
+	_, err = tx.Exec(`INSERT INTO idempotency_keys (method, path_sha, key, fingerprint, state, created_at_ns, proc)
+		VALUES ('POST', 'x', 'lock-holder', 'fp', 'in_flight', 0, 'other')`)
+	must(t, err)
+	defer tx.Rollback()
+
+	start := time.Now()
+	store.close()
+	if elapsed := time.Since(start); elapsed > idempotencyCloseBudget+2*time.Second {
+		t.Fatalf("close took %v against a locked database; budget %v", elapsed, idempotencyCloseBudget)
+	}
+}
+
 func TestIdempotencyClaimSettledOnPanicAndRecordFailure(t *testing.T) {
 	e := newCapEnv(t, testSelfID, defaultContainers)
 	withIdempotency(t, e, t.TempDir())
@@ -434,12 +515,30 @@ func TestIdempotencyClaimSettledOnPanicAndRecordFailure(t *testing.T) {
 		if n := idemRows(t, db, "key = 'k-acted' AND state = 'done'"); n != 0 {
 			t.Fatal("precondition: the durable write is still failing")
 		}
+		// The in-memory answer is still bound to the request that made it.
+		if other := e.doKeyed(t, http.MethodPost, "/v1/containers/gdrive-agent/stop", "k-acted", `{"force":true}`); other.status != http.StatusUnprocessableEntity || other.code() != "idempotency_key_reused" {
+			t.Fatalf("a pending answer replayed for a different body: %d %s", other.status, other.body)
+		}
 		_, err := db.Exec(`DROP TRIGGER fail_record`)
 		must(t, err)
 		deadline := time.Now().Add(3 * time.Second)
 		for idemRows(t, db, "key = 'k-acted' AND state = 'done'") == 0 {
 			if time.Now().After(deadline) {
 				t.Fatal("the background writer never stored the answer")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		// Once stored, the in-memory copy is dropped: the pending set is bounded by
+		// answers still waiting, not by every answer that ever waited.
+		for {
+			e.a.idem.mu.Lock()
+			left := len(e.a.idem.pending)
+			e.a.idem.mu.Unlock()
+			if left == 0 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%d pending answers kept after their write landed", left)
 			}
 			time.Sleep(10 * time.Millisecond)
 		}

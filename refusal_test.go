@@ -71,6 +71,7 @@ func TestEveryRefusalCarriesACode(t *testing.T) {
 		{"bulk-too-many", "POST", "/v1/containers/bulk", mustJSON(t, map[string]any{"action": "stop", "ids": manyIDs}), 400, "too_many_targets"},
 		{"container-ref-too-long", "POST", "/v1/containers/" + strings.Repeat("r", maxProjectNameLen+1) + "/stop", ``, 400, "invalid_target"},
 		{"container-ambiguous", "POST", "/v1/containers/ab/stop", ``, 400, "invalid_target"},
+		{"cancel-unknown-job", "POST", "/v1/jobs/no-such-job/cancel", ``, 409, "job_not_cancellable"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -158,11 +159,21 @@ func TestEveryBodyIsBounded(t *testing.T) {
 			}
 		})
 	}
+	// Raw bytes, not re-encoded JSON: an encoder compacts the padding away, and the
+	// "at the limit" body would silently be a few dozen bytes.
+	const payload = `{"action":"restart","ids":["gdrive-agent"]}`
+	atLimit := payload + strings.Repeat(" ", maxRequestBodyBytes-len(payload))
 	t.Run("at-the-limit-is-accepted", func(t *testing.T) {
-		pad := strings.Repeat(" ", maxRequestBodyBytes-len(`{"action":"restart","ids":["gdrive-agent"]}`))
-		status, _ := e.do(t, "POST", "/v1/containers/bulk", json.RawMessage(`{"action":"restart","ids":["gdrive-agent"]}`+pad))
-		if status != http.StatusAccepted {
-			t.Fatalf("a body of exactly the limit: got %d", status)
+		if len(atLimit) != maxRequestBodyBytes {
+			t.Fatalf("precondition: body is %d bytes", len(atLimit))
+		}
+		if r := e.doKeyed(t, "POST", "/v1/containers/bulk", "", atLimit); r.status != http.StatusAccepted {
+			t.Fatalf("a body of exactly the limit: got %d %s", r.status, clipTo(string(r.body), 200))
+		}
+	})
+	t.Run("one-byte-over-is-refused", func(t *testing.T) {
+		if r := e.doKeyed(t, "POST", "/v1/containers/bulk", "", atLimit+" "); r.status != http.StatusRequestEntityTooLarge || r.code() != "request_too_large" {
+			t.Fatalf("limit+1: got %d %s", r.status, clipTo(string(r.body), 200))
 		}
 	})
 	if n := e.eng.mutationCount(); n > 1 {
@@ -459,6 +470,26 @@ func TestFingerprintKeyCollisions(t *testing.T) {
 		if got := same(c.a, c.b); got != c.want {
 			t.Errorf("same(%s, %s) = %v, want %v", c.a, c.b, got, c.want)
 		}
+	}
+	// encoding/json folds beyond ASCII: U+017F LATIN SMALL LETTER LONG S matches
+	// "s", and U+212A KELVIN SIGN matches "k". Each collision below binds to one
+	// struct field, so the body's meaning depends on key order.
+	for _, c := range []struct{ a, b string }{
+		{`{"ids":["x"],"idſ":["y"]}`, `{"idſ":["y"],"ids":["x"]}`},
+		{`{"KEY":1,"KEY":2}`, `{"KEY":2,"KEY":1}`},
+		{`{"ſ":1,"S":2}`, `{"S":2,"ſ":1}`},
+	} {
+		if same(c.a, c.b) {
+			t.Errorf("same(%s, %s): a Unicode-folded collision must hash raw bytes", c.a, c.b)
+		}
+	}
+	var probe struct {
+		IDs []string `json:"ids"`
+		Key int      `json:"key"`
+	}
+	must(t, json.Unmarshal([]byte(`{"ids":["x"],"idſ":["y"],"key":1,"Key":2}`), &probe))
+	if probe.IDs[0] != "y" || probe.Key != 2 {
+		t.Fatalf("precondition: encoding/json folds these keys onto one field: %+v", probe)
 	}
 	if !jsonKeysCollide([]byte(`{"x":[1,{"y":2,"Y":3}]}`)) || jsonKeysCollide([]byte(`[{"a":1},{"A":2}]`)) {
 		t.Fatal("collision detection is wrong on nesting")

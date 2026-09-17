@@ -19,7 +19,10 @@ package main
 //     503 self_identity_unavailable — is transient: the claim is released so a
 //     retry can succeed later.
 //   - An answer to a request that ACTED but could not be stored is kept in memory
-//     and served to retries while a background writer keeps trying to store it.
+//     and served to retries while a background writer keeps trying to store it;
+//     close() makes one last bounded attempt at every such answer on shutdown.
+//     Only an answer that still cannot be written then is lost — its claim stays in
+//     flight, the boot sweep releases it, and a retry re-runs the request.
 //   - Claims still in flight when the process died cannot have a recorded answer;
 //     the boot sweep releases them before the listener binds. Any job such a
 //     request had started was interrupted with the process and is failed by the
@@ -47,6 +50,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 )
@@ -88,6 +93,12 @@ const (
 	// falls back to 409 idempotency_key_in_flight, which the client polls.
 	idempotencyMaxPending = 1024
 	idempotencyRetryMax   = time.Minute
+
+	// idempotencyCloseBudget bounds close()'s final writes of pending answers,
+	// all of them together. Shutdown is the HTTP server's 10s drain (main.go) plus
+	// this; a sqlite write that has not landed in 2s during shutdown is not going
+	// to, and the process must still exit.
+	idempotencyCloseBudget = 2 * time.Second
 )
 
 // idempotencyStore persists claims and recorded answers in events.sqlite.
@@ -158,13 +169,63 @@ func newIdempotencyStore(db *sql.DB) (*idempotencyStore, error) {
 	return s, nil
 }
 
-// close stops the background writers and waits for them.
+// close stops the background writers, waits for them, then makes one final
+// attempt to store every answer still pending — all within idempotencyCloseBudget.
+// An answer stored here is replayed after the restart instead of the request
+// being re-run.
 func (s *idempotencyStore) close() {
 	if s == nil {
 		return
 	}
 	s.closing.Do(func() { close(s.done) })
 	s.writers.Wait()
+
+	s.mu.Lock()
+	pending := make([]pendingAnswer, 0, len(s.pending))
+	for _, a := range s.pending {
+		pending = append(pending, a)
+	}
+	s.mu.Unlock()
+	if len(pending) == 0 {
+		return
+	}
+	// The sqlite driver does not abandon a lock wait when a context expires: the
+	// wait is sqlite's own busy_timeout (5s on this database), so the bound is set
+	// there. Every final write goes through one connection whose busy_timeout is the
+	// budget, restored before the connection returns to the pool.
+	deadline := time.Now().Add(idempotencyCloseBudget)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		slog.Error("idempotency answers lost at shutdown — no connection", "lost", len(pending), "error", err)
+		return
+	}
+	defer func() {
+		_, _ = conn.ExecContext(context.Background(), `PRAGMA busy_timeout = 5000`)
+		_ = conn.Close()
+	}()
+	stored := 0
+	for _, a := range pending {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf(`PRAGMA busy_timeout = %d`, remaining.Milliseconds())); err != nil {
+			break
+		}
+		if err := s.recordOn(ctx, conn, a); err != nil && !errors.Is(err, errClaimLost) {
+			continue
+		}
+		stored++
+		s.mu.Lock()
+		delete(s.pending, scopeKey(a.method, a.pathSHA, a.key))
+		s.mu.Unlock()
+	}
+	if stored < len(pending) {
+		slog.Error("idempotency answers lost at shutdown — their requests re-run on retry",
+			"lost", len(pending)-stored, "stored", stored)
+	}
 }
 
 func pathSHA(path string) string {
@@ -251,7 +312,15 @@ var errClaimLost = errors.New("idempotency claim lost to a different request")
 // claim is still in flight or has vanished (swept, pruned) — but never over an
 // answer another request recorded.
 func (s *idempotencyStore) record(ctx context.Context, a pendingAnswer) error {
-	res, err := s.db.ExecContext(ctx, `
+	return s.recordOn(ctx, s.db, a)
+}
+
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+func (s *idempotencyStore) recordOn(ctx context.Context, db execer, a pendingAnswer) error {
+	res, err := db.ExecContext(ctx, `
 		INSERT INTO idempotency_keys (method, path_sha, key, fingerprint, state, status, body, created_at_ns, proc)
 		VALUES (?, ?, ?, ?, 'done', ?, ?, ?, ?)
 		ON CONFLICT (method, path_sha, key) DO UPDATE SET state = 'done', status = excluded.status, body = excluded.body
@@ -295,7 +364,7 @@ func (s *idempotencyStore) keepPending(a pendingAnswer) bool {
 		for {
 			select {
 			case <-s.done:
-				return // the answer stays in flight on disk; the boot sweep releases it
+				return // close() makes the final attempt
 			case <-time.After(wait):
 			}
 			err := s.record(context.Background(), a)
@@ -416,8 +485,9 @@ func bodyFingerprint(raw []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// jsonKeysCollide reports whether any object in raw repeats a key, compared
-// case-insensitively. Malformed JSON reports false (it is hashed as bytes anyway).
+// jsonKeysCollide reports whether any object in raw repeats a key under the
+// folding encoding/json binds with. Malformed JSON reports false (it is hashed as
+// bytes anyway).
 func jsonKeysCollide(raw []byte) bool {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	type frame struct {
@@ -443,7 +513,7 @@ func jsonKeysCollide(raw []byte) bool {
 				}
 				continue
 			}
-			k := strings.ToLower(tok.(string))
+			k := foldJSONKey(tok.(string))
 			if _, dup := top.keys[k]; dup {
 				return true
 			}
@@ -472,6 +542,34 @@ func jsonKeysCollide(raw []byte) bool {
 			return false
 		}
 	}
+}
+
+// foldJSONKey folds a key exactly as encoding/json matches object keys to struct
+// fields (encoding/json/fold.go): ASCII upper-cased, every other rune mapped to the
+// smallest rune of its unicode.SimpleFold orbit. strings.ToLower is not that
+// relation — "ſ" (U+017F) and the Kelvin sign (U+212A) match "s" and "k" there.
+func foldJSONKey(k string) string {
+	var b strings.Builder
+	b.Grow(len(k))
+	for _, r := range k {
+		if r < utf8.RuneSelf {
+			if 'a' <= r && r <= 'z' {
+				r -= 'a' - 'A'
+			}
+			b.WriteRune(r)
+			continue
+		}
+		for {
+			r2 := unicode.SimpleFold(r)
+			if r2 <= r {
+				r = r2
+				break
+			}
+			r = r2
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 // captureWriter keeps a copy of the response body the handler writes.

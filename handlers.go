@@ -315,7 +315,7 @@ func (a *app) handleCancelJob(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"cancelled": true})
 		return
 	}
-	c.JSON(http.StatusConflict, gin.H{"error": "job not cancellable (unknown or already terminal)"})
+	refuse(c, http.StatusConflict, "job_not_cancellable", "job not cancellable (unknown or already terminal)", nil)
 }
 
 // handleJobLogsWS streams a job's log: backlog then live lines, over the shared
