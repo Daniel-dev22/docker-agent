@@ -97,6 +97,19 @@ func TestUpdateSmoke(t *testing.T) {
 	if afterID == "" || afterID == beforeID {
 		t.Fatalf("container did not swap: before=%s after=%s", beforeID, afterID)
 	}
+	// The engine deploys the project as it reloads from disk after the write: the
+	// swapped container must run the new image, not the one loaded before it.
+	sctx, scancel := context.WithTimeout(context.Background(), 10*time.Second)
+	containers, _, err := dc.snapshot(sctx)
+	scancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range containers {
+		if c.ComposeProject == name && c.Image != "alpine:3.20" {
+			t.Fatalf("the swapped container runs %q, want alpine:3.20", c.Image)
+		}
+	}
 
 	// The compose file should be rewritten to the new tag (durable persistence).
 	data, _ := os.ReadFile(composePath)
