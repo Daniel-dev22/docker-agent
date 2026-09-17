@@ -900,6 +900,18 @@ func TestImageWriteFollowsTemplateEnvValues(t *testing.T) {
 		}
 	})
 
+	t.Run("zwave: one service's undeclared tag variable is declared above the value using it", func(t *testing.T) {
+		f := newWriteFixture(t, map[string]string{
+			"compose.yaml": "services:\n  zwave-js-ui:\n    image: ${ZWAVE_IMAGE}\n",
+			".env":         "TZ=UTC\nZWAVE_IMAGE=zwavejs/zwave-js-ui:${IMAGE_NAME:-9.9.0}\n",
+		}, ProjectEntry{})
+		_, err := f.write(map[string]string{"zwave-js-ui": "zwavejs/zwave-js-ui:9.9.1"})
+		must(t, err)
+		if got := f.state(t)[".env"]; got != "TZ=UTC\nIMAGE_NAME=9.9.1\nZWAVE_IMAGE=zwavejs/zwave-js-ui:${IMAGE_NAME:-9.9.0}\n" {
+			t.Errorf(".env = %q", got)
+		}
+	})
+
 	t.Run("a value template beyond a trailing tag is refused, not flattened", func(t *testing.T) {
 		f := newWriteFixture(t, map[string]string{
 			"compose.yaml": "services:\n  app:\n    image: ${APP_IMAGE}\n",
