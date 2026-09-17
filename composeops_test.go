@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -8,11 +9,13 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/docker/compose/v5/pkg/api"
+	"github.com/sirupsen/logrus"
 )
 
 func opsProject() *types.Project {
@@ -230,5 +233,104 @@ func TestNarrowedOpEventCarriesServices(t *testing.T) {
 	must(t, json.Unmarshal(payload, &got))
 	if got.Target != "a,b" || !slices.Equal(got.Services, []string{"a", "b"}) {
 		t.Fatalf("event payload: %s", payload)
+	}
+}
+
+// Every op that builds from the compose files refuses a project whose files do not
+// load — coded, before a job exists — whole-project or narrowed. down and restart
+// work from labels and still run.
+func TestFileOpsRefuseAnUnloadableProject(t *testing.T) {
+	e := newCapEnv(t, testSelfID, func(root string) []fakeContainer {
+		return append(defaultContainers(root), fakeContainer{id: "beef" + strings.Repeat("0", 60), name: "myapp-app-1", project: "myapp", workingDir: filepath.Join(root, "myapp"), service: "app"})
+	})
+	must(t, os.MkdirAll(filepath.Join(e.root, "myapp"), 0o755))
+	must(t, os.WriteFile(filepath.Join(e.root, "myapp", "compose.yaml"), []byte("x"), 0o644)) // the 1-byte file in the fleet
+	must(t, e.a.projects.register(ProjectEntry{Name: "myapp", WorkingDir: filepath.Join(e.root, "myapp")}))
+
+	jobs := func() int { return len(e.a.reg.list()) }
+	for _, op := range []string{opComposeUp, opComposeRecreate, opComposePull, opComposeUpdate} {
+		for _, services := range [][]string{nil, {"app"}} {
+			if op == opComposeUpdate && services != nil {
+				continue
+			}
+			before := jobs()
+			body := map[string]any{"op": op}
+			if services != nil {
+				body["services"] = services
+			}
+			status, resp := e.do(t, http.MethodPost, "/v1/projects/myapp/op", body)
+			if status != http.StatusConflict || resp["code"] != "project_load_failed" || resp["retryable"] != nil {
+				t.Errorf("%s %v on an unloadable project: %d %v", op, services, status, resp)
+			}
+			if jobs() != before {
+				t.Errorf("%s %v started a job that could only fail", op, services)
+			}
+		}
+	}
+	for _, op := range []string{opComposeRestart, opComposeDown} {
+		if status, resp := e.do(t, http.MethodPost, "/v1/projects/myapp/op", map[string]any{"op": op}); status != http.StatusAccepted {
+			t.Errorf("%s works from labels and must not need the files: %d %v", op, status, resp)
+		}
+	}
+}
+
+type warnCapture struct {
+	mu   sync.Mutex
+	msgs []string
+}
+
+func (w *warnCapture) Levels() []logrus.Level { return []logrus.Level{logrus.WarnLevel} }
+func (w *warnCapture) Fire(e *logrus.Entry) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.msgs = append(w.msgs, e.Message)
+	return nil
+}
+
+// The pre-load passes interpolate with the environment the real load uses, and
+// quietly: a variable the .env sets warns nowhere, a genuinely unset one warns once.
+// compose-go's ProjectOptions.LoadModel dropped the environment, so every variable
+// read as unset — a warning per load, and a `label_file: ${DIR}/x` checked as `/x`.
+func TestPreLoadPassesInterpolateLikeTheLoad(t *testing.T) {
+	capture := &warnCapture{}
+	old := logrus.StandardLogger().ReplaceHooks(logrus.LevelHooks{})
+	logrus.AddHook(capture)
+	defer logrus.StandardLogger().ReplaceHooks(old)
+	unsetWarnings := func() int {
+		capture.mu.Lock()
+		defer capture.mu.Unlock()
+		n := 0
+		for _, m := range capture.msgs {
+			if strings.Contains(m, "variable is not set") {
+				n++
+			}
+		}
+		capture.msgs = nil
+		return n
+	}
+
+	l := newLoadEnv(t)
+	set := l.project(t, "envset", map[string]string{
+		"compose.yaml":      "services:\n  app:\n    image: ${IMG}\n    label_file: ${LBL_DIR}/app.labels\n",
+		".env":              "IMG=nginx:alpine\nLBL_DIR=./labels\n",
+		"labels/app.labels": "tier=web\n",
+	})
+	p, err := l.cb.loadProject(context.Background(), ProjectEntry{Name: "envset", WorkingDir: set})
+	if err != nil {
+		t.Fatalf("a label_file under a .env-set directory must load: %v", err)
+	}
+	if p.Services["app"].Labels["tier"] != "web" {
+		t.Errorf("label_file not applied: %v", p.Services["app"].Labels)
+	}
+	if n := unsetWarnings(); n != 0 {
+		t.Errorf("%d unset-variable warnings for variables the .env sets", n)
+	}
+
+	unset := l.project(t, "envunset", map[string]string{"compose.yaml": "services:\n  app:\n    image: nginx:${TW_NEVER_SET_TAG}\n"})
+	if _, err := l.cb.loadProject(context.Background(), ProjectEntry{Name: "envunset", WorkingDir: unset}); err != nil {
+		t.Fatal(err)
+	}
+	if n := unsetWarnings(); n != 1 {
+		t.Errorf("a genuinely unset variable warned %d times, want once (the real load)", n)
 	}
 }

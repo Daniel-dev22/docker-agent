@@ -59,6 +59,7 @@ import (
 	"github.com/compose-spec/compose-go/v2/dotenv"
 	"github.com/compose-spec/compose-go/v2/loader"
 	"github.com/compose-spec/compose-go/v2/paths"
+	"github.com/compose-spec/compose-go/v2/template"
 	"github.com/compose-spec/compose-go/v2/types"
 )
 
@@ -293,7 +294,19 @@ func (s projectScan) parse(ctx context.Context, file, workingDir string, env typ
 		o.SkipDefaultValues = true
 		o.ResolvePaths = false
 		o.SetProjectName("project-scan", true)
+		quietInterpolation(o)
 	})
+}
+
+// quietInterpolation interpolates exactly as compose does, without compose-go's
+// "variable is not set" warning: a pre-load pass reads the same variables as the
+// real load, which reports a genuinely unset one — once, not once per pass.
+func quietInterpolation(o *loader.Options) {
+	if o.Interpolate != nil {
+		o.Interpolate.Substitute = func(s string, m template.Mapping) (string, error) {
+			return template.SubstituteWithOptions(s, m, template.WithoutLogging)
+		}
+	}
 }
 
 // includeEntries decodes a model's top-level include list. compose-go's

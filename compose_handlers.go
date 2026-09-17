@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/gin-gonic/gin"
 )
@@ -111,7 +112,21 @@ func (a *app) handleComposeOp(c *gin.Context) {
 				"whitespace, control characters and shell or interpolation metacharacters are refused", nil)
 		return
 	}
-	services, ok := a.checkOpServices(c, body, entry, summaries)
+	// An op that builds from the compose files loads them now: a project whose files
+	// do not load is refused here, coded, instead of starting a job that can only
+	// fail. allowed_ops stays structural — loading every project on every fleet
+	// snapshot would cost tens of milliseconds a project on each push.
+	var project *types.Project
+	if needsModel(body.Op) || body.Op == opComposeUpdate {
+		loaded, err := a.compose.loadProject(c.Request.Context(), entry)
+		if err != nil {
+			refuse(c, http.StatusConflict, "project_load_failed",
+				"the project's compose files do not load: "+err.Error(), gin.H{"working_dir": entry.WorkingDir})
+			return
+		}
+		project = loaded
+	}
+	services, ok := a.checkOpServices(c, body, entry, summaries, project)
 	if !ok {
 		return
 	}
@@ -141,7 +156,7 @@ func (a *app) handleComposeOp(c *gin.Context) {
 // as it runs them whole. up, recreate and pull build from the model, so theirs are
 // the services of the project as it loads; a project that does not load is a
 // deterministic refusal, not a server error.
-func (a *app) checkOpServices(c *gin.Context, body composeOpBody, entry ProjectEntry, summaries []container.Summary) ([]string, bool) {
+func (a *app) checkOpServices(c *gin.Context, body composeOpBody, entry ProjectEntry, summaries []container.Summary, project *types.Project) ([]string, bool) {
 	if len(body.Services) == 0 {
 		return nil, true
 	}
@@ -164,14 +179,7 @@ func (a *app) checkOpServices(c *gin.Context, body composeOpBody, entry ProjectE
 	}
 	known := map[string]bool{}
 	if needsModel(body.Op) {
-		project, err := a.compose.loadProject(c.Request.Context(), entry)
-		if err != nil {
-			refuse(c, http.StatusConflict, "project_load_failed",
-				"the project's compose files do not load, so its services cannot be checked: "+err.Error(),
-				gin.H{"working_dir": entry.WorkingDir})
-			return nil, false
-		}
-		for s := range project.Services {
+		for s := range project.Services { // loaded by the handler, which refused if it did not load
 			known[s] = true
 		}
 	} else {

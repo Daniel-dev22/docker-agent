@@ -324,7 +324,11 @@ func newCapEnv(t *testing.T, selfID string, containers func(root string) []fakeC
 	// gracefully, a container job reaches the fake engine.
 	jobs := newJobRegistry(cfg, newEngine(cfg, dc, nil, reg), nil)
 	self := &selfIdentity{containerID: selfID, controlPathName: "traefik"}
-	a := &app{cfg: cfg, docker: dc, projects: reg, reg: jobs, compose: &composeBackend{}, self: self}
+	// A real compose backend over the temp root: ops that build from the compose files
+	// load them in the handler.
+	cb, err := newComposeBackend(Config{DockerHost: eng.host(), ComposeRoot: root})
+	must(t, err)
+	a := &app{cfg: cfg, docker: dc, projects: reg, reg: jobs, compose: cb, self: self}
 	r := gin.New()
 	r.Use(auditRefusalCodes(t))
 	registerRoutes(r, a)

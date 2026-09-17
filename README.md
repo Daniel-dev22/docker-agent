@@ -287,6 +287,13 @@ carry `service_ops`: true when some op in `allowed_ops` can be narrowed — ever
 records its `services` on the job object and its events, joins them into `target` (the column the
 controller's `docker_jobs` history already has), and logs `compose <op> <project> [a b]`.
 
+**Load failures are refused at op time.** `allowed_ops` is structural — whether the op may run
+here — and never loads the compose files: a fleet snapshot is built on every push, and loading
+each project costs tens of milliseconds a project. So an op that builds from the files (`up`,
+`recreate`, `pull`, `update`) loads them when it is requested, and a project whose files do not load
+is `409 project_load_failed`, with no job started. `down` and `restart` work from container labels
+and need no files.
+
 It returns:
 - `400` if `op` is not one of those,
 - `503 {"error":"compose backend unavailable on this host"}` if the compose backend failed to
@@ -577,7 +584,7 @@ ID starts with `db`.
 | Register or copy while another change holds the project for longer than 10s | 409 | `project_busy` (`"retryable": true`, `holder`) |
 | Register or copy onto a working directory another registered project already has (symlinks resolved) | 409 | `working_dir_in_use` (`project`, `working_dir`) |
 | Op `services`: not a compose service name, or not a service of the project (for `down`/`restart`: no container carries it) | 400 | `unknown_service` (`service`) |
-| Op `services` on `up`/`recreate`/`pull` for a project whose compose files do not load | 409 | `project_load_failed` (`working_dir`) |
+| `up`/`recreate`/`pull`/`update`, whole or narrowed, on a project whose compose files do not load | 409 | `project_load_failed` (`working_dir`) |
 | Bulk `action` not one of start/stop/restart/kill/remove | 400 | `invalid_action` |
 | More than 100 distinct targets | 400 | `too_many_targets` |
 | An ambiguous, malformed, or >255-byte container reference | 400 | `invalid_target` |

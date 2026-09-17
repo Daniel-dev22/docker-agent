@@ -346,7 +346,24 @@ func (b *composeBackend) preLoadCheck(ctx context.Context, e ProjectEntry, paths
 	if err := scan.scan(ctx, paths.config, e.WorkingDir, e.WorkingDir, opts.Environment, 0, nil); err != nil {
 		return err
 	}
-	model, err := opts.LoadModel(ctx)
+	// Not opts.LoadModel: compose-go builds that model's ConfigDetails without the
+	// options' Environment, so every variable read as unset — logged as a warning on
+	// every load, and a `label_file: ${DIR}/x` confined as `/x`, refusing a file
+	// inside the root. The model is loaded here with the environment the real load
+	// interpolates with.
+	files := make([]types.ConfigFile, 0, len(paths.config))
+	for _, f := range paths.config {
+		files = append(files, types.ConfigFile{Filename: f})
+	}
+	model, err := loader.LoadModelWithContext(ctx, types.ConfigDetails{
+		WorkingDir:  e.WorkingDir,
+		ConfigFiles: files,
+		Environment: opts.Environment,
+	}, func(o *loader.Options) {
+		o.ResourceLoaders = append([]loader.ResourceLoader{guard}, b.remoteLoaders()...)
+		o.SetProjectName(e.Name, true)
+		quietInterpolation(o)
+	})
 	if v := guard.violation(); v != nil {
 		return v
 	}
