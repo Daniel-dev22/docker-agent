@@ -196,3 +196,31 @@ health check, and a re-run of the role is idempotent.
 - **A consumer must check `service_ops` before sending `services`** — an older agent ignores the field
   and acts on the whole project.
 - **`allowed_ops` is structural** (never loads files); load failures surface only at op time.
+
+## Rollout record (2026-09-17)
+
+Order was consumers first, agents last, because a new agent refuses a register without `replace`
+while every new consumer is backward compatible with an old agent.
+
+| Step | What | Verified |
+|---|---|---|
+| 1 | control-center `4.0.780` (merge `9f638fc6`) → kd + ng, 7 services | both sync-workers read the peer healthy through the new `/api/sync/status` probe, `queue_known` true, dead counts 0, no Overview alarm from this change |
+| 2 | ansible `51.107.7` → kd-cluster + ng-cluster (7 hosts, `failed=0`) | deployed tree on 51.107.7; `deploy.yml -e server_home=kdhome` now lists 6 hosts **including kd-vps01** behind a localhost assert play |
+| 3 | docker-agent `0.1.18` (merge `ff164e7`) built on both NAS from tag 0.1.18 → image `20260917-180612` → deployed to all 10 hosts (`failed=0`) | below |
+
+Live checks after step 3 (through the router proxy):
+
+- Every agent advertises capability on every project (78 entries, 10 hosts); each marks its own stack
+  `ops_blocked: self`; readiness resolves self + control path; `shared_working_dirs` empty everywhere.
+- The action that started this phase — `update` of `docker-agent` on kd-vps01 — now answers **409
+  `self_project`** naming `docker-agent/deploy.yml`, with **no job created**. Same answer cross-site on
+  ng-nuc01 through the remote router.
+- An Ansible-owned stack outside the compose root (`duplicacy-agent-api`) answers 409
+  `project_not_operable` and names what IS allowed (`down, restart`).
+- A container verb on the agent's own container answers 409 `self_container`.
+- Discovery rows: 38 operable · 10 operable with `control_path` (no `down`) · 20 `outside_compose_root`
+  · 10 `self`. No new failed jobs.
+
+Not done, pending the user's decision: the esphome image-ID repair op on kd-nuc01 and ng-nuc01; the
+registry junk (`homeassistant` on kd-nuc02/kd-pi01/kd-vm01, `myapp`, dead `duplicacy`); rotating the
+credentials that sit inline in the traefik compose files.
