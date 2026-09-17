@@ -110,7 +110,7 @@ type Job struct {
 	targets   []string
 	targetIDs []string
 	force     bool
-	timeout *int
+	timeout   *int
 	// Stack-update op params — in-memory, set at construction.
 	overrideImage   string
 	overrideService string
