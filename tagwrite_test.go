@@ -913,11 +913,14 @@ func TestImageWriteFollowsTemplateEnvValues(t *testing.T) {
 		sameState(t, "after the refusal", f.state(t), original)
 	})
 
-	t.Run("a single-quoted value is literal to dotenv and is rewritten", func(t *testing.T) {
+	t.Run("a single-quoted value is literal to dotenv, even with a $, and is rewritten", func(t *testing.T) {
 		f := newWriteFixture(t, map[string]string{
 			"compose.yaml": "services:\n  app:\n    image: ${APP_IMAGE:-reg.example/app:v1}\n",
-			".env":         "APP_IMAGE='reg.example/app:v1'\n",
+			".env":         "APP_IMAGE='reg.example/app:${NOT_EXPANDED}'\n",
 		}, ProjectEntry{})
+		if got := f.image(t, "app"); got != "reg.example/app:${NOT_EXPANDED}" {
+			t.Fatalf("fixture: dotenv expanded a single-quoted value: %q", got)
+		}
 		_, err := f.write(map[string]string{"app": "reg.example/app:v2"})
 		must(t, err)
 		if got := f.state(t)[".env"]; got != "APP_IMAGE='reg.example/app:v2'\n" {

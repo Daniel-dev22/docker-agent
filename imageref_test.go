@@ -248,7 +248,11 @@ func TestValidImageRefAgreesWithTheGrammar(t *testing.T) {
 		return s
 	}
 	extra := func(s string) bool { return isImageID(s) || len(s) > maxImageRefLen }
-	inputs := append([]string{"[::1]:5000/a-b", "[fe80::1%eth0]:5000/a", "sha256:" + strings.Repeat("f", 64)}, realFleetImages...)
+	overCap := "reg.example/" + strings.Repeat("a", 243) + ":" + strings.Repeat("t", 128) + "@sha512:" + strings.Repeat("0", 128)
+	if _, err := reference.ParseNormalizedNamed(overCap); err != nil || len(overCap) <= maxImageRefLen {
+		t.Fatalf("fixture: %d bytes, grammar err %v", len(overCap), err)
+	}
+	inputs := append([]string{"[::1]:5000/a-b", "[fe80::1%eth0]:5000/a", "sha256:" + strings.Repeat("f", 64), overCap}, realFleetImages...)
 	for range 200_000 {
 		inputs = append(inputs, gen())
 	}
