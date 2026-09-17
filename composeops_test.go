@@ -172,6 +172,7 @@ func TestNarrowedOpsWorkFromLabels(t *testing.T) {
 		{"narrowed restart outside the root", "duplicacy", map[string]any{"op": "restart", "services": []string{"web"}}, 202, ""},
 		{"narrowed down outside the root", "duplicacy", map[string]any{"op": "down", "services": []string{"cli", "web"}}, 202, ""},
 		{"a service with no containers", "duplicacy", map[string]any{"op": "restart", "services": []string{"nope"}}, 400, "unknown_service"},
+		{"another project's service", "duplicacy", map[string]any{"op": "down", "services": []string{"gdrive-agent"}}, 400, "unknown_service"},
 		{"up outside the root is refused by capability first", "duplicacy", map[string]any{"op": "up", "services": []string{"web"}}, 409, "project_not_operable"},
 		{"narrowed up on a project whose files do not load", "broken", map[string]any{"op": "up", "services": []string{"web"}}, 409, "project_load_failed"},
 	}
