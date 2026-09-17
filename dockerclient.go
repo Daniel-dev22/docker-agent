@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
@@ -51,6 +52,12 @@ type ContainerStatus struct {
 	ComposeProject string `json:"compose_project,omitempty"`
 	ComposeService string `json:"compose_service,omitempty"`
 	Ports          []Port `json:"ports,omitempty"`
+	// Self: this is docker-agent's own container (or shares its network namespace).
+	// Every container verb on it is refused. ControlPath: the container the agent's
+	// control-center traffic dials; stop/kill/remove on it are refused. Both come
+	// from the same selfView the endpoints enforce, so a UI need not infer them.
+	Self        bool `json:"self,omitempty"`
+	ControlPath bool `json:"control_path,omitempty"`
 
 	// Image-outdated detection. Populated by the imageChecker's slow
 	// jittered pass (NEVER inline in this snapshot) and stamped onto the container
@@ -83,19 +90,39 @@ type ContainerStatus struct {
 // is derived from live container labels; the durable projects.json registry is
 // merged in on top so stopped-but-known projects also appear.
 type ComposeProject struct {
-	Name           string   `json:"name"`
+	Name string `json:"name"`
+	// WorkingDir is the directory ops decide on: the registry entry's for a
+	// registered project (it is what an op loads), the live label's only for an
+	// unregistered running project. ConfigFiles stays the label value.
 	WorkingDir     string   `json:"working_dir,omitempty"`
 	ConfigFiles    string   `json:"config_files,omitempty"`
 	ContainerCount int      `json:"container_count"`
 	RunningCount   int      `json:"running_count"`
 	Containers     []string `json:"containers"`
-	// Managed is true when docker-agent owns this stack's compose files: it was
-	// created via register/copy and its working dir lives under ComposeRoot, so
-	// the agent can read/write it and a UI can offer in-place editing. False =
-	// externally-provisioned (another tool, or ad-hoc) — discovered only, files
-	// live outside the agent's mount, so editing is not offered. Set by
-	// composeRegistry.mergeKnown when building the fleet snapshot.
-	Managed bool `json:"managed,omitempty"`
+	// Capability, all from projectCapabilities and stamped by
+	// composeRegistry.mergeKnown onto EVERY project in the snapshot.
+	//
+	// AllowedOps is the sorted set of POST /v1/projects/:name/op values the endpoint
+	// accepts right now. Never null: an empty list means no op, which a consumer
+	// must be able to tell apart from an agent too old to send the field.
+	AllowedOps []string `json:"allowed_ops"`
+	// Operable: AllowedOps includes the file-loading ops (up/pull/recreate/update) —
+	// the stack's compose files are visible to the agent.
+	Operable bool `json:"operable"`
+	// Managed: the agent may read and rewrite the stack's compose files (edit in
+	// place, copy source). Never omitempty — false IS the signal; omitting it made
+	// every `managed === false` check downstream unreachable.
+	Managed bool `json:"managed"`
+	// OpsBlocked says why AllowedOps is not every op, by priority: "self" (the
+	// agent's own stack), "invalid_name" (compose would act on a different name),
+	// "outside_compose_root" (files outside the agent's mount), "control_path" (the
+	// stack runs the agent's control-path proxy, so no `down`). Empty when every op
+	// is allowed.
+	OpsBlocked string `json:"ops_blocked,omitempty"`
+	// ServiceOps: every op in AllowedOps except update accepts "services" on POST
+	// /v1/projects/:name/op (projectCapability.serviceOps). An agent too old to
+	// support it does not send the field.
+	ServiceOps bool `json:"service_ops"`
 
 	// Rolled-up image-outdated status, computed from the project's
 	// containers during the fleet merge: outdated if ANY service is outdated.
@@ -170,19 +197,36 @@ func (d *dockerClient) inspectImage(ctx context.Context, id string) (imageInfo, 
 	return info, nil
 }
 
+// listContainers is the single Engine API call every snapshot and every self
+// derivation reads.
+func (d *dockerClient) listContainers(ctx context.Context) ([]container.Summary, error) {
+	return d.cli.ContainerList(ctx, container.ListOptions{All: true})
+}
+
 // snapshot returns the full container list plus the compose-project grouping in a
 // single Engine API call — the bounded single-pass collection the plan requires.
+// Containers carry no self/control-path stamp; the fleet build uses snapshotFrom.
 func (d *dockerClient) snapshot(ctx context.Context) ([]ContainerStatus, []ComposeProject, error) {
-	summaries, err := d.cli.ContainerList(ctx, container.ListOptions{All: true})
+	summaries, err := d.listContainers(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
+	containers, projects := snapshotFrom(summaries, nil)
+	return containers, projects, nil
+}
+
+// snapshotFrom converts one container list into the snapshot rows, stamping each
+// container's self/control-path flags from v (nil = none).
+func snapshotFrom(summaries []container.Summary, v *selfView) ([]ContainerStatus, []ComposeProject) {
 	containers := make([]ContainerStatus, 0, len(summaries))
 	for _, s := range summaries {
-		containers = append(containers, summaryToStatus(s))
+		cs := summaryToStatus(s)
+		cs.Self = v.isSelfID(s.ID)
+		cs.ControlPath = v.isControlPathID(s.ID)
+		containers = append(containers, cs)
 	}
 	sort.Slice(containers, func(i, j int) bool { return containers[i].Name < containers[j].Name })
-	return containers, groupComposeProjects(summaries), nil
+	return containers, groupComposeProjects(summaries)
 }
 
 func summaryToStatus(s container.Summary) ContainerStatus {
@@ -516,6 +560,21 @@ func (d *dockerClient) inspectState(ctx context.Context, nameOrID string) (conta
 		}
 	}
 	return st, nil
+}
+
+// resolveContainerID asks the daemon which container a reference names — full ID,
+// exact name, or unique ID prefix, in the daemon's own order — and returns its
+// full ID. A reference that names nothing returns ("", nil): an op on it fails on
+// its own, so it is nobody's to protect.
+func (d *dockerClient) resolveContainerID(ctx context.Context, ref string) (string, error) {
+	resp, err := d.cli.ContainerInspect(ctx, ref)
+	if err != nil {
+		if cerrdefs.IsNotFound(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	return resp.ID, nil
 }
 
 // containerNetworks returns the set of network names a container is currently

@@ -1,11 +1,12 @@
 package main
 
 import (
+	"github.com/distribution/reference"
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"os"
-	"path/filepath"
+	"math/rand/v2"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -47,11 +48,31 @@ var realFleetImages = []string{
 	"moby/buildkit:buildx-stable-1",
 	"nginx:alpine",
 	"postgres:16-alpine",
-	"sha256:15dc409d48a2a475ef6e54b26e211a13a97f5ea5d0b7f20bf2ee22c37ea33237",
-	"sha256:65688cd5e2071f581c8cdca102574db86b64541bb0b18f87d04b4ec3ba6096ec",
 	"traefik:v3.7.12",
 	"vaultwarden/server:latest",
 	"zwavejs/zwave-js-ui:latest",
+}
+
+// The two esphome containers run from bare image IDs: the legacy Portainer rollback
+// wrote the ID into CURRENT_ESPHOME_IMAGE and the migration copied it into .env.
+// An ID is refused as an image to deploy — it is the defect, not a value to keep.
+var realFleetImageIDs = []string{
+	"sha256:15dc409d48a2a475ef6e54b26e211a13a97f5ea5d0b7f20bf2ee22c37ea33237",
+	"sha256:65688cd5e2071f581c8cdca102574db86b64541bb0b18f87d04b4ec3ba6096ec",
+	"15dc409d48a2a475ef6e54b26e211a13a97f5ea5d0b7f20bf2ee22c37ea33237",
+}
+
+func TestValidImageRefRefusesImageIDs(t *testing.T) {
+	for _, id := range realFleetImageIDs {
+		if validImageRef(id) || !isImageID(id) {
+			t.Errorf("%q: valid=%v isImageID=%v", id, validImageRef(id), isImageID(id))
+		}
+	}
+	for _, img := range realFleetImages {
+		if isImageID(img) {
+			t.Errorf("a named reference read as an image ID: %q", img)
+		}
+	}
 }
 
 func TestValidImageRefAcceptsEveryImageInTheEstate(t *testing.T) {
@@ -93,6 +114,11 @@ func TestValidImageRefRefusesWhatWouldCorruptAFile(t *testing.T) {
 		{"-reg/app:latest", "leading dash could read as a flag"},
 		{"reg//app:latest", "empty path segment"},
 		{"reg/app@sha256:aa@sha256:bb", "two digests"},
+		{"traefik:", "an empty tag — the grammar, not the charset"},
+		{"traefik@", "an empty digest"},
+		{"traefik:v3:x", "two tags"},
+		{"Traefik:v3", "an uppercase repository"},
+		{"reg/app@sha256:abc", "a truncated digest"},
 		{strings.Repeat("a", maxImageRefLen+1), "over the length cap"},
 	}
 	for _, c := range cases {
@@ -105,8 +131,13 @@ func TestValidImageRefRefusesWhatWouldCorruptAFile(t *testing.T) {
 	if !validImageRef(base) {
 		t.Fatalf("positive control rejected: %q", base)
 	}
-	if !validImageRef(strings.Repeat("a", maxImageRefLen)) {
-		t.Error("exactly at the cap must pass")
+	// A valid reference exactly at the cap: a 128-byte tag and a sha512 digest
+	// (exactly 128 hex), with the name taking the rest.
+	suffix := ":" + strings.Repeat("t", 128) + "@sha512:" + strings.Repeat("0", 128)
+	name := "reg.example/" + strings.Repeat("a", maxImageRefLen-len(suffix)-len("reg.example/"))
+	atCap := name + suffix
+	if len(atCap) != maxImageRefLen || !validImageRef(atCap) {
+		t.Errorf("a valid reference exactly at the cap (%d bytes) must pass", len(atCap))
 	}
 }
 
@@ -171,38 +202,85 @@ func TestSafeEnvLineValue(t *testing.T) {
 	}
 }
 
-// setEnvVar must REFUSE, and must not have touched the file. A guard that rejects
-// after a partial write is not a guard.
-func TestSetEnvVarRefusesAMultilineValueAndLeavesTheFileIntact(t *testing.T) {
-	dir := t.TempDir()
-	envPath := filepath.Join(dir, ".env")
-	const original = "IMAGE=reg/app:v1\nOTHER=keepme\n"
-	if err := os.WriteFile(envPath, []byte(original), 0o600); err != nil {
-		t.Fatal(err)
+// The env writer refuses a value that would add lines, whatever validated it
+// upstream: the guard holds for every caller, not only today's one boundary.
+func TestPlanVarRefusesAValueThatWouldAddLines(t *testing.T) {
+	p := &writePlan{files: map[string]*fileState{}, vars: map[string]*varEdit{}}
+	for _, v := range []string{"reg/app:v2\nINJECTED=yes", "reg/app:v2\rX=1", "a b", "a#b", `a"b`, "a$b"} {
+		if err := p.planVar("IMAGE", v, "app", "", 0); err == nil {
+			t.Errorf("planVar accepted %q", v)
+		}
 	}
-	entry := ProjectEntry{Name: "p", WorkingDir: dir}
+	if len(p.files) != 0 {
+		t.Error("a refused value was planned into a file")
+	}
+}
 
-	if _, err := setEnvVar(entry, "IMAGE", "reg/app:v2\nINJECTED=yes"); err == nil {
-		t.Error("a value with a newline must be refused")
+// validImageRef agrees with docker's grammar on every input, except where one of
+// its three documented extra rules says otherwise: an image ID, the length cap,
+// or a rune outside the grammar's alphabet (which the grammar never accepts).
+func TestValidImageRefAgreesWithTheGrammar(t *testing.T) {
+	rng := rand.New(rand.NewPCG(20260917, 1))
+	alphabet := []rune("abcxyz09AZ._-/:@+[]$ \"'\\#\n\t%!=")
+	hosts := []string{"", "reg.example/", "reg.example:5000/", "localhost:5000/", "[::1]:5000/", "[fe80::1]/", "[::1]/", "10.0.0.1:443/", "[zz]/"}
+	names := []string{"a", "a-b", "a__b", "library/nginx", "Up", "x.y_z", "a/b/c", ""}
+	tags := []string{"", ":v1", ":V1.2-rc", ":", ":v3:x", ":" + strings.Repeat("t", 129)}
+	digests := []string{"", "@sha256:" + strings.Repeat("a", 64), "@sha256:abc", "@", "@sha512:" + strings.Repeat("0", 128)}
+	gen := func() string {
+		s := hosts[rng.IntN(len(hosts))] + names[rng.IntN(len(names))] + tags[rng.IntN(len(tags))] + digests[rng.IntN(len(digests))]
+		for range rng.IntN(3) {
+			rs := []rune(s)
+			i := rng.IntN(len(rs) + 1)
+			switch rng.IntN(3) {
+			case 0:
+				rs = slices.Insert(rs, i, alphabet[rng.IntN(len(alphabet))])
+			case 1:
+				if i < len(rs) {
+					rs = slices.Delete(rs, i, i+1)
+				}
+			default:
+				if i < len(rs) {
+					rs[i] = alphabet[rng.IntN(len(alphabet))]
+				}
+			}
+			s = string(rs)
+		}
+		return s
 	}
-	got, err := os.ReadFile(envPath)
-	if err != nil {
-		t.Fatal(err)
+	extra := func(s string) bool { return isImageID(s) || len(s) > maxImageRefLen }
+	overCap := "reg.example/" + strings.Repeat("a", 243) + ":" + strings.Repeat("t", 128) + "@sha512:" + strings.Repeat("0", 128)
+	if _, err := reference.ParseNormalizedNamed(overCap); err != nil || len(overCap) <= maxImageRefLen {
+		t.Fatalf("fixture: %d bytes, grammar err %v", len(overCap), err)
 	}
-	if string(got) != original {
-		t.Errorf("file was modified by a refused write:\n%q", got)
+	inputs := append([]string{"[::1]:5000/a-b", "[fe80::1%eth0]:5000/a", "sha256:" + strings.Repeat("f", 64), overCap}, realFleetImages...)
+	for range 200_000 {
+		inputs = append(inputs, gen())
 	}
-	if strings.Contains(string(got), "INJECTED") {
-		t.Error("🔴 the injected line reached the .env")
+	disagree, accepted, ipv6 := 0, 0, 0
+	for _, s := range inputs {
+		_, err := reference.ParseNormalizedNamed(s)
+		grammar := err == nil
+		want := grammar && !extra(s)
+		got := validImageRef(s)
+		if got {
+			accepted++
+			if strings.HasPrefix(s, "[") {
+				ipv6++
+			}
+		}
+		if got != want {
+			if disagree++; disagree <= 10 {
+				t.Errorf("%q: validImageRef=%v, grammar=%v, extra rule=%v", s, got, grammar, extra(s))
+			}
+		}
+		if grammar && !extra(s) && strings.IndexFunc(s, func(r rune) bool { return !fileSafeImageRune(r) }) >= 0 {
+			t.Errorf("%q: the grammar accepts a rune outside fileSafeImageRune — the file-safety rule would disagree", s)
+		}
 	}
-
-	// Positive control: a legitimate value still writes, so the refusal above is
-	// the guard working rather than setEnvVar being broken.
-	if _, err := setEnvVar(entry, "IMAGE", "reg/app:v2"); err != nil {
-		t.Fatalf("a valid value must still be written: %v", err)
+	if disagree > 0 {
+		t.Fatalf("%d of %d inputs disagree with the grammar", disagree, len(inputs))
 	}
-	after, _ := os.ReadFile(envPath)
-	if !strings.Contains(string(after), "IMAGE=reg/app:v2") || !strings.Contains(string(after), "OTHER=keepme") {
-		t.Errorf("valid write did not land or clobbered a sibling:\n%q", after)
+	if accepted < 1000 || ipv6 == 0 {
+		t.Fatalf("the corpus barely reaches the valid space (%d accepted, %d IPv6): it proves little", accepted, ipv6)
 	}
 }

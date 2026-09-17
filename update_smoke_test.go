@@ -97,6 +97,19 @@ func TestUpdateSmoke(t *testing.T) {
 	if afterID == "" || afterID == beforeID {
 		t.Fatalf("container did not swap: before=%s after=%s", beforeID, afterID)
 	}
+	// The engine deploys the project as it reloads from disk after the write: the
+	// swapped container must run the new image, not the one loaded before it.
+	sctx, scancel := context.WithTimeout(context.Background(), 10*time.Second)
+	containers, _, err := dc.snapshot(sctx)
+	scancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range containers {
+		if c.ComposeProject == name && c.Image != "alpine:3.20" {
+			t.Fatalf("the swapped container runs %q, want alpine:3.20", c.Image)
+		}
+	}
 
 	// The compose file should be rewritten to the new tag (durable persistence).
 	data, _ := os.ReadFile(composePath)
@@ -110,6 +123,79 @@ func TestUpdateSmoke(t *testing.T) {
 	eng.runComposeOp(dctx, downJob, opComposeDown, noop)
 	dcancel()
 	logJob(downJob, "down")
+}
+
+// TestUpdateSmokeRollbackRestoresBytes: an update whose new image cannot start is
+// rolled back, and the compose file it wrote is back to its exact original bytes —
+// irregular formatting and comments included — with the stack on its old image.
+func TestUpdateSmokeRollbackRestoresBytes(t *testing.T) {
+	root := t.TempDir()
+	const name = "dockeragentrbsmoke"
+	dir := filepath.Join(root, name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	composePath := filepath.Join(dir, "docker-compose.yml")
+	// hello-world has no `sleep`: the new container cannot start.
+	compose := "services:\n\n  app:   # smoke\n     image: alpine:3.19   # pinned\n     command: [\"sleep\", \"3600\"]\n"
+	if err := os.WriteFile(composePath, []byte(compose), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{NodeName: "nuc", DockerHost: os.Getenv("DOCKER_HOST"), ComposeRoot: root, ComposeRegistryPath: filepath.Join(root, "projects.json")}
+	dc, err := newDockerClient(cfg.DockerHost)
+	if err != nil {
+		t.Fatalf("docker client: %v", err)
+	}
+	defer dc.close()
+	cb, err := newComposeBackend(cfg)
+	if err != nil {
+		t.Fatalf("compose backend: %v", err)
+	}
+	reg := newComposeRegistry(cfg.ComposeRegistryPath, cfg.ComposeRoot)
+	if err := reg.register(ProjectEntry{Name: name, WorkingDir: dir, ComposeFiles: []string{"docker-compose.yml"}}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	eng := newEngine(cfg, dc, cb, reg)
+	noop := func() {}
+	run := func(j *Job, d time.Duration) {
+		ctx, cancel := context.WithTimeout(context.Background(), d)
+		defer cancel()
+		eng.run(ctx, j, func(JobEvent) {}, noop)
+		t.Logf("--- %s (state=%s) ---", j.snapshot().ID, j.snapshot().State)
+		for _, l := range j.logLines() {
+			t.Logf("  %s", l)
+		}
+	}
+	newJob := func(id, op, image string) *Job {
+		return &Job{jobPublic: jobPublic{ID: id, Project: name, Operation: op, State: JobPending},
+			overrideImage: image, overrideService: "app", subscribers: map[chan string]struct{}{}}
+	}
+	defer run(newJob("rb-down", opComposeDown, ""), time.Minute)
+
+	up := newJob("rb-up", opComposeUp, "")
+	run(up, 2*time.Minute)
+	if up.snapshot().State != JobCompleted {
+		t.Fatalf("up: %s", up.snapshot().ErrorMsg)
+	}
+	upd := newJob("rb-update", opComposeUpdate, "hello-world:latest")
+	run(upd, 5*time.Minute)
+	if upd.snapshot().State != JobFailed {
+		t.Fatalf("an update to an image that cannot start must fail, got %s", upd.snapshot().State)
+	}
+	if data, _ := os.ReadFile(composePath); string(data) != compose {
+		t.Fatalf("the compose file is not back to its original bytes:\n%q\nwant\n%q", data, compose)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	containers, _, err := dc.snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range containers {
+		if c.ComposeProject == name && c.State != "running" {
+			t.Errorf("after the rollback %s is %s", c.Name, c.State)
+		}
+	}
 }
 
 func singleContainerID(t *testing.T, dc *dockerClient, project string) string {

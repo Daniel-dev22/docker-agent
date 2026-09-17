@@ -548,7 +548,7 @@ func TestProvenanceSurvivesTheMergeKnownStep(t *testing.T) {
 	// and it must claim no provenance rather than inheriting anyone else's.
 	reg.byName["stopped"] = &ProjectEntry{Name: "stopped", WorkingDir: "/data/stopped"}
 
-	merged := reg.mergeKnown(projects)
+	merged := reg.mergeKnown(projects, nil)
 
 	byName := map[string]ComposeProject{}
 	for _, p := range merged {

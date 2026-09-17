@@ -105,7 +105,9 @@ One flat `package main`. 29 source files plus 13 test files.
 | `stackengine.go` | `updateProject` — the whole pipeline (below), plus the rollback baseline, per-service tag persistence, rollback, and the failed-container log dump. |
 | `resolvers.go` | The four `ImageResolver` kinds and the selection logic; the upstream-compose fetch/cache/interpolate path. |
 | `healthwait.go` | Two-stage wait: container-ID swap detection, then a health poll with crash-loop (restart-count) detection. |
-| `tagwrite.go` | Writes a resolved tag back to the on-host compose scalar or `.env` var (YAML node round-trip, atomic write), returning the previous value so a rollback is reversible per service. |
+| `tagwrite.go` | Writes resolved images into the project's own files: one token in place (the compose scalar where compose takes the image from, or the value of its `.env` assignment), verified by reloading the project, reverted byte for byte. Refuses — changing nothing — whatever cannot be written that way. |
+| `envscan.go` | compose-go's dotenv parser with byte offsets kept, so an assignment can be rewritten in place — and a `KEY=` line inside another variable's quoted value is never mistaken for one. |
+| `projectlock.go` | Per-project serialisation: every project job, and the register/copy writes, hold the project's lock. |
 | `netreconcile.go` | Post-update check that no container came back attached to fewer networks than its service declares; one corrective `up --force-recreate` if so. Best-effort, never fails the update. |
 
 ### Image checking
@@ -133,21 +135,60 @@ listing) and `reconcile`.
 
 ## HTTP API
 
-Everything listens on `:8080`. All bodies are JSON.
+Everything listens on `:8080`. All bodies are JSON, and every request body is capped at 1 MiB
+(`413 {"code":"request_too_large"}`, refused before any handler reads it); the largest real one on
+the fleet is a 12 KB register.
 
 The async pattern is uniform: **any mutation returns `202 Accepted` with a `job_id`**, and you
 observe the result on `/ws/jobs/:id/logs`, `GET /v1/jobs/:id`, or the next `/ws/fleet` snapshot.
 Jobs run on a detached context, so the operation is not cancelled when the HTTP response is
 written.
 
+### Idempotency-Key
+
+Every request that can start a job — `POST /v1/projects/:name/op`, `POST /v1/projects`,
+`POST /v1/projects/:name/copy`, `POST /v1/containers/:id/{start,stop,restart}`,
+`DELETE /v1/containers/:id` and `POST /v1/containers/bulk` — accepts an optional
+**`Idempotency-Key`** header, so a caller that lost a response (the agent restarted mid-request, a
+timeout, a dropped connection) can resend without running the operation twice.
+
+- The key is 1–128 printable ASCII characters, one header line. Anything else is
+  `400 {"code":"invalid_idempotency_key"}` and nothing runs.
+- Scope is method + path + key. The agent records the answer it gave — status and JSON body —
+  in `events.sqlite` under `CONFIG_DIR`, so it survives an agent restart.
+- A resend with the same key and the same body returns the **original status and body verbatim**
+  (a `202 {"job_id":…}` or the original refusal) and runs nothing. Replayed responses carry
+  `Idempotency-Replayed: true`. "Same body" is compared on canonical JSON, so key order and
+  whitespace do not matter.
+- The same key with a different body: `422 {"code":"idempotency_key_reused"}`.
+- The same key while the first request is still being handled: `409
+  {"code":"idempotency_key_in_flight","retryable":true}` — the claim is atomic and taken before
+  anything runs, so the duplicate never executes. Retry (poll) for the answer.
+- Only deterministic answers are recorded (2xx and 4xx). A 5xx — notably `503
+  self_identity_unavailable` — releases the key, so a retry can succeed once the daemon answers.
+- A claim still in flight when the agent died is released at boot: any job it had started was
+  interrupted and failed by the orphan sweep, so a retry correctly runs again.
+- Keys are honoured for 24 hours. The table is bounded by rows (5,000 answers) and by bytes (2 MiB
+  of answers), oldest first; with both caps binding the whole database measured 5.1 MiB.
+- If an answer cannot be stored after the request acted, it is served to retries from memory while
+  it is written in the background. Choose a new key per logical operation, not per retry.
+
+Without the header, every endpoint behaves exactly as described below.
+
 ### Health (2)
 
 | Method | Path | Response |
 |---|---|---|
 | `GET` | `/health/live` | `200 {"status":"ok"}` |
-| `GET` | `/health/ready` | `200 {"status":"ready"}` |
+| `GET` | `/health/ready` | `200 {"status":"ready", "self":{…}, "projects":{"shared_working_dirs":{…}}}` |
 
-Neither touches the Docker daemon. The image's `HEALTHCHECK` curls `/health/ready`.
+Neither touches the Docker daemon: readiness reports the last published self identity
+(`container_id`, `name`, `projects`, `ambiguous`, `control_path` / `control_path_error`,
+`observed_at`, `last_list_error`, or `error`) and never gates on it. The image's `HEALTHCHECK`
+curls `/health/ready`. `projects.shared_working_dirs` maps a working directory (symlinks
+resolved) to the registry entries that share it — `{}` when none do. A register refuses to
+create one, but a `projects.json` from an earlier release can hold one; it is reported, not
+gated, and changes through either name are still serialised (they take one lock).
 
 ### Jobs (4)
 
@@ -160,7 +201,16 @@ Neither touches the Docker daemon. The image's `HEALTHCHECK` curls `/health/read
 
 A job object is `{id, project?, operation, target?, state, started_at, completed_at?, exit_code,
 error?, line_count, trigger_key?}` with `state` one of
-`pending|running|completed|failed|cancelled`.
+`pending|running|completed|failed|cancelled`. A compose op narrowed to services carries
+`services` (and `target` = those services, comma-joined).
+
+**One change per project at a time.** Every project-scoped job (`up`, `down`, `pull`, `restart`,
+`recreate`, `update`) holds its project's lock for its whole run; a second one on the same
+project waits, `running`, with `queued: waiting for job <id> (<op>) on project <name>` in its
+log. The wait honours cancellation and gives up after `DOCKER_COMPOSE_OP_TIMEOUT`, then the op
+runs with its own full timeout. Container verbs and jobs on other projects are not held up.
+Without it, two updates on one stack each rewrote the same `.env`: measured against the real
+writer, 2,000 concurrent pairs tore 367 files and lost 814 updates.
 
 ### Container lifecycle (6)
 
@@ -171,6 +221,10 @@ error?, line_count, trigger_key?}` with `state` one of
 | `POST` | `/v1/containers/:id/restart` | optional `{timeout?, trigger_key?}` | `202` |
 | `DELETE` | `/v1/containers/:id` | optional `{force?, trigger_key?}` | `202` |
 | `POST` | `/v1/containers/bulk` | `{action, ids[], force?, timeout?, trigger_key?}` | `202 {"job_id":…, "state":…, "count":N}`; `400` on an unknown action or empty `ids` |
+
+Every container verb first refuses a protected target — `409 self_container`, `409
+control_path_container`, `503 self_identity_unavailable` — see "What the agent will do with a
+project, and why" under Mounts.
 | `GET` | `/v1/containers/:id/logs` | — | `200 {"lines":[…]}` |
 
 `timeout` is the SIGTERM grace in seconds (stop/restart); `force` kills a running container
@@ -187,10 +241,10 @@ front never relays a scary error and a viewer simply stops paging.
 
 | Method | Path | Body | Response |
 |---|---|---|---|
-| `GET` | `/v1/projects` | — | `200 {"projects":[…]}` — the durable registry, sorted by name. |
+| `GET` | `/v1/projects` | — | `200 {"projects":[…]}` — the durable registry, sorted by name, each entry with `allowed_ops`, `operable`, `managed`, `ops_blocked`. |
 | `POST` | `/v1/projects` | see below | `200 {"registered":name, "job_id"?:…}` |
 | `DELETE` | `/v1/projects/:name` | — | `200 {"deregistered":name}` |
-| `POST` | `/v1/projects/:name/op` | `{op, timeout?, override_image?, override_service?, trigger_key?}` | `202 {"job_id":…, "state":…}` |
+| `POST` | `/v1/projects/:name/op` | `{op, services?, timeout?, override_image?, override_service?, trigger_key?}` | `202 {"job_id":…, "state":…}` |
 | `GET` | `/v1/projects/:name/bundle` | — | `200 {name, working_dir, compose_files:[{name,content}], env_files:[…]}` |
 | `POST` | `/v1/projects/:name/copy` | `{new_name, deploy?}` | `200 {"copied":…, "working_dir":…, "job_id"?:…}` |
 
@@ -199,15 +253,56 @@ front never relays a scary error and a viewer simply stops paging.
 `{name, files:{"<relpath>":"<content>"}, deploy:true}`, which writes the files under
 `$COMPOSE_ROOT/<name>/` (rejecting any path escaping that directory) and optionally `up`s them
 immediately. The inline form is how a stack is copied to a different host: `GET` the source's
-bundle, `POST` it to the target agent. `400` on a missing name or a bad path, `500` on a persist
-failure.
+bundle, `POST` it to the target agent.
 
-**Op** accepts `up | down | pull | restart | recreate | update`. It returns:
+Registering onto a project that **already exists** — registered, or running as containers labelled
+with that project — requires `"replace": true`, whatever the directory or `deploy`; otherwise it is
+`409 project_exists` carrying the existing `working_dir`. This is accident protection (a copy or a
+typo re-pointing someone else's stack), not a security boundary: the API is unauthenticated
+in-network. With `replace:true`, re-pointing and deploying in one request is allowed, and the
+deploy still goes through the capability gate for the new entry. Ansible and the editor send
+`replace:true`; a cross-host copy does not.
+
+Every refusal happens before any file is written; the codes are in the table under Mounts. A write
+that fails after validation is a `500` (transient).
+
+**Op** accepts `up | down | pull | restart | recreate | update`.
+
+**`services`** (optional, `up`, `recreate`, `pull`, `restart`, `down`) narrows the op to exactly
+those services; absent or empty is the whole project. Each must be a compose service name, else
+`400 unknown_service` naming it. `down` and `restart` act on containers, as they do whole: their
+services are the project's containers' `com.docker.compose.service` labels, and no file is read —
+so a project outside the compose root narrows them too. `up`, `recreate` and `pull` build from the
+model, so theirs are the services of the project as it loads; a project whose files do not load is
+`409 project_load_failed`. The list is a set:
+order and duplicates do not matter, to the op or to the Idempotency-Key fingerprint. A narrowed op
+never touches anything else: `up`/`recreate`/`pull` run with no dependencies (`--no-deps`) and
+remove no orphans, so a dependency an operator stopped stays stopped; `restart` restarts only
+them; `down` stops and removes only their containers — compose's own service-scoped `down` also
+removes the services depending on them and tries to remove the project's networks, so it is not
+used. Volumes, anonymous ones included, are kept. `update` does not take `services`; it targets
+one service with `override_service`. `GET /v1/projects` entries (and fleet snapshot projects)
+carry `service_ops`: true when some op in `allowed_ops` can be narrowed — every allowed op except
+`update` then accepts `services` — and false when none can (the agent's own stack). A narrowed job
+records its `services` on the job object and its events, joins them into `target` (the column the
+controller's `docker_jobs` history already has), and logs `compose <op> <project> [a b]`.
+
+**Load failures are refused at op time.** `allowed_ops` is structural — whether the op may run
+here — and never loads the compose files: a fleet snapshot is built on every push, and loading
+each project costs tens of milliseconds a project. So an op that builds from the files (`up`,
+`recreate`, `pull`, `update`) loads them when it is requested, and a project whose files do not load
+is `409 project_load_failed`, with no job started. `down` and `restart` work from container labels
+and need no files.
+
+It returns:
 - `400` if `op` is not one of those,
 - `503 {"error":"compose backend unavailable on this host"}` if the compose backend failed to
   initialise at startup (the agent deliberately keeps running in that case — the read-only fleet
   and container lifecycle still work),
 - `404` if the project is neither in the registry nor currently running,
+- `409 project_not_operable` / `self_project` if the op is not in the project's `allowed_ops`
+  (checked before the `503`: retrying cannot fix a refusal),
+- `503 self_identity_unavailable` if the container list needed to decide that failed,
 - `202` otherwise.
 
 `down` never removes volumes. `update` runs the stack-update engine (next section).
@@ -216,7 +311,9 @@ failure.
 the running containers.
 
 **Copy** duplicates a project on the *same* host under a new name, returning `409` if that name
-already exists and `404` if the source is unknown.
+already exists, `404` if the source is unknown, `400 invalid_project_name`, and `409
+project_not_editable` / `self_project` when the source cannot be read or either name is the
+agent's own.
 
 Bundle reads are deliberately forgiving: a compose file the agent cannot read (an
 externally-provisioned stack living outside `$COMPOSE_ROOT`) is skipped with a warning, and the
@@ -261,12 +358,28 @@ All three write coalesced frames (a burst of N queued log lines becomes one fram
    target cannot be resolved fails the update rather than silently redeploying the old pin and
    reporting success. For non-`registry` resolvers, an empty plan means *up to date* and the
    update stops cleanly — no needless force-recreate.
-3. **Apply.** Mutate the in-memory project **and** persist each tag to the on-host compose file
-   or `.env` (`tagwrite.go`), keeping the previous value per service. If persistence fails, the
-   already-written tags are reverted and the update fails — running state must never get ahead
-   of disk, or the next manual `compose up` would silently downgrade.
+3. **Persist.** Write each target into the project's files (`tagwrite.go`), then deploy the
+   project **as it now loads from disk** — so what runs is exactly what the next `compose up`
+   reads. The write:
+   - changes one token per service and nothing else: a literal image where compose takes it
+     from (the last compose file, and the last YAML document in it, that sets it); a
+     `${VAR}` image as the value of VAR's assignment in the env file compose takes it from,
+     keeping its quotes, inline comment and line ending — or a new `VAR=` line when nothing
+     declares it; a template whose only variable part is a trailing tag (`reg/app:${TAG}`,
+     `…:${TAG:-release}`) as the value of that tag variable;
+   - refuses, changing nothing, whatever cannot be written that way: an anchored or aliased
+     image, a tagged, block or escaped scalar, a merge key, a template that varies anything
+     but a trailing tag, a variable declared by a bare inheriting line or set in the agent's
+     own environment, a spelling that would not read back as the image;
+   - is **verified**: the project is reloaded with the agent's loader, every target must
+     resolve to its new image, and no other service, variable use, network or volume may
+     differ — a later assignment that shadows the write, or another service that shares the
+     variable, puts the original bytes back and fails the update.
+
+   Running state never gets ahead of disk: if persistence fails, nothing was written.
 4. **Pull, then `up --force-recreate`.** Both in-process, with progress streaming into the job
-   log. A pull failure reverts the persisted tags (nothing has been recreated yet).
+   log. A pull failure reverts the written files to their exact prior bytes (nothing has been
+   recreated yet).
 5. **Health-wait** (`healthwait.go`), in two stages:
    - *Swap detection* — wait for container IDs to change. Partial-update tolerant: it succeeds
      as soon as all containers have swapped, or once one has swapped plus a 20s grace for the
@@ -277,7 +390,9 @@ All three write coalesced frames (a burst of N queued log lines becomes one fram
      stopped container. Containers with no shell (so no healthcheck can ever report) are
      excluded — see `DOCKER_HEALTH_EXCLUDES`.
 6. **Rollback on failure.** Dump the tail of each unhealthy container's logs into the job log,
-   revert the persisted tags for the affected services, redeploy them pinned to their
+   revert the persisted tags for the affected services — each file rebuilt from its original
+   bytes with only the kept services' edits, never by writing an old value back; a file changed
+   by hand since the update is left alone and reported — redeploy them pinned to their
    pre-update image IDs with `PullPolicy: never`, and re-health-wait to report whether the
    rollback itself came back healthy. Scope is `per-container` by default (only the unhealthy
    services roll back; healthy updated ones keep their new version) or `whole-stack` for a
@@ -407,6 +522,136 @@ provisioned by something else, its files are outside the agent's mount, and it i
 shares a path prefix is not "under" the root. It needs no migration and no persisted provenance
 flag, which is exactly why it is structural.
 
+**What the agent will do with a project, and why.** Every project in the fleet snapshot and in
+`GET /v1/projects` carries its capability from one function (`projectCapabilities`,
+`capability.go`), and every mutating endpoint enforces the same function, so a consumer keyed on
+what the agent advertises never offers an op the endpoint refuses:
+
+| Field | Meaning |
+|---|---|
+| `allowed_ops` | Sorted `POST /v1/projects/:name/op` values accepted now. Always present; `[]` means none. |
+| `operable` | `allowed_ops` includes the file-loading ops (`up`/`pull`/`recreate`/`update`). |
+| `managed` | The files can be read and rewritten here (edit, copy source). |
+| `ops_blocked` | Why `allowed_ops` is not every op, by priority: `self`, `invalid_name`, `outside_compose_root`, `control_path`. Absent when every op is allowed. |
+
+The rules, per op rather than per stack:
+
+- **`restart` and `down` do not read files** — compose rebuilds them from the containers' labels —
+  so they work on a stack outside `$COMPOSE_ROOT`. `up`/`pull`/`recreate`/`update` load the compose
+  model, so they need the files under the mount.
+- **The agent's own stack allows nothing**, wherever its files live, and its own container refuses
+  every verb: compose or the daemon would stop the container running the job, the process dies
+  mid-operation, and the host is left with no agent. Update the agent with whatever deployed it.
+  "Own" is keyed on the live containers' compose labels, not on a registry entry, so
+  re-registering a working dir cannot launder it.
+- **A name compose would normalise allows nothing** (`invalid_name`): compose lowercases the name
+  before `down`/`restart`, so `Docker-Agent` would act on `docker-agent`. Register and copy refuse
+  such a name with `400 invalid_project_name`.
+- **The control-path proxy** — the container `TRAEFIK_DOCKER_DNS` names — refuses `down` on its
+  stack and `stop`/`kill`/`remove` on the container: the agent would be alive but unreachable with
+  nothing able to start the proxy again. `restart`/`recreate`/`update` bring it back and are allowed.
+
+Self identity comes from `/proc/self/mountinfo` (the container ID) plus the container **list**
+(the compose project, and every container sharing the agent's network namespace, which is treated
+as self because Docker gives such a container the owner's mountinfo). There is no separate inspect
+and nothing waits under a lock: `GET /health/ready` reports the last published view in its `self`
+block and never gates on it. A mutating request takes a fresh bounded list first; if the agent knows
+its container ID but cannot list, the request is refused `503 self_identity_unavailable` rather
+than allowed blind. If mountinfo names no container (not running under Docker), nothing is
+protected by identity and readiness says so — that case cannot tell what to protect, and refusing
+every op would take the whole agent down with it. Container verbs resolve each target through the
+daemon (`inspect` → full ID), so a container named `db` is not the agent just because the agent's
+ID starts with `db`.
+
+| Refusal | Status | `code` |
+|---|---|---|
+| Op not in `allowed_ops` (non-self reason) | 409 | `project_not_operable` |
+| Any op, register, copy source/target on the agent's own project | 409 | `self_project` |
+| Copy of a project whose files are not visible | 409 | `project_not_editable` |
+| Container verb on the agent's own container | 409 | `self_container` |
+| `stop`/`kill`/`remove` on the control-path container | 409 | `control_path_container` |
+| Register/copy with a name compose would normalise, or longer than 255 bytes | 400 | `invalid_project_name` |
+| Register/copy onto an existing project without `replace:true` | 409 | `project_exists` |
+| Register: relative, or longer than 4096 bytes, `working_dir` | 400 | `invalid_working_dir` |
+| Register: a declared compose/env path escaping the working dir | 400 | `project_path_outside_working_dir` |
+| Register: an inline file path that is empty or has a >255-byte component | 400 | `invalid_file_path` |
+| Register: a path-only project under the root with no readable compose file | 400 | `compose_files_missing` |
+| Unknown project (op, copy source, bundle) | 404 | `unknown_project` |
+| Malformed body, or a required field missing | 400 | `invalid_body` |
+| Op not one of the six | 400 | `invalid_op` |
+| `health_timeout_s` / `swap_timeout_s` out of range | 400 | `invalid_budget` |
+| `override_image` not an image reference by docker's own grammar (`distribution/reference`), or an image ID (`sha256:…`) | 400 | `invalid_override_image` |
+| Register or copy while another change holds the project for longer than 10s | 409 | `project_busy` (`"retryable": true`, `holder`) |
+| Register or copy onto a working directory another registered project already has (symlinks resolved) | 409 | `working_dir_in_use` (`project`, `working_dir`) |
+| Op `services`: not a compose service name, or not a service of the project (for `down`/`restart`: no container carries it) | 400 | `unknown_service` (`service`) |
+| `up`/`recreate`/`pull`/`update`, whole or narrowed, on a project whose compose files do not load | 409 | `project_load_failed` (`working_dir`) |
+| Bulk `action` not one of start/stop/restart/kill/remove | 400 | `invalid_action` |
+| More than 100 distinct targets | 400 | `too_many_targets` |
+| An ambiguous, malformed, or >255-byte container reference | 400 | `invalid_target` |
+| Cancel of a job that is unknown or already finished | 409 | `job_not_cancellable` |
+| The container list or a target inspect failed | 503 | `self_identity_unavailable` |
+
+**Refusal semantics.** Every 4xx carries a `code`, and a coded 4xx is **final**: retrying the same
+request gets the same answer. The exceptions say so with `"retryable": true` — only
+`idempotency_key_in_flight`, whose answer is still coming, and `project_busy`, whose project is
+being changed by the job or request named in `holder`; a new retryable code is a contract change
+for every consumer (the test suite pins the set). A failure that is not the caller's — a request
+body that could not be read, a write that failed, the Docker daemon not answering — is a 5xx, and
+only `503 self_identity_unavailable` carries a code there. Refusals echo caller input clipped to 512
+bytes. Project refusals carry `working_dir`; container refusals
+carry `targets`. A bulk request naming any protected container is refused whole. The idempotency
+codes are under Idempotency-Key.
+
+---
+
+## API consumers
+
+| Consumer | Where | Uses |
+|---|---|---|
+| control-center | the router's `/api/docker/:node/*` proxy; the frontend's stack editor, copy and fleet pages | register (`replace:true` from the editor), copy, ops, container verbs; reads `allowed_ops` / `operable` / `managed` / `ops_blocked` and refusal `code`s |
+| Ansible | `plugins/module_utils/docker_agent_client.py` — the one client behind the `docker_agent_stack` module and `system_monitor` | register (`replace:true`), ops |
+| Test harness | control-center `tools/docker-agent-test` | every endpoint; asserts `409 project_exists` without `replace` |
+
+### Rollout order: consumers first, agents last
+
+A contract change ships to every consumer **before** any agent runs it. The changes are safe in
+that direction and only in that direction:
+
+- **A request field the agent now requires.** Registering onto an existing project needs
+  `"replace": true`. An old agent binds request bodies with `ShouldBindJSON` and no
+  `DisallowUnknownFields`, so it ignores `replace` — a new consumer works against it. An old
+  consumer against a new agent gets `409 project_exists` on every re-register: Ansible's re-run
+  of a deployed stack fails, and so does an editor save.
+- **Response fields the agent now adds** — `allowed_ops`, `operable`, `ops_blocked`, a refusal's
+  `code` and `retryable`. A consumer deployed first reads an old agent's responses without them,
+  so it must treat a missing field as *not reported*, never as a refusal or as "nothing allowed".
+- **`Idempotency-Key`** is optional. An old agent ignores the header, so a consumer that sends it
+  gets replay protection only once the agent is upgraded, and must not depend on it before then.
+- **`409 project_busy`** is new and retryable: a register or copy onto a project a job is
+  changing. A consumer should retry after the named holder finishes; one that does not yet know
+  the code surfaces it as an error, which is safe — nothing was written. It is never recorded
+  under an Idempotency-Key: the same key goes through once the project is free.
+- **`409 working_dir_in_use`** is new and final: two registry names for one directory are
+  refused. The project lock is keyed by the resolved directory, so a duplicate that predates the
+  rule still cannot interleave with its twin.
+- **`services` on an op** is new; an agent advertises it per project with `service_ops` on each
+  `GET /v1/projects` entry. An older agent ignores the field and acts on the WHOLE project, so a
+  consumer must check `service_ops` before sending it — not after. The job event carries
+  `services`, and `target` holds them comma-joined, which the controller already stores in
+  `docker_jobs.target`; a controller that wants the list as a list reads `services`.
+- **`/bundle` returns file contents verbatim** — every compose file and every project-level env
+  file the load reads. Neither may carry a secret inline: a secret reaches a stack through a
+  service's `env_file:` rendered from Bitwarden, which compose reads at `up` and `/bundle` never
+  returns. A secret in a compose file or the project `.env` is sent to whoever reads the bundle.
+- **`override_image` validation is stricter**: docker's reference grammar, and no image IDs. A
+  value control-api accepted and the old agent took (`traefik:`, `sha256:…`) is now `400
+  invalid_override_image`.
+
+So the order is: control-center (router and frontend, both sites) → the Ansible release
+(`docker_agent_client.py`, rolled out to the fleet) → the agents, host by host, through Ansible —
+the agent is never updated through its own API. The harness asserts the new refusal, so run it
+against an upgraded agent.
+
 ---
 
 ## Controller contract
@@ -487,6 +732,7 @@ on `/health/ready`.
 | `project_plan_test.go` | The plan-driven detection rule: a coupled stack whose driver is current reports *updated* even when a coupled dependency has its own newer upstream — and the converse when the driver does move. |
 | `movingtag_test.go` | Moving-tag recognition. |
 | `projects_managed_test.go` | `underComposeRoot` (including the prefix-but-not-subdirectory case), `mergeKnown`'s `managed` flag for owned vs external stacks, and `readBundle`'s graceful degradation on an unreadable compose file. |
+| `capability_test.go` | The mountinfo parser, self-view derivation (network-namespace dependents, control path by name/alias), the per-op capability table, the snapshot wire contract (`allowed_ops:[]`, `false` on the wire), and every refusal through the real routes and a real `dockerClient` against a fake Engine API — including the production `newApp` wiring, readiness under a hung daemon, list/inspect failure, and file-write-before-refusal. |
 | `logstream_test.go` | The line writer (including a line longer than any single read), `drainBatch` coalescing, and an end-to-end backlog-then-live delivery over a real WebSocket. |
 
 ### Suites that are not hermetic

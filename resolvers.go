@@ -26,9 +26,11 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
 	neturl "net/url"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -214,6 +216,14 @@ type registryResolver struct{ e *engine }
 func (r *registryResolver) kind() string { return "registry" }
 
 func (r *registryResolver) plan(ctx context.Context, project *types.Project, log func(string)) (map[string]string, error) {
+	// A service pinned to an image ID can be neither resolved nor pulled; say so
+	// before a pull fails on `sha256` as a repository name. Recovering it is an
+	// explicit override_image to the tag it should track.
+	for _, name := range slices.Sorted(maps.Keys(project.Services)) {
+		if img := project.Services[name].Image; isImageID(img) {
+			return nil, imageIDError(name, img)
+		}
+	}
 	ic := r.e.images
 	if ic == nil {
 		log("no image checker — pull-only update (no version resolution)")

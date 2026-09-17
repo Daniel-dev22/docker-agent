@@ -49,9 +49,14 @@ const (
 
 // JobRequest is the wire body that starts a job.
 //
-// Target is the single container id for a container-scoped op; Targets carries
-// the id list for a bulk op (Operation "container.bulk.<verb>"). Force/Timeout
-// are op options (remove force, stop/restart SIGTERM grace). Targets/Force/
+// Target is the single container reference for a container-scoped op; Targets
+// carries the references for a bulk op (Operation "container.bulk.<verb>"). Both
+// are DISPLAY values — what the caller asked for, for the job log. TargetIDs are
+// what the op acts on: the full IDs the handler resolved and checked, aligned with
+// Targets (or with Target for a single op), "" for a reference that named no
+// container. Acting on the reference instead would re-resolve it after the check,
+// and a reference can resolve differently the second time. Force/Timeout are op
+// options (remove force, stop/restart SIGTERM grace). Targets/TargetIDs/Force/
 // Timeout are NOT persisted to the controller — they live only on the in-memory
 // Job for the duration of the run.
 type JobRequest struct {
@@ -59,6 +64,7 @@ type JobRequest struct {
 	Project    string   `json:"project,omitempty"`
 	Target     string   `json:"target,omitempty"`
 	Targets    []string `json:"targets,omitempty"`
+	TargetIDs  []string `json:"-"`
 	Force      bool     `json:"force,omitempty"`
 	Timeout    *int     `json:"timeout,omitempty"`
 	TriggerKey string   `json:"trigger_key,omitempty"`
@@ -74,6 +80,10 @@ type JobRequest struct {
 	// the same amount, for a delay that happens once.
 	HealthTimeoutS int `json:"health_timeout_s,omitempty"`
 	SwapTimeoutS   int `json:"swap_timeout_s,omitempty"`
+	// Services narrows a compose op (up, recreate, pull, restart, down) to exactly
+	// these services — sorted, deduplicated, each a service of the project. Empty
+	// is the whole project. Not for update, which targets with OverrideService.
+	Services []string `json:"services,omitempty"`
 }
 
 // jobPublic carries the JSON-serializable fields of a Job, split out so
@@ -90,6 +100,9 @@ type jobPublic struct {
 	ErrorMsg    string    `json:"error,omitempty"`
 	LineCount   int       `json:"line_count"`
 	TriggerKey  string    `json:"trigger_key,omitempty"`
+	// Services a compose op was narrowed to (also joined into Target, for the
+	// controller's history). Empty: the whole project.
+	Services []string `json:"services,omitempty"`
 }
 
 // Job is one operation tracked through its lifecycle, with a bounded log ring
@@ -101,14 +114,16 @@ type jobPublic struct {
 type Job struct {
 	jobPublic
 
-	targets []string
-	force   bool
-	timeout *int
+	targets   []string
+	targetIDs []string
+	force     bool
+	timeout   *int
 	// Stack-update op params — in-memory, set at construction.
 	overrideImage   string
 	overrideService string
 	healthTimeoutS  int
 	swapTimeoutS    int
+	services        []string // compose ops: exactly these services; empty = all
 
 	mu          sync.Mutex
 	cancel      context.CancelFunc
