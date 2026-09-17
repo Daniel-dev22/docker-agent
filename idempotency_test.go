@@ -486,16 +486,19 @@ func TestIdempotencyCloseIsBounded(t *testing.T) {
 // already waiting on a locked database when shutdown starts must not stretch it —
 // close(), and the database close after it, return within close's budget.
 func TestIdempotencyShutdownIsBoundedWithAWriterMidAttempt(t *testing.T) {
+	const firstRetry = 400 * time.Millisecond
 	dir := t.TempDir()
 	e := newCapEnv(t, testSelfID, defaultContainers)
 	withIdempotency(t, e, dir)
 	store := e.a.idem
-	store.retryBase = 20 * time.Millisecond
+	store.retryBase = firstRetry
 	_, err := e.a.events.DB().Exec(`CREATE TRIGGER fail_record BEFORE UPDATE ON idempotency_keys BEGIN SELECT RAISE(ABORT, 'disk full'); END`)
 	must(t, err)
 	if r := e.doKeyed(t, http.MethodPost, "/v1/containers/gdrive-agent/stop", "k-mid", ""); r.status != http.StatusAccepted {
 		t.Fatalf("got %d", r.status)
 	}
+	// The answer is pending now, and its writer's first attempt is firstRetry away.
+	answered := time.Now()
 	e.waitJobs(t)
 
 	holder, err := sql.Open("sqlite", filepath.Join(dir, "events.sqlite")+"?_pragma=journal_mode(WAL)")
@@ -507,22 +510,12 @@ func TestIdempotencyShutdownIsBoundedWithAWriterMidAttempt(t *testing.T) {
 		VALUES ('POST', 'x', 'lock-holder', 'fp', 'in_flight', 0, 'other')`)
 	must(t, err)
 	defer tx.Rollback()
-	// The writer retried every few tens of milliseconds while the trigger failed
-	// it; its next attempt waits on the holder's lock before the trigger can run,
-	// holding a connection for as long as it waits. Nothing else here uses one.
-	db := e.a.events.DB()
-	var held time.Time
-	for wait := time.Now(); time.Since(held) < 100*time.Millisecond || held.IsZero(); time.Sleep(5 * time.Millisecond) {
-		switch {
-		case db.Stats().InUse == 0:
-			held = time.Time{}
-		case held.IsZero():
-			held = time.Now()
-		}
-		if time.Since(wait) > 5*time.Second {
-			t.Fatal("precondition: the writer never waited on the lock")
-		}
+	if since := time.Since(answered); since > firstRetry*3/4 {
+		t.Fatalf("precondition: the lock was taken %v after the answer, too close to the writer's first attempt at %v", since, firstRetry)
 	}
+	// The writer's first attempt starts at firstRetry and waits on the lock; shut
+	// down well inside that wait.
+	time.Sleep(time.Until(answered.Add(firstRetry + 200*time.Millisecond)))
 	store.mu.Lock()
 	pending := len(store.pending)
 	store.mu.Unlock()
