@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -95,6 +96,21 @@ func TestEveryRefusalCarriesACode(t *testing.T) {
 		}
 	})
 	e.waitJobs(t)
+}
+
+// TestRegisterWriteFailureIsTransient: once the request is validated, a failing
+// write is I/O — a 500 the caller may retry, never a coded refusal.
+func TestRegisterWriteFailureIsTransient(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	e := newCapEnv(t, testSelfID, defaultContainers)
+	must(t, os.Chmod(e.root, 0o555))
+	t.Cleanup(func() { _ = os.Chmod(e.root, 0o755) })
+	status, body := e.do(t, http.MethodPost, "/v1/projects", map[string]any{"name": "fresh", "files": map[string]string{"docker-compose.yml": "services: {}\n"}})
+	if status != http.StatusInternalServerError || body["code"] != nil {
+		t.Fatalf("got %d %v, want a code-less 500", status, body)
+	}
 }
 
 func mustJSON(t *testing.T, v any) string {

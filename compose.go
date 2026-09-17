@@ -165,15 +165,17 @@ func jobTimeoutDur(j *Job) *time.Duration {
 //     loader, and refuses an `include` or `extends.file` that escapes the root
 //     before the file is read. It also watches include events, so an included
 //     project's .env is checked before compose loads it.
-//  3. Service environment resolution — reading every service `env_file` — is
+//  3. A service `label_file` is read DURING the project load, and compose's dotenv
+//     parser quotes a line it cannot parse. So the raw model is loaded first
+//     (compose-go's LoadModel: includes and extends applied, paths resolved, no
+//     label or env file read) and every service label_file in it is confined.
+//  4. Service environment resolution — reading every service `env_file` — is
 //     deferred. After the load, every service env_file and label_file in the
-//     model is confined, and only then is the environment resolved.
+//     project is confined, and only then is the environment resolved.
 //
 // Not reachable from any hook compose-go exposes, and so not confined here: an
-// include's own `env_file` and a custom `project_directory`, and a service
-// `label_file` (compose reads it during the load, before the model can be walked).
-// Each can only surface content through a load ERROR's text; the model is never
-// used, since step 3 refuses a label_file outside the root.
+// include's own `env_file` and a custom include `project_directory`. Both are read
+// during include processing, before either the model or the project exists.
 func (b *composeBackend) loadProject(ctx context.Context, e ProjectEntry) (*types.Project, error) {
 	paths, err := resolveLoadPaths(e)
 	if err != nil {
@@ -185,6 +187,9 @@ func (b *composeBackend) loadProject(ctx context.Context, e ProjectEntry) (*type
 		}
 	}
 	guard := newLoadGuard(b.root, e.WorkingDir, b.remoteLoaders())
+	if err := b.confineModelLabelFiles(ctx, e, paths, guard); err != nil {
+		return nil, err
+	}
 	project, err := b.base.LoadProject(ctx, api.ProjectLoadOptions{
 		ProjectName: e.Name,
 		ConfigPaths: paths.config,
@@ -216,6 +221,56 @@ func (b *composeBackend) loadProject(ctx context.Context, e ProjectEntry) (*type
 		}
 	}
 	return project.WithServicesEnvironmentResolved(false)
+}
+
+// confineModelLabelFiles loads the raw model with the same files, environment and
+// guard as the real load, and confines every service label_file before compose
+// would read one.
+func (b *composeBackend) confineModelLabelFiles(ctx context.Context, e ProjectEntry, paths loadPaths, guard *loadGuard) error {
+	fns := []cli.ProjectOptionsFn{
+		cli.WithWorkingDirectory(e.WorkingDir),
+		cli.WithOsEnv,
+		cli.WithEnvFiles(paths.env...),
+		cli.WithDotEnv,
+		cli.WithName(e.Name),
+		cli.WithResourceLoader(guard),
+		cli.WithLoadOptions(func(o *loader.Options) { o.Listeners = append(o.Listeners, guard.listen) }),
+	}
+	for _, r := range b.remoteLoaders() {
+		fns = append(fns, cli.WithResourceLoader(r))
+	}
+	opts, err := cli.NewProjectOptions(paths.config, fns...)
+	if err != nil {
+		return err
+	}
+	model, err := opts.LoadModel(ctx)
+	if v := guard.violation(); v != nil {
+		return v
+	}
+	if err != nil {
+		return err
+	}
+	services, _ := model["services"].(map[string]any)
+	for _, raw := range services {
+		svc, _ := raw.(map[string]any)
+		var files []any
+		switch v := svc["label_file"].(type) {
+		case []any:
+			files = v
+		case string:
+			files = []any{v}
+		}
+		for _, f := range files {
+			path, ok := f.(string)
+			if !ok {
+				continue
+			}
+			if err := confinePath(absAgainst(e.WorkingDir, path), b.root); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // remoteLoaders are compose's own git and OCI loaders: a reference either accepts

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -143,6 +144,40 @@ func TestProjectLoadIsConfined(t *testing.T) {
 		})
 		_, err := l.cb.loadProject(ctx, ProjectEntry{Name: "svcenv", WorkingDir: dir})
 		refused(t, err)
+	})
+	// Compose's dotenv parser quotes a line it cannot parse: the refusal must come
+	// before any read, not after a load error has already quoted the secret.
+	unparsable := filepath.Join(l.outside, "unparsable")
+	must(t, os.WriteFile(unparsable, []byte(loadSecret+" !@#\n"), 0o600))
+	t.Run("service-env-file-outside-unparsable", func(t *testing.T) {
+		dir := l.project(t, "svcenvbad", map[string]string{
+			"compose.yaml": "services:\n  app:\n    image: alpine\n    env_file: " + unparsable + "\n",
+		})
+		_, err := l.cb.loadProject(ctx, ProjectEntry{Name: "svcenvbad", WorkingDir: dir})
+		refused(t, err)
+	})
+	t.Run("service-label-file-outside-unparsable", func(t *testing.T) {
+		for i, form := range []string{"label_file: " + unparsable, "label_file:\n      - " + unparsable} {
+			name := fmt.Sprintf("svclabel%d", i)
+			dir := l.project(t, name, map[string]string{
+				"compose.yaml": "services:\n  app:\n    image: alpine\n    " + form + "\n",
+			})
+			_, err := l.cb.loadProject(ctx, ProjectEntry{Name: name, WorkingDir: dir})
+			refused(t, err)
+		}
+	})
+	t.Run("service-label-file-inside-is-applied", func(t *testing.T) {
+		dir := l.project(t, "svclabelok", map[string]string{
+			"compose.yaml": "services:\n  app:\n    image: alpine\n    label_file: app.labels\n",
+			"app.labels":   "com.example.team=platform\n",
+		})
+		p, err := l.cb.loadProject(ctx, ProjectEntry{Name: "svclabelok", WorkingDir: dir})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.Services["app"].Labels["com.example.team"] != "platform" {
+			t.Fatalf("a confined label_file must still apply: %v", p.Services["app"].Labels)
+		}
 	})
 	t.Run("service-env-file-inside-is-resolved", func(t *testing.T) {
 		dir := l.project(t, "svcenvok", map[string]string{
