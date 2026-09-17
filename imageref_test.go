@@ -180,9 +180,15 @@ func TestSetEnvVarRefusesAMultilineValueAndLeavesTheFileIntact(t *testing.T) {
 	if err := os.WriteFile(envPath, []byte(original), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	entry := ProjectEntry{Name: "p", WorkingDir: dir}
+	if err := os.WriteFile(filepath.Join(dir, "compose.yaml"), []byte("services:\n  app:\n    image: ${IMAGE}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	paths, err := resolveLoadPaths(ProjectEntry{Name: "p", WorkingDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	if _, err := setEnvVar(entry, "IMAGE", "reg/app:v2\nINJECTED=yes"); err == nil {
+	if _, err := setEnvVar(paths, dir, "IMAGE", "reg/app:v2\nINJECTED=yes"); err == nil {
 		t.Error("a value with a newline must be refused")
 	}
 	got, err := os.ReadFile(envPath)
@@ -198,7 +204,7 @@ func TestSetEnvVarRefusesAMultilineValueAndLeavesTheFileIntact(t *testing.T) {
 
 	// Positive control: a legitimate value still writes, so the refusal above is
 	// the guard working rather than setEnvVar being broken.
-	if _, err := setEnvVar(entry, "IMAGE", "reg/app:v2"); err != nil {
+	if _, err := setEnvVar(paths, dir, "IMAGE", "reg/app:v2"); err != nil {
 		t.Fatalf("a valid value must still be written: %v", err)
 	}
 	after, _ := os.ReadFile(envPath)

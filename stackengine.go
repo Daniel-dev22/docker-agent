@@ -512,8 +512,8 @@ func applyImages(project *types.Project, targets map[string]string) {
 // failure is fatal: returning an error lets the caller revert the partial writes and
 // fail the update, rather than deploy a tag that disk would revert on the next
 // `compose up`. The returned map holds whatever was written before the failure.
-func (e *engine) persistTargets(j *Job, entry ProjectEntry, targets map[string]string) (map[string]string, error) {
-	old := map[string]string{}
+func (e *engine) persistTargets(j *Job, entry ProjectEntry, targets map[string]string) (map[string]priorImage, error) {
+	old := map[string]priorImage{}
 	for svc, img := range targets {
 		prev, err := setServiceImage(entry, svc, img)
 		if err != nil {
@@ -526,9 +526,9 @@ func (e *engine) persistTargets(j *Job, entry ProjectEntry, targets map[string]s
 
 // revertDisk restores each persisted service's prior on-disk image (pull-failure
 // path, and the per-service half of a rollback).
-func (e *engine) revertDisk(j *Job, entry ProjectEntry, diskOld map[string]string) {
+func (e *engine) revertDisk(j *Job, entry ProjectEntry, diskOld map[string]priorImage) {
 	for svc, prev := range diskOld {
-		if _, err := setServiceImage(entry, svc, prev); err != nil {
+		if err := restoreServiceImage(entry, svc, prev); err != nil {
 			j.appendLine(fmt.Sprintf("warn: revert %s tag failed: %v", svc, err))
 		}
 	}
@@ -548,7 +548,7 @@ func (e *engine) revertDisk(j *Job, entry ProjectEntry, diskOld map[string]strin
 // rollback is detached from cancellation entirely (WithoutCancel) and given its own
 // bounded deadline: it is the safety action, and it must be allowed to finish even
 // when the operator cancelled or the op budget ran out.
-func (e *engine) rollback(parentCtx context.Context, j *Job, entry ProjectEntry, meta resolveMeta, base projectBaseline, scope []string, diskOld map[string]string, fleetTrigger func()) {
+func (e *engine) rollback(parentCtx context.Context, j *Job, entry ProjectEntry, meta resolveMeta, base projectBaseline, scope []string, diskOld map[string]priorImage, fleetTrigger func()) {
 	if len(scope) == 0 {
 		j.appendLine("rollback: no services in scope")
 		return
@@ -574,7 +574,7 @@ func (e *engine) rollback(parentCtx context.Context, j *Job, entry ProjectEntry,
 	// the rollback (healthy updated services keep their new persisted tags).
 	for _, svc := range scope {
 		if prev, ok := diskOld[svc]; ok {
-			if _, err := setServiceImage(entry, svc, prev); err != nil {
+			if err := restoreServiceImage(entry, svc, prev); err != nil {
 				j.appendLine(fmt.Sprintf("warn: revert %s tag failed: %v", svc, err))
 			}
 		}

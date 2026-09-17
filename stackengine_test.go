@@ -179,8 +179,8 @@ func TestSetServiceImageLiteralAndVar(t *testing.T) {
 
 	// Literal rewrite.
 	old, err := setServiceImage(entry, "traefik", "traefik:v3.1")
-	if err != nil || old != "traefik:v3.0" {
-		t.Fatalf("literal old=%q err=%v", old, err)
+	if err != nil || old.literal != "traefik:v3.0" {
+		t.Fatalf("literal old=%+v err=%v", old, err)
 	}
 	data, _ := os.ReadFile(compose)
 	if !contains(string(data), "traefik:v3.1") {
@@ -189,8 +189,8 @@ func TestSetServiceImageLiteralAndVar(t *testing.T) {
 
 	// Var rewrite goes to .env, leaves the ${VAR} scalar intact.
 	old, err = setServiceImage(entry, "immich", "ghcr.io/immich-app/immich:v2.0.0")
-	if err != nil || old != "ghcr.io/immich-app/immich:v1.0.0" {
-		t.Fatalf("var old=%q err=%v", old, err)
+	if err != nil || old.env == nil || old.env.line != "IMMICH_IMAGE=ghcr.io/immich-app/immich:v1.0.0" {
+		t.Fatalf("var old=%+v err=%v", old, err)
 	}
 	edata, _ := os.ReadFile(env)
 	if !contains(string(edata), "IMMICH_IMAGE=ghcr.io/immich-app/immich:v2.0.0") || !contains(string(edata), "OTHER=keep") {
