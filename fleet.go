@@ -42,14 +42,15 @@ func newFleetHub(a *app) *fleetHub {
 		// container's real CPU quota. The container list is one bounded Engine API call.
 		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
+		startedAt := time.Now()
 		summaries, err := a.docker.listContainers(cctx)
 		if err != nil {
-			a.self.observeFailed(err)
+			a.self.observeFailed(err, startedAt)
 			return fleetEnvelope{}, err
 		}
 		// The same list that feeds the frame refreshes self identity, so the flags a
 		// consumer reads were derived from exactly the containers it is shown.
-		view := a.self.observe(summaries)
+		view := a.self.observe(summaries, startedAt)
 		containers, projects := snapshotFrom(summaries, view)
 		// Stamp cached image-outdated results onto containers + roll up to
 		// projects. The checks come from the imageChecker's slow capped

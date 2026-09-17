@@ -106,55 +106,53 @@ func (a *app) startBackgroundWorkers(ctx context.Context) {
 func (a *app) enrichProjectsOnce(ctx context.Context) {
 	sctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
+	startedAt := time.Now()
 	summaries, err := a.docker.listContainers(sctx)
 	if err != nil {
-		a.self.observeFailed(err)
+		a.self.observeFailed(err, startedAt)
 		slog.Warn("project enrichment skipped — snapshot failed", "error", err)
 		return
 	}
 	// Publish self identity from this first list so readiness shows it before any
 	// dashboard has asked for a snapshot.
-	a.self.observe(summaries)
+	a.self.observe(summaries, startedAt)
 	a.projects.enrichFromLive(groupComposeProjects(summaries))
 }
 
 // selfListTimeout bounds the container list a mutating request takes to learn what
-// it must not touch. It is derived from the request context, never held under a
-// lock, and a failure is a 503 the caller can retry.
-const selfListTimeout = 5 * time.Second
+// it must not touch, and the target inspects of a container verb. It is derived
+// from the request context, never held under a lock, and a failure is a 503 the
+// caller can retry. A variable only so a test can shorten it.
+var selfListTimeout = 5 * time.Second
 
-// observeNow takes a fresh bounded container list and republishes self identity
-// from it.
+// observeNow takes a fresh bounded container list and publishes self identity from
+// it (unless a list that started later already has).
 func (a *app) observeNow(ctx context.Context) ([]container.Summary, *selfView, error) {
 	if a.docker == nil {
 		return nil, nil, errors.New("docker client unavailable")
 	}
 	lctx, cancel := context.WithTimeout(ctx, selfListTimeout)
 	defer cancel()
+	startedAt := time.Now()
 	summaries, err := a.docker.listContainers(lctx)
 	if err != nil {
-		a.self.observeFailed(err)
+		a.self.observeFailed(err, startedAt)
 		return nil, nil, err
 	}
-	return summaries, a.self.observe(summaries), nil
+	return summaries, a.self.observe(summaries, startedAt), nil
 }
 
-// selfForMutation is the gate every mutating handler passes first. It returns the
-// fresh container list and self view, or writes a 503 and returns ok=false when the
-// agent knows which container it is but cannot see the current list — allowing
-// the request then would be allowing it blind.
-//
-// When mountinfo named no container (not running under Docker), there is nothing
-// to protect by identity: a list failure is reported in readiness, and the request
-// proceeds with whatever the list could not tell it (summaries and view nil).
+// selfForMutation is the gate every mutating handler passes first. It returns a
+// fresh container list and the self view derived from exactly that list, or writes
+// a 503 and returns ok=false. It never falls back to an earlier view: the request is
+// about to act on the daemon now, and a view from before the failure cannot show a
+// container recreated since. Every mutation needs the daemon anyway, so a failed
+// list costs a retry, not an op.
 func (a *app) selfForMutation(c *gin.Context) ([]container.Summary, *selfView, bool) {
 	summaries, view, err := a.observeNow(c.Request.Context())
 	if err != nil {
-		if a.self.known() {
-			refuseSelfUnavailable(c, err, nil)
-			return nil, nil, false
-		}
-		return nil, nil, true
+		refuseSelfUnavailable(c, err, nil)
+		return nil, nil, false
 	}
 	return summaries, view, true
 }

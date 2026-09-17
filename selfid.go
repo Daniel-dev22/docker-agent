@@ -87,6 +87,8 @@ func parseSelfContainerID(r io.Reader) (string, error) {
 // selfView is one derivation of self identity from one container list. Immutable
 // once published.
 type selfView struct {
+	// observedAt is when the list it was derived from STARTED: a slower list that
+	// began earlier describes an older state, however late it returns.
 	observedAt time.Time
 	// found: the container mountinfo names was in the list.
 	found bool
@@ -103,8 +105,11 @@ type selfView struct {
 	// cannot tell which of these containers it is, so all of them are self.
 	ambiguous []string
 	// controlPath is the container the agent's control-center traffic dials
-	// (TRAEFIK_DOCKER_DNS). Stopping it leaves the agent alive but unreachable,
-	// with nothing able to start it again.
+	// (TRAEFIK_DOCKER_DNS), matched by exact container name. Stopping it leaves the
+	// agent alive but unreachable, with nothing able to start it again. The name is
+	// the only thing a list can match on: the Engine API's container list returns
+	// no network aliases or DNS names (null on every network), so an alias match
+	// would silently never fire.
 	controlPath    *controlPathContainer
 	controlPathErr string
 }
@@ -137,11 +142,11 @@ func (v *selfView) isControlPathID(fullID string) bool {
 	return v != nil && v.controlPath != nil && fullID != "" && v.controlPath.id == fullID
 }
 
-// deriveSelfView computes self identity from one container list. selfID may be ""
-// (mountinfo unreadable): then nothing is self, but the control path is still
-// derived.
-func deriveSelfView(selfID, controlPathName string, summaries []container.Summary, now time.Time) *selfView {
-	v := &selfView{observedAt: now, ids: map[string]struct{}{}, projects: map[string]struct{}{}}
+// deriveSelfView computes self identity from one container list that started at
+// startedAt. selfID may be "" (mountinfo unreadable): then nothing is self, but the
+// control path is still derived — it needs only the list.
+func deriveSelfView(selfID, controlPathName string, summaries []container.Summary, startedAt time.Time) *selfView {
+	v := &selfView{observedAt: startedAt, ids: map[string]struct{}{}, projects: map[string]struct{}{}}
 	var ownNames []string
 	if selfID != "" {
 		v.ids[selfID] = struct{}{}
@@ -183,48 +188,23 @@ func deriveSelfView(selfID, controlPathName string, summaries []container.Summar
 	}
 	if controlPathName != "" {
 		for _, s := range summaries {
-			if !answersTo(s, controlPathName) {
+			if !hasName(s, controlPathName) {
 				continue
 			}
-			names := summaryNames(s)
-			name := controlPathName
-			if len(names) > 0 {
-				name = names[0]
-			}
-			v.controlPath = &controlPathContainer{id: s.ID, name: name, project: s.Labels[labelComposeProject]}
+			v.controlPath = &controlPathContainer{id: s.ID, name: controlPathName, project: s.Labels[labelComposeProject]}
 			break
 		}
 		if v.controlPath == nil {
-			v.controlPathErr = fmt.Sprintf("no container named or aliased %q", controlPathName)
+			v.controlPathErr = fmt.Sprintf("no container named %q", controlPathName)
 		}
 	}
 	return v
 }
 
-// answersTo reports whether a container resolves as dnsName on a docker network:
-// its container name, or an alias / DNS name on any network it is attached to.
-func answersTo(s container.Summary, dnsName string) bool {
+func hasName(s container.Summary, name string) bool {
 	for _, n := range summaryNames(s) {
-		if n == dnsName {
+		if n == name {
 			return true
-		}
-	}
-	if s.NetworkSettings == nil {
-		return false
-	}
-	for _, ep := range s.NetworkSettings.Networks {
-		if ep == nil {
-			continue
-		}
-		for _, a := range ep.Aliases {
-			if a == dnsName {
-				return true
-			}
-		}
-		for _, a := range ep.DNSNames {
-			if a == dnsName {
-				return true
-			}
 		}
 	}
 	return false
@@ -248,7 +228,7 @@ type selfIdentity struct {
 	controlPathName string
 
 	view        atomic.Pointer[selfView]
-	lastListErr atomic.Pointer[string]
+	lastListErr atomic.Pointer[listFailure]
 
 	logMu   sync.Mutex // guards lastLog only; never held across I/O
 	lastLog string
@@ -272,31 +252,73 @@ func newSelfIdentity(path, controlPathName string) *selfIdentity {
 	return s
 }
 
-// known reports whether the agent knows which container it is. When it does, a
-// mutating request that cannot see the current container list is refused rather
-// than allowed.
+// listFailure is a container list that failed, stamped with when it started.
+type listFailure struct {
+	startedAt time.Time
+	msg       string
+}
+
+// known reports whether the agent knows which container it is.
 func (s *selfIdentity) known() bool { return s != nil && s.containerID != "" }
 
-// observe derives and publishes a view from a fresh container list.
-func (s *selfIdentity) observe(summaries []container.Summary) *selfView {
+// protects reports whether anything is protected by what a container list shows:
+// the agent's own containers (needs the mountinfo ID) or its control-path proxy
+// (needs only the configured name). A request that cannot see the list while
+// either holds cannot be proven safe.
+func (s *selfIdentity) protects() bool {
+	return s != nil && (s.containerID != "" || s.controlPathName != "")
+}
+
+// observe derives a view from a container list that started at startedAt and
+// publishes it unless a list that started later has already published. The view
+// derived from THIS list is returned either way: a caller decides on the
+// containers it saw.
+func (s *selfIdentity) observe(summaries []container.Summary, startedAt time.Time) *selfView {
 	if s == nil {
 		return nil
 	}
-	v := deriveSelfView(s.containerID, s.controlPathName, summaries, time.Now())
-	s.view.Store(v)
-	s.lastListErr.Store(nil)
+	v := deriveSelfView(s.containerID, s.controlPathName, summaries, startedAt)
+	for {
+		old := s.view.Load()
+		if old != nil && old.observedAt.After(startedAt) {
+			return v
+		}
+		if s.view.CompareAndSwap(old, v) {
+			break
+		}
+	}
+	// A success clears only a failure that started no later than it did.
+	for {
+		f := s.lastListErr.Load()
+		if f == nil || f.startedAt.After(startedAt) || s.lastListErr.CompareAndSwap(f, nil) {
+			break
+		}
+	}
 	s.logTransition(v)
 	return v
 }
 
-// observeFailed records a container-list failure for readiness. The previous view
-// stays published: it is still the best description of what the agent last saw.
-func (s *selfIdentity) observeFailed(err error) {
+// observeFailed records a container-list failure (the list started at startedAt)
+// for readiness, unless a list that started later has already succeeded or
+// failed. The previous view stays published: it is still the best description of
+// what the agent last saw.
+func (s *selfIdentity) observeFailed(err error, startedAt time.Time) {
 	if s == nil || err == nil {
 		return
 	}
-	msg := err.Error()
-	s.lastListErr.Store(&msg)
+	f := &listFailure{startedAt: startedAt, msg: err.Error()}
+	if v := s.view.Load(); v != nil && v.observedAt.After(startedAt) {
+		return
+	}
+	for {
+		old := s.lastListErr.Load()
+		if old != nil && old.startedAt.After(startedAt) {
+			return
+		}
+		if s.lastListErr.CompareAndSwap(old, f) {
+			return
+		}
+	}
 }
 
 // current is the last published view (nil before the first list).
@@ -352,8 +374,8 @@ func (s *selfIdentity) status() map[string]any {
 	} else {
 		out["container_id"] = shortID(s.containerID)
 	}
-	if e := s.lastListErr.Load(); e != nil {
-		out["last_list_error"] = *e
+	if f := s.lastListErr.Load(); f != nil {
+		out["last_list_error"] = f.msg
 	}
 	v := s.view.Load()
 	if v == nil {

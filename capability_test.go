@@ -98,7 +98,6 @@ func TestParseSelfContainerID(t *testing.T) {
 
 type fakeContainer struct {
 	id, name, project, workingDir, networkMode string
-	aliases                                    []string
 }
 
 type fakeEngine struct {
@@ -110,8 +109,13 @@ type fakeEngine struct {
 	listErr    bool
 	listHang   chan struct{} // non-nil: the list blocks until closed or the request ends
 	inspectErr bool
-	lists      int
-	mutations  []string
+	// inspectErrFor fails only these references.
+	inspectErrFor map[string]bool
+	inspectDelay  time.Duration
+	inFlight      int
+	maxInFlight   int
+	lists         int
+	mutations     []string
 }
 
 var apiVersionPrefix = regexp.MustCompile(`^/v[0-9.]+`)
@@ -136,6 +140,12 @@ func (f *fakeEngine) mutationCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.mutations)
+}
+
+func (f *fakeEngine) mutationList() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.mutations...)
 }
 
 func (f *fakeEngine) serve(w http.ResponseWriter, r *http.Request) {
@@ -180,20 +190,33 @@ func (f *fakeEngine) serve(w http.ResponseWriter, r *http.Request) {
 				s.Labels[labelComposeWorkingDir] = c.workingDir
 			}
 			s.HostConfig.NetworkMode = c.networkMode
-			if len(c.aliases) > 0 {
-				s.NetworkSettings = &container.NetworkSettingsSummary{Networks: map[string]*network.EndpointSettings{
-					"traefik-network": {Aliases: c.aliases},
-				}}
-			}
+			// The real list endpoint returns Aliases/DNSNames null on every network
+			// (verified against Docker 29.7.2), so the fake never lists them.
+			s.NetworkSettings = &container.NetworkSettingsSummary{Networks: map[string]*network.EndpointSettings{
+				"traefik-network": {},
+			}}
 			out = append(out, s)
 		}
 		writeJSON(http.StatusOK, out)
 	case r.Method == http.MethodGet && strings.HasPrefix(path, "/containers/") && strings.HasSuffix(path, "/json"):
 		ref := strings.TrimSuffix(strings.TrimPrefix(path, "/containers/"), "/json")
 		f.mu.Lock()
-		fail := f.inspectErr
+		fail := f.inspectErr || f.inspectErrFor[ref]
+		delay := f.inspectDelay
 		cs := append([]fakeContainer(nil), f.containers...)
+		f.inFlight++
+		if f.inFlight > f.maxInFlight {
+			f.maxInFlight = f.inFlight
+		}
 		f.mu.Unlock()
+		defer func() {
+			f.mu.Lock()
+			f.inFlight--
+			f.mu.Unlock()
+		}()
+		if delay > 0 {
+			time.Sleep(delay)
+		}
 		if fail {
 			writeJSON(http.StatusInternalServerError, map[string]string{"message": "inspect timed out"})
 			return
@@ -222,6 +245,11 @@ func (f *fakeEngine) serve(w http.ResponseWriter, r *http.Request) {
 			if len(matches) == 1 {
 				hit = matches[0]
 			}
+			if len(matches) > 1 {
+				// The daemon answers an ambiguous prefix with InvalidParameter.
+				writeJSON(http.StatusBadRequest, map[string]string{"message": "multiple IDs found with provided prefix: " + ref})
+				return
+			}
 		}
 		if hit == nil {
 			writeJSON(http.StatusNotFound, map[string]string{"message": "No such container: " + ref})
@@ -234,6 +262,17 @@ func (f *fakeEngine) serve(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(path, "/containers/"):
 		f.mu.Lock()
 		f.mutations = append(f.mutations, r.Method+" "+path)
+		// A removed container is gone: a later reference to it resolves elsewhere.
+		if r.Method == http.MethodDelete {
+			ref := strings.TrimPrefix(path, "/containers/")
+			kept := f.containers[:0]
+			for _, c := range f.containers {
+				if c.id != ref && c.name != ref {
+					kept = append(kept, c)
+				}
+			}
+			f.containers = kept
+		}
 		f.mu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
 	default:
@@ -328,18 +367,19 @@ func doJSON(t *testing.T, r http.Handler, method, path string, body any) (int, m
 	return w.Code, out
 }
 
-func observed(t *testing.T, selfID string, cs []fakeContainer) *selfView {
-	t.Helper()
+func summariesOf(cs []fakeContainer) []container.Summary {
 	var summaries []container.Summary
 	for _, c := range cs {
 		s := container.Summary{ID: c.id, Names: []string{"/" + c.name}, Labels: map[string]string{labelComposeProject: c.project}}
 		s.HostConfig.NetworkMode = c.networkMode
-		if len(c.aliases) > 0 {
-			s.NetworkSettings = &container.NetworkSettingsSummary{Networks: map[string]*network.EndpointSettings{"n": {Aliases: c.aliases}}}
-		}
 		summaries = append(summaries, s)
 	}
-	return deriveSelfView(selfID, "traefik", summaries, time.Now())
+	return summaries
+}
+
+func observed(t *testing.T, selfID string, cs []fakeContainer) *selfView {
+	t.Helper()
+	return deriveSelfView(selfID, "traefik", summariesOf(cs), time.Now())
 }
 
 // --- the capability rule ---
@@ -376,16 +416,27 @@ func TestDeriveSelfView(t *testing.T) {
 			t.Fatalf("got %+v", v)
 		}
 	})
-	t.Run("control-path-by-alias", func(t *testing.T) {
-		cs := []fakeContainer{{id: testTraefikID, name: "proxy", project: "edge", aliases: []string{"traefik"}}}
-		if v := observed(t, testSelfID, cs); !v.isControlPathProject("edge") {
-			t.Fatalf("alias not matched: %+v", v.controlPath)
+	t.Run("control-path-is-the-exact-name-only", func(t *testing.T) {
+		cs := []fakeContainer{{id: testTraefikID, name: "traefik-proxy", project: "edge"}}
+		v := observed(t, testSelfID, cs)
+		if v.controlPath != nil || v.controlPathErr != `no container named "traefik"` {
+			t.Fatalf("a near name must not match: %+v / %q", v.controlPath, v.controlPathErr)
 		}
 	})
 	t.Run("control-path-missing-is-reported", func(t *testing.T) {
 		v := observed(t, testSelfID, base[:1])
 		if v.controlPath != nil || !strings.Contains(v.controlPathErr, "traefik") {
 			t.Fatalf("got %+v / %q", v.controlPath, v.controlPathErr)
+		}
+	})
+	t.Run("other-network-namespace-owners-are-not-self", func(t *testing.T) {
+		const other = "6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e"
+		cs := append(append([]fakeContainer{}, base...),
+			fakeContainer{id: other, name: "vpn-client", project: "vpn", networkMode: "container:" + testGdriveID},
+			fakeContainer{id: strings.Repeat("4", 64), name: "tailnet", project: "tailnet", networkMode: "container:gdrive-agent"})
+		v := observed(t, testSelfID, cs)
+		if v.isSelfID(other) || v.isSelfProject("vpn") || v.isSelfProject("tailnet") || len(v.ambiguous) != 0 {
+			t.Fatalf("only namespaces owned by the agent are self: %+v", v)
 		}
 	})
 	t.Run("no-mountinfo-id-still-derives-control-path", func(t *testing.T) {
@@ -421,6 +472,11 @@ func TestProjectCapabilities(t *testing.T) {
 		{"dotted-name", "my.stack", root + "/my.stack", v, []string{}, false, blockedInvalidName},
 		{"control-path-under-root", "traefik", root + "/traefik", v, []string{"pull", "recreate", "restart", "up", "update"}, true, blockedControlPath},
 		{"control-path-outside-root", "traefik", "/srv/containers/traefik", v, []string{"restart"}, false, blockedOutsideComposeRoot},
+		// The agent's own stack also runs the control-path proxy: self still wins.
+		{"self-that-is-also-control-path", "docker-agent", root + "/docker-agent", observed(t, testSelfID, []fakeContainer{
+			{id: testSelfID, name: "docker-agent", project: "docker-agent"},
+			{id: testTraefikID, name: "traefik", project: "docker-agent"},
+		}), []string{}, false, blockedSelf},
 		{"no-view", "docker-agent", root + "/docker-agent", nil, full, true, ""},
 	}
 	for _, c := range cases {

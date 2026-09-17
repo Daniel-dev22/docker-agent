@@ -150,13 +150,19 @@ func (e *engine) run(ctx context.Context, j *Job, onChange func(JobEvent), fleet
 
 // runContainerOp executes a single-container lifecycle verb on j.Target.
 func (e *engine) runContainerOp(ctx context.Context, j *Job, verb string, fleetTrigger func()) {
-	id := j.snapshot().Target
-	if id == "" {
-		j.markFailed("no target container")
+	ref := j.snapshot().Target
+	if len(j.targetIDs) != 1 {
+		j.markFailed("no checked target container")
 		return
 	}
-	j.appendLine(fmt.Sprintf("%s %s", verb, id))
-	if err := e.doContainerVerb(ctx, verb, id, j.force, j.timeout); err != nil {
+	j.appendLine(fmt.Sprintf("%s %s", verb, ref))
+	if j.targetIDs[0] == "" {
+		msg := "no such container: " + ref
+		j.appendLine("error: " + msg)
+		j.markFailed(msg)
+		return
+	}
+	if err := e.doContainerVerb(ctx, verb, j.targetIDs[0], j.force, j.timeout); err != nil {
 		j.appendLine("error: " + err.Error())
 		j.markFailed(err.Error())
 		return
@@ -170,10 +176,10 @@ func (e *engine) runContainerOp(ctx context.Context, j *Job, verb string, fleetT
 // one progress line per container and an aggregate result. The job fails if ANY
 // container op fails (partial-success is still surfaced line by line).
 func (e *engine) runBulk(ctx context.Context, j *Job, verb string, fleetTrigger func()) {
-	ids := j.targets
+	refs, ids := j.targets, j.targetIDs
 	total := len(ids)
-	if total == 0 {
-		j.markFailed("no target containers")
+	if total == 0 || len(refs) != total {
+		j.markFailed("no checked target containers")
 		return
 	}
 	j.appendLine(fmt.Sprintf("bulk %s on %d container(s) (concurrency %d)", verb, total, e.bulkConcurrency))
@@ -182,7 +188,8 @@ func (e *engine) runBulk(ctx context.Context, j *Job, verb string, fleetTrigger 
 	var wg sync.WaitGroup
 	var done, failed atomic.Int32
 
-	for _, id := range ids {
+	for i, id := range ids {
+		ref := refs[i]
 		wg.Go(func() { // Go 1.25 WaitGroup.Go
 			sem <- struct{}{}
 			defer func() { <-sem }()
@@ -190,16 +197,21 @@ func (e *engine) runBulk(ctx context.Context, j *Job, verb string, fleetTrigger 
 			if ctx.Err() != nil {
 				n := done.Add(1)
 				failed.Add(1)
-				j.appendLine(fmt.Sprintf("[%d/%d] %s %s: cancelled", n, total, verb, id))
+				j.appendLine(fmt.Sprintf("[%d/%d] %s %s: cancelled", n, total, verb, ref))
 				return
 			}
-			err := e.doContainerVerb(ctx, verb, id, j.force, j.timeout)
+			var err error
+			if id == "" {
+				err = fmt.Errorf("no such container")
+			} else {
+				err = e.doContainerVerb(ctx, verb, id, j.force, j.timeout)
+			}
 			n := done.Add(1)
 			if err != nil {
 				failed.Add(1)
-				j.appendLine(fmt.Sprintf("[%d/%d] %s %s: error: %v", n, total, verb, id, err))
+				j.appendLine(fmt.Sprintf("[%d/%d] %s %s: error: %v", n, total, verb, ref, err))
 			} else {
-				j.appendLine(fmt.Sprintf("[%d/%d] %s %s: ok", n, total, verb, id))
+				j.appendLine(fmt.Sprintf("[%d/%d] %s %s: ok", n, total, verb, ref))
 			}
 			fleetTrigger()
 		})

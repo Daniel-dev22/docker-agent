@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strings"
 
 	"github.com/compose-spec/compose-go/v2/loader"
 	"github.com/gin-gonic/gin"
@@ -49,12 +50,28 @@ func (c projectCapability) allows(op string) bool {
 // are allowed.
 func (c projectCapability) operable() bool { return c.allows(opComposeUpdate) }
 
-// validProjectName is compose's own rule. compose-go refuses any other name when a
-// project is loaded, and Down/Restart LOWERCASE it before acting — so "Docker-Agent"
-// would act on the project "docker-agent". A name only compose can reinterpret is a
-// name no op may run under.
+// validProjectName reports whether name is one compose uses unchanged: compose-go
+// refuses any other name when a project is loaded, and Down/Restart LOWERCASE it
+// before acting — so "Docker-Agent" would act on the project "docker-agent". A name
+// only compose can reinterpret is a name no op may run under.
+//
+// Compose is the authority: this is exactly `loader.NormalizeProjectName(name) ==
+// name` for a non-empty name, and TestValidProjectNameAgreesWithCompose fuzzes the
+// two against each other. NormalizeProjectName compiles a regexp on every call
+// (12.7µs, 31 allocs), and this runs once per project on every fleet snapshot; the
+// byte scan below is the same rule — every byte in [a-z0-9_-], the first not '_'
+// or '-' — with no allocation.
 func validProjectName(name string) bool {
-	return name != "" && loader.NormalizeProjectName(name) == name
+	if name == "" || name[0] == '_' || name[0] == '-' {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '_' && c != '-' {
+			return false
+		}
+	}
+	return true
 }
 
 // projectCapabilities is the ONE decision about a project. The fleet snapshot, GET
@@ -122,11 +139,11 @@ func refuseProjectOp(c *gin.Context, e ProjectEntry, composeRoot string, capa pr
 			"Deregister it and register the stack under a lowercase name.", e.Name, loader.NormalizeProjectName(e.Name))
 	case op == opComposeDown && capa.controlPath:
 		msg = fmt.Sprintf("%s runs this agent's control-path proxy: `down` would leave the agent unreachable "+
-			"with nothing able to start it again. restart, recreate and update are allowed.", e.Name)
+			"with nothing able to start it again. %s", e.Name, allowedSentence(capa.Allowed))
 	default:
 		msg = fmt.Sprintf("compose files for %s are at %s, outside docker-agent's compose root (%s): %s loads "+
-			"the compose files, which the agent cannot see. restart and down do not read files and are allowed.",
-			e.Name, e.WorkingDir, composeRoot, op)
+			"the compose files, which the agent cannot see. %s",
+			e.Name, e.WorkingDir, composeRoot, op, allowedSentence(capa.Allowed))
 	}
 	c.JSON(http.StatusConflict, gin.H{"error": msg, "code": "project_not_operable", "working_dir": e.WorkingDir})
 	return true
@@ -151,6 +168,15 @@ func refuseProjectEdit(c *gin.Context, e ProjectEntry, composeRoot string, capa 
 	return true
 }
 
+// allowedSentence states what IS allowed, from the same list the endpoint enforces,
+// so a refusal can never advertise an op that would itself be refused.
+func allowedSentence(allowed []string) string {
+	if len(allowed) == 0 {
+		return "No op is allowed on it."
+	}
+	return "Allowed: " + strings.Join(allowed, ", ") + "."
+}
+
 func refuseSelfProject(c *gin.Context, e ProjectEntry) {
 	c.JSON(http.StatusConflict, gin.H{
 		"error": fmt.Sprintf("%s is docker-agent's own stack: acting on it would stop or remove the agent mid-job, "+
@@ -168,10 +194,26 @@ func refuseInvalidName(c *gin.Context, name string) {
 	})
 }
 
+// refuseRelocationDeploy: a register that moves an existing project to a different
+// working dir must not deploy in the same request. The deploy would run `up` on
+// the NEW files against the project's live containers before the capability gate
+// had ever seen the new location — a stack the agent refuses to `up` in place (for
+// instance an Ansible-owned stack outside ComposeRoot) could be replaced by
+// re-registering it. Register without deploy, then `up` through the op endpoint.
+func refuseRelocationDeploy(c *gin.Context, e ProjectEntry, from string) {
+	c.JSON(http.StatusConflict, gin.H{
+		"error": fmt.Sprintf("%s already exists at %s: registering it at %s moves it, and a move cannot deploy in the "+
+			"same request. Register without deploy, then run `up` through POST /v1/projects/%s/op.",
+			e.Name, from, e.WorkingDir, e.Name),
+		"code":        "project_relocation_requires_separate_up",
+		"working_dir": from,
+	})
+}
+
 func refuseSelfUnavailable(c *gin.Context, err error, targets []string) {
 	body := gin.H{
-		"error": "cannot confirm this request does not target docker-agent itself: " + err.Error() +
-			". Retry once the Docker daemon answers.",
+		"error": "cannot confirm this request does not target docker-agent itself or its control-path proxy: " +
+			err.Error() + ". Retry once the Docker daemon answers.",
 		"code": "self_identity_unavailable",
 	}
 	if targets != nil {

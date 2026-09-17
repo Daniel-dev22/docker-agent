@@ -97,13 +97,17 @@ func TestReadBundleGraceful(t *testing.T) {
 	})
 
 	t.Run("readable-returns-content", func(t *testing.T) {
-		dir := t.TempDir()
+		root := t.TempDir()
+		dir := filepath.Join(root, "owned")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
 		body := "services:\n  app:\n    image: alpine\n"
 		if err := os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		e := ProjectEntry{Name: "owned", WorkingDir: dir, ComposeFiles: []string{"docker-compose.yml"}}
-		b, err := a.readBundle(e)
+		b, err := (&app{cfg: Config{ComposeRoot: root}}).readBundle(e)
 		if err != nil {
 			t.Fatal(err)
 		}

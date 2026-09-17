@@ -31,6 +31,7 @@ import (
 type composeBackend struct {
 	cli  command.Cli
 	base api.Compose // no per-job streams — used for LoadProject / queries only
+	root string      // ComposeRoot: every file a load reads must resolve under it
 }
 
 func newComposeBackend(cfg Config) (*composeBackend, error) {
@@ -54,7 +55,7 @@ func newComposeBackend(cfg Config) (*composeBackend, error) {
 	if err != nil {
 		return nil, fmt.Errorf("compose service: %w", err)
 	}
-	return &composeBackend{cli: dockerCli, base: base}, nil
+	return &composeBackend{cli: dockerCli, base: base, root: cfg.ComposeRoot}, nil
 }
 
 // serviceForJob returns an api.Compose whose progress events + Out/Err stream
@@ -150,6 +151,11 @@ func jobTimeoutDur(j *Job) *time.Duration {
 // loadProject parses + validates a project's compose files into a typed model.
 // Uses the base service (no per-job stream wiring needed for a pure load).
 func (b *composeBackend) loadProject(ctx context.Context, e ProjectEntry) (*types.Project, error) {
+	// compose echoes parse errors into the job log: a compose or env path resolving
+	// outside the root would make the load a way to read an arbitrary file.
+	if err := confineProjectFiles(e, b.root); err != nil {
+		return nil, err
+	}
 	return b.base.LoadProject(ctx, api.ProjectLoadOptions{
 		ProjectName: e.Name,
 		ConfigPaths: e.absComposeFiles(),

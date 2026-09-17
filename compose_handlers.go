@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
@@ -10,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/docker/docker/api/types/container"
 	"github.com/gin-gonic/gin"
 )
 
@@ -134,19 +137,35 @@ type projectListEntry struct {
 	OpsBlocked string   `json:"ops_blocked,omitempty"`
 }
 
-// handleListProjects takes a fresh list for the self view. If that fails, the last
-// published view still describes the agent's own container — its ID and labels
-// cannot change for this process's lifetime — so it is used when it found that
-// container; with no such view the capability cannot be stated, and saying
-// "operable" blind is the over-claim this list exists to prevent.
-func (a *app) handleListProjects(c *gin.Context) {
+// viewForRead is the self view a READ reports capability from. It takes a fresh
+// list; if that fails, the last published view is used only when it can still
+// state what is protected — it found the agent's own container (whose ID and labels
+// cannot change for this process's lifetime), or, with no mountinfo ID, it exists
+// at all. Otherwise it writes a 503 and returns ok=false: stating "operable" blind
+// is the over-claim these reads exist to prevent. Mutations never fall back — see
+// selfForMutation.
+func (a *app) viewForRead(c *gin.Context) (*selfView, bool) {
 	_, view, err := a.observeNow(c.Request.Context())
-	if err != nil {
-		view = a.self.current()
-		if a.self.known() && (view == nil || !view.found) {
-			refuseSelfUnavailable(c, err, nil)
-			return
-		}
+	if err == nil {
+		return view, true
+	}
+	view = a.self.current()
+	stale := view == nil && a.self.protects()
+	if view != nil && a.self.known() && !view.found {
+		stale = true
+	}
+	if stale {
+		refuseSelfUnavailable(c, err, nil)
+		return nil, false
+	}
+	return view, true
+}
+
+// handleListProjects reports each entry's capability (viewForRead).
+func (a *app) handleListProjects(c *gin.Context) {
+	view, ok := a.viewForRead(c)
+	if !ok {
+		return
 	}
 	entries := a.projects.list()
 	out := make([]projectListEntry, 0, len(entries))
@@ -194,10 +213,6 @@ func (a *app) handleRegisterProject(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "working_dir or files is required"})
 		return
 	}
-	_, view, proceed := a.selfForMutation(c)
-	if !proceed {
-		return
-	}
 	entry := ProjectEntry{
 		Name:         body.Name,
 		WorkingDir:   body.WorkingDir,
@@ -209,6 +224,19 @@ func (a *app) handleRegisterProject(c *gin.Context) {
 		// Inline files always land under ComposeRoot; decide on that directory.
 		entry.WorkingDir = filepath.Join(a.cfg.ComposeRoot, body.Name)
 	}
+	if !filepath.IsAbs(entry.WorkingDir) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "working_dir must be absolute", "working_dir": entry.WorkingDir})
+		return
+	}
+	entry.WorkingDir = filepath.Clean(entry.WorkingDir)
+	if err := validateDeclaredPaths(entry); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error(), "code": "project_path_outside_working_dir", "working_dir": entry.WorkingDir})
+		return
+	}
+	summaries, view, proceed := a.selfForMutation(c)
+	if !proceed {
+		return
+	}
 	// Every refusal happens BEFORE writeProjectFiles, which overwrites: a refused
 	// request must not have rewritten anything — least of all the agent's own
 	// compose file.
@@ -216,6 +244,12 @@ func (a *app) handleRegisterProject(c *gin.Context) {
 	if capa.Blocked == blockedSelf {
 		refuseSelfProject(c, entry)
 		return
+	}
+	if body.Deploy {
+		if from, moved := a.relocation(entry, summaries); moved {
+			refuseRelocationDeploy(c, entry, from)
+			return
+		}
 	}
 	if len(body.Files) == 0 && capa.Editable {
 		// A path-only register under ComposeRoot claims managed:true. Make that claim
@@ -251,6 +285,21 @@ func (a *app) handleRegisterProject(c *gin.Context) {
 		resp["job_id"] = j.ID
 	}
 	c.JSON(http.StatusOK, resp)
+}
+
+// relocation reports whether registering entry moves an existing project: the name
+// is already registered, or already running, with a different working dir. from is
+// that existing dir.
+func (a *app) relocation(entry ProjectEntry, summaries []container.Summary) (from string, moved bool) {
+	if e, ok := a.projects.get(entry.Name); ok {
+		return e.WorkingDir, filepath.Clean(e.WorkingDir) != entry.WorkingDir
+	}
+	for _, p := range groupComposeProjects(summaries) {
+		if p.Name == entry.Name {
+			return p.WorkingDir, filepath.Clean(p.WorkingDir) != entry.WorkingDir
+		}
+	}
+	return "", false
 }
 
 // composeDefaultFiles are the names compose auto-discovers in a working dir, in its
@@ -316,11 +365,24 @@ type projectBundle struct {
 	EnvFiles     []bundleFile `json:"env_files"`
 }
 
+// handleProjectBundle returns a project's file contents only when the project is
+// editable here. Any other known project gets the same typed, empty bundle an
+// unreadable one always did — the editor renders its "not editable, files live at
+// <working_dir>" notice from exactly that shape — and no content.
 func (a *app) handleProjectBundle(c *gin.Context) {
 	name := c.Param("name")
 	entry, ok := a.projects.get(name)
 	if !ok {
 		c.JSON(http.StatusNotFound, gin.H{"error": "unknown project: " + name})
+		return
+	}
+	view, ok := a.viewForRead(c)
+	if !ok {
+		return
+	}
+	if !a.capabilityOf(entry, view).Editable {
+		c.JSON(http.StatusOK, projectBundle{Name: entry.Name, WorkingDir: entry.WorkingDir,
+			ComposeFiles: []bundleFile{}, EnvFiles: []bundleFile{}})
 		return
 	}
 	bundle, err := a.readBundle(entry)
@@ -412,41 +474,43 @@ func (a *app) handleCopyProject(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
-// readBundle reads a project's compose + env file contents off disk. Unreadable
-// compose files are SKIPPED (logged), not fatal: an externally-provisioned stack
-// whose working dir is outside the agent's bind-mounted
-// ComposeRoot returns an empty/partial bundle + its working_dir, so the UI shows
-// its graceful "not editable, files live at <working_dir>" notice instead of a
-// raw 500. (Such stacks are also flagged managed:false up front — see mergeKnown —
-// and copy refuses them before reaching here.)
+// readBundle reads a project's compose + env file contents off disk. A file that
+// is unreadable, or that resolves (symlinks followed) outside ComposeRoot, is
+// SKIPPED and logged, never read: the bundle returns file content over the API, so
+// a registered path must not be a way to read an arbitrary file the container can
+// see. Callers gate on the project being editable first.
 func (a *app) readBundle(e ProjectEntry) (projectBundle, error) {
-	b := projectBundle{Name: e.Name, WorkingDir: e.WorkingDir}
-	for _, p := range e.absComposeFiles() {
+	b := projectBundle{Name: e.Name, WorkingDir: e.WorkingDir, ComposeFiles: []bundleFile{}, EnvFiles: []bundleFile{}}
+	read := func(p string) (string, bool) {
+		ok, err := confinedUnder(p, a.cfg.ComposeRoot)
+		if err != nil || !ok {
+			if err == nil || !errors.Is(err, fs.ErrNotExist) {
+				slog.Warn("compose bundle: skipping file outside the agent's compose root or unreadable",
+					"project", e.Name, "file", p, "error", err)
+			}
+			return "", false
+		}
 		data, err := os.ReadFile(p)
 		if err != nil {
-			slog.Warn("compose bundle: skipping unreadable file (likely outside the agent's ComposeRoot mount)",
-				"project", e.Name, "file", p, "error", err)
+			slog.Warn("compose bundle: skipping unreadable file", "project", e.Name, "file", p, "error", err)
+			return "", false
+		}
+		return string(data), true
+	}
+	for _, p := range e.absComposeFiles() {
+		if content, ok := read(p); ok {
+			b.ComposeFiles = append(b.ComposeFiles, bundleFile{Name: filepath.Base(p), Content: content})
+		}
+	}
+	seen := map[string]struct{}{}
+	for _, p := range envFilesToLoad(e) {
+		if _, dup := seen[p]; dup {
 			continue
 		}
-		b.ComposeFiles = append(b.ComposeFiles, bundleFile{Name: filepath.Base(p), Content: string(data)})
-	}
-	// Include any env files plus a conventional .env in the working dir.
-	envPaths := map[string]struct{}{}
-	for _, ef := range e.EnvFiles {
-		if !filepath.IsAbs(ef) && e.WorkingDir != "" {
-			ef = filepath.Join(e.WorkingDir, ef)
+		seen[p] = struct{}{}
+		if content, ok := read(p); ok {
+			b.EnvFiles = append(b.EnvFiles, bundleFile{Name: filepath.Base(p), Content: content})
 		}
-		envPaths[ef] = struct{}{}
-	}
-	if e.WorkingDir != "" {
-		envPaths[filepath.Join(e.WorkingDir, ".env")] = struct{}{}
-	}
-	for p := range envPaths {
-		data, err := os.ReadFile(p)
-		if err != nil {
-			continue // env files are optional
-		}
-		b.EnvFiles = append(b.EnvFiles, bundleFile{Name: filepath.Base(p), Content: string(data)})
 	}
 	return b, nil
 }

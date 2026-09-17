@@ -66,6 +66,7 @@ func newJob(id string, req JobRequest, cancel context.CancelFunc) *Job {
 			Target: req.Target, State: JobPending, TriggerKey: req.TriggerKey,
 		},
 		targets:         req.Targets,
+		targetIDs:       req.TargetIDs,
 		force:           req.Force,
 		timeout:         req.Timeout,
 		overrideImage:   req.OverrideImage,

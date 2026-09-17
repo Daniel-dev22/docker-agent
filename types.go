@@ -49,9 +49,14 @@ const (
 
 // JobRequest is the wire body that starts a job.
 //
-// Target is the single container id for a container-scoped op; Targets carries
-// the id list for a bulk op (Operation "container.bulk.<verb>"). Force/Timeout
-// are op options (remove force, stop/restart SIGTERM grace). Targets/Force/
+// Target is the single container reference for a container-scoped op; Targets
+// carries the references for a bulk op (Operation "container.bulk.<verb>"). Both
+// are DISPLAY values — what the caller asked for, for the job log. TargetIDs are
+// what the op acts on: the full IDs the handler resolved and checked, aligned with
+// Targets (or with Target for a single op), "" for a reference that named no
+// container. Acting on the reference instead would re-resolve it after the check,
+// and a reference can resolve differently the second time. Force/Timeout are op
+// options (remove force, stop/restart SIGTERM grace). Targets/TargetIDs/Force/
 // Timeout are NOT persisted to the controller — they live only on the in-memory
 // Job for the duration of the run.
 type JobRequest struct {
@@ -59,6 +64,7 @@ type JobRequest struct {
 	Project    string   `json:"project,omitempty"`
 	Target     string   `json:"target,omitempty"`
 	Targets    []string `json:"targets,omitempty"`
+	TargetIDs  []string `json:"-"`
 	Force      bool     `json:"force,omitempty"`
 	Timeout    *int     `json:"timeout,omitempty"`
 	TriggerKey string   `json:"trigger_key,omitempty"`
@@ -101,8 +107,9 @@ type jobPublic struct {
 type Job struct {
 	jobPublic
 
-	targets []string
-	force   bool
+	targets   []string
+	targetIDs []string
+	force     bool
 	timeout *int
 	// Stack-update op params — in-memory, set at construction.
 	overrideImage   string

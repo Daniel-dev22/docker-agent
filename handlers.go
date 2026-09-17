@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 )
@@ -57,18 +58,20 @@ func (a *app) handleContainerRemove(c *gin.Context)  { a.startContainerJob(c, op
 
 func (a *app) startContainerJob(c *gin.Context, op string) {
 	id := c.Param("id")
-	if id == "" {
+	if strings.TrimSpace(id) == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "container id is required"})
 		return
 	}
-	if a.refuseContainerTargets(c, op, []string{id}) {
+	refs, ids, ok := a.checkContainerTargets(c, op, []string{id})
+	if !ok {
 		return
 	}
 	var body containerOpBody
 	_ = c.ShouldBindJSON(&body) // optional; empty body leaves zero values
 	j := a.reg.start(context.Background(), JobRequest{
 		Operation:  op,
-		Target:     id,
+		Target:     refs[0],
+		TargetIDs:  ids,
 		Force:      body.Force,
 		Timeout:    body.Timeout,
 		TriggerKey: orDefault(body.TriggerKey, "ui"),
@@ -86,28 +89,34 @@ func (a *app) handleContainerBulk(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "action must be one of start|stop|restart|kill|remove"})
 		return
 	}
-	if len(body.IDs) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "ids must be non-empty"})
-		return
-	}
 	// All or nothing: a bulk request naming a protected container is refused whole,
 	// so no partial fan-out runs against the rest of the selection.
-	if a.refuseContainerTargets(c, opContainerBulkPrefix+body.Action, body.IDs) {
+	refs, ids, ok := a.checkContainerTargets(c, opContainerBulkPrefix+body.Action, body.IDs)
+	if !ok {
 		return
 	}
 	j := a.reg.start(context.Background(), JobRequest{
 		Operation:  opContainerBulkPrefix + body.Action,
-		Target:     fmt.Sprintf("%d container(s)", len(body.IDs)),
-		Targets:    body.IDs,
+		Target:     fmt.Sprintf("%d container(s)", len(ids)),
+		Targets:    refs,
+		TargetIDs:  ids,
 		Force:      body.Force,
 		Timeout:    body.Timeout,
 		TriggerKey: orDefault(body.TriggerKey, "ui"),
 	})
-	c.JSON(http.StatusAccepted, gin.H{"job_id": j.ID, "state": j.snapshot().State, "count": len(body.IDs)})
+	c.JSON(http.StatusAccepted, gin.H{"job_id": j.ID, "state": j.snapshot().State, "count": len(ids)})
 }
 
 // containerResolveConcurrency bounds the inspects one bulk request issues.
 const containerResolveConcurrency = 4
+
+// maxContainerTargets caps one request's distinct targets. Every target costs one
+// inspect before the job is accepted, all inside selfListTimeout (5s) at
+// containerResolveConcurrency (4): 100 targets are 25 rounds, ~1.25s at 50ms per
+// inspect on a Pi-class host — 4x headroom. The largest live host runs 15
+// containers (kd-nas01, 2026-09-17), so the cap is ~6x the real maximum and only
+// ever refuses a request that could not be one host's selection.
+const maxContainerTargets = 100
 
 // stopsContainer reports whether a verb leaves the container not running.
 func stopsContainer(op string) bool {
@@ -118,37 +127,83 @@ func stopsContainer(op string) bool {
 	return false
 }
 
-// refuseContainerTargets refuses a container verb aimed at a protected container
-// and returns true when it wrote a response. Every target is resolved by the
-// daemon's own authority (inspect → full ID), then compared by ID: a container
-// named `db` is not the agent just because the agent's ID starts with "db", and a
-// renamed agent is still the agent.
+// checkContainerTargets decides a container verb's targets and returns the
+// references (for the job log) and the full IDs the job must act on, aligned; or it
+// writes the response and returns ok=false.
+//
+// Every target is resolved by the daemon's own authority (inspect → full ID) and
+// the job then acts on that ID, never on the reference again: a reference resolved
+// twice can name a different container the second time (two "db" in one request,
+// the second resolving by ID prefix to the agent). Duplicate references and
+// references naming the same container collapse to one.
 //
 //   - self (the agent, or a container sharing its network namespace): every verb.
 //   - the control-path container: stop/kill/remove. start/restart bring it back.
-//   - a target the daemon cannot find is not refused — the op fails on its own.
-//   - an inspect or list failure is a 503: the request cannot be proven safe.
-func (a *app) refuseContainerTargets(c *gin.Context, op string, targets []string) bool {
+//   - a reference the daemon cannot find acts on nothing; the job reports it.
+//   - an ambiguous or malformed reference is the caller's error: 400 invalid_target.
+//   - a failed list or inspect is a 503: the request cannot be proven safe.
+func (a *app) checkContainerTargets(c *gin.Context, op string, targets []string) ([]string, []string, bool) {
+	refs := make([]string, 0, len(targets))
+	seen := make(map[string]struct{}, len(targets))
+	for _, t := range targets {
+		if strings.TrimSpace(t) == "" {
+			continue
+		}
+		if _, dup := seen[t]; dup {
+			continue
+		}
+		seen[t] = struct{}{}
+		refs = append(refs, t)
+	}
+	if len(refs) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "ids must be non-empty"})
+		return nil, nil, false
+	}
+	if len(refs) > maxContainerTargets {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": fmt.Sprintf("%d distinct targets exceeds the limit of %d per request; split the selection",
+				len(refs), maxContainerTargets),
+			"code": "too_many_targets",
+		})
+		return nil, nil, false
+	}
 	_, view, proceed := a.selfForMutation(c)
 	if !proceed {
-		return true
+		return nil, nil, false
 	}
-	if view == nil || (len(view.ids) == 0 && view.controlPath == nil) {
-		return false // nothing to protect by identity (see selfForMutation)
+	resolved, invalid, err := a.resolveContainerTargets(c.Request.Context(), refs)
+	if len(invalid) > 0 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "ambiguous or malformed container reference; use a full ID or an exact name",
+			"code":    "invalid_target",
+			"targets": invalid,
+		})
+		return nil, nil, false
 	}
-	ids, err := a.resolveContainerTargets(c.Request.Context(), targets)
 	if err != nil {
-		refuseSelfUnavailable(c, err, targets)
-		return true
+		refuseSelfUnavailable(c, err, refs)
+		return nil, nil, false
 	}
+	outRefs := make([]string, 0, len(refs))
+	ids := make([]string, 0, len(refs))
+	byID := make(map[string]struct{}, len(refs))
 	var selfT, controlT []string
-	for i, t := range targets {
-		switch {
-		case view.isSelfID(ids[i]):
-			selfT = append(selfT, t)
-		case stopsContainer(op) && view.isControlPathID(ids[i]):
-			controlT = append(controlT, t)
+	for i, ref := range refs {
+		id := resolved[i]
+		if id != "" {
+			if _, dup := byID[id]; dup {
+				continue
+			}
+			byID[id] = struct{}{}
 		}
+		switch {
+		case view.isSelfID(id):
+			selfT = append(selfT, ref)
+		case stopsContainer(op) && view.isControlPathID(id):
+			controlT = append(controlT, ref)
+		}
+		outRefs = append(outRefs, ref)
+		ids = append(ids, id)
 	}
 	if len(selfT) > 0 {
 		c.JSON(http.StatusConflict, gin.H{
@@ -157,49 +212,66 @@ func (a *app) refuseContainerTargets(c *gin.Context, op string, targets []string
 			"code":    "self_container",
 			"targets": selfT,
 		})
-		return true
+		return nil, nil, false
 	}
 	if len(controlT) > 0 {
 		c.JSON(http.StatusConflict, gin.H{
 			"error": fmt.Sprintf("refusing %s on the agent's control-path proxy: the agent would be left unreachable "+
-				"with nothing able to start it again. restart is allowed.", op),
+				"with nothing able to start it again. start and restart are allowed.", op),
 			"code":    "control_path_container",
 			"targets": controlT,
 		})
-		return true
+		return nil, nil, false
 	}
-	return false
+	return outRefs, ids, true
 }
 
-// resolveContainerTargets inspects each target (bounded concurrency, bounded time)
-// and returns full IDs aligned with targets ("" = no such container).
-func (a *app) resolveContainerTargets(ctx context.Context, targets []string) ([]string, error) {
+// resolveContainerTargets inspects each reference (at most
+// containerResolveConcurrency at once, all inside selfListTimeout) and returns full
+// IDs aligned with refs ("" = no such container), the references the daemon called
+// ambiguous or malformed, and the first other failure. Every target's outcome
+// counts: one failed inspect anywhere fails the whole request.
+func (a *app) resolveContainerTargets(ctx context.Context, refs []string) ([]string, []string, error) {
 	if a.docker == nil {
-		return nil, fmt.Errorf("docker client unavailable")
+		return nil, nil, fmt.Errorf("docker client unavailable")
 	}
 	rctx, cancel := context.WithTimeout(ctx, selfListTimeout)
 	defer cancel()
-	ids := make([]string, len(targets))
-	errs := make([]error, len(targets))
+	ids := make([]string, len(refs))
+	errs := make([]error, len(refs))
 	sem := make(chan struct{}, containerResolveConcurrency)
 	var wg sync.WaitGroup
-	for i, t := range targets {
-		if strings.TrimSpace(t) == "" {
-			continue // names no container
+spawn:
+	for i, ref := range refs {
+		// Take the slot BEFORE starting the goroutine, so a large request never holds
+		// more than containerResolveConcurrency goroutines; stop starting work once
+		// the deadline has passed.
+		select {
+		case sem <- struct{}{}:
+		case <-rctx.Done():
+			for k := i; k < len(refs); k++ {
+				errs[k] = rctx.Err()
+			}
+			break spawn
 		}
 		wg.Go(func() {
-			sem <- struct{}{}
 			defer func() { <-sem }()
-			ids[i], errs[i] = a.docker.resolveContainerID(rctx, t)
+			ids[i], errs[i] = a.docker.resolveContainerID(rctx, ref)
 		})
 	}
 	wg.Wait()
+	var invalid []string
+	var firstErr error
 	for i, err := range errs {
-		if err != nil {
-			return nil, fmt.Errorf("resolve container %q: %w", targets[i], err)
+		switch {
+		case err == nil:
+		case cerrdefs.IsInvalidArgument(err):
+			invalid = append(invalid, refs[i])
+		case firstErr == nil:
+			firstErr = fmt.Errorf("resolve container %q: %w", refs[i], err)
 		}
 	}
-	return ids, nil
+	return ids, invalid, firstErr
 }
 
 func orDefault(v, def string) string {
