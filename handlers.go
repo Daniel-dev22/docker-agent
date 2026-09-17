@@ -59,7 +59,7 @@ func (a *app) handleContainerRemove(c *gin.Context)  { a.startContainerJob(c, op
 func (a *app) startContainerJob(c *gin.Context, op string) {
 	id := c.Param("id")
 	if strings.TrimSpace(id) == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "container id is required"})
+		refuse(c, http.StatusBadRequest, "invalid_target", "container id is required", nil)
 		return
 	}
 	refs, ids, ok := a.checkContainerTargets(c, op, []string{id})
@@ -82,11 +82,11 @@ func (a *app) startContainerJob(c *gin.Context, op string) {
 func (a *app) handleContainerBulk(c *gin.Context) {
 	var body bulkOpBody
 	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		refuse(c, http.StatusBadRequest, "invalid_body", "invalid request body: "+echo(err.Error()), nil)
 		return
 	}
 	if !validBulkAction[body.Action] {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "action must be one of start|stop|restart|kill|remove"})
+		refuse(c, http.StatusBadRequest, "invalid_action", "action must be one of start|stop|restart|kill|remove", nil)
 		return
 	}
 	// All or nothing: a bulk request naming a protected container is refused whole,
@@ -156,15 +156,26 @@ func (a *app) checkContainerTargets(c *gin.Context, op string, targets []string)
 		refs = append(refs, t)
 	}
 	if len(refs) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "ids must be non-empty"})
+		refuse(c, http.StatusBadRequest, "invalid_body", "ids must be non-empty", nil)
 		return nil, nil, false
 	}
 	if len(refs) > maxContainerTargets {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": fmt.Sprintf("%d distinct targets exceeds the limit of %d per request; split the selection",
-				len(refs), maxContainerTargets),
-			"code": "too_many_targets",
-		})
+		refuse(c, http.StatusBadRequest, "too_many_targets",
+			fmt.Sprintf("%d distinct targets exceeds the limit of %d per request; split the selection",
+				len(refs), maxContainerTargets), nil)
+		return nil, nil, false
+	}
+	// A container name is at most 255 bytes and an ID 64: anything longer names
+	// nothing, and must not reach the daemon or an echo.
+	var tooLong []string
+	for _, r := range refs {
+		if len(r) > maxProjectNameLen {
+			tooLong = append(tooLong, r)
+		}
+	}
+	if len(tooLong) > 0 {
+		refuse(c, http.StatusBadRequest, "invalid_target",
+			fmt.Sprintf("container reference longer than %d bytes", maxProjectNameLen), gin.H{"targets": tooLong})
 		return nil, nil, false
 	}
 	_, view, proceed := a.selfForMutation(c)
@@ -173,11 +184,8 @@ func (a *app) checkContainerTargets(c *gin.Context, op string, targets []string)
 	}
 	resolved, invalid, err := a.resolveContainerTargets(c.Request.Context(), refs)
 	if len(invalid) > 0 {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error":   "ambiguous or malformed container reference; use a full ID or an exact name",
-			"code":    "invalid_target",
-			"targets": invalid,
-		})
+		refuse(c, http.StatusBadRequest, "invalid_target",
+			"ambiguous or malformed container reference; use a full ID or an exact name", gin.H{"targets": invalid})
 		return nil, nil, false
 	}
 	if err != nil {
@@ -206,21 +214,15 @@ func (a *app) checkContainerTargets(c *gin.Context, op string, targets []string)
 		ids = append(ids, id)
 	}
 	if len(selfT) > 0 {
-		c.JSON(http.StatusConflict, gin.H{
-			"error": fmt.Sprintf("refusing %s on docker-agent's own container: the agent would stop mid-job. "+
-				"The agent is managed by Ansible (docker-agent/deploy.yml).", op),
-			"code":    "self_container",
-			"targets": selfT,
-		})
+		refuse(c, http.StatusConflict, "self_container",
+			fmt.Sprintf("refusing %s on docker-agent's own container: the agent would stop mid-job. "+
+				"The agent is managed by Ansible (docker-agent/deploy.yml).", op), gin.H{"targets": selfT})
 		return nil, nil, false
 	}
 	if len(controlT) > 0 {
-		c.JSON(http.StatusConflict, gin.H{
-			"error": fmt.Sprintf("refusing %s on the agent's control-path proxy: the agent would be left unreachable "+
-				"with nothing able to start it again. start and restart are allowed.", op),
-			"code":    "control_path_container",
-			"targets": controlT,
-		})
+		refuse(c, http.StatusConflict, "control_path_container",
+			fmt.Sprintf("refusing %s on the agent's control-path proxy: the agent would be left unreachable "+
+				"with nothing able to start it again. start and restart are allowed.", op), gin.H{"targets": controlT})
 		return nil, nil, false
 	}
 	return outRefs, ids, true
@@ -268,7 +270,7 @@ spawn:
 		case cerrdefs.IsInvalidArgument(err):
 			invalid = append(invalid, refs[i])
 		case firstErr == nil:
-			firstErr = fmt.Errorf("resolve container %q: %w", refs[i], err)
+			firstErr = fmt.Errorf("resolve container %q: %w", echo(refs[i]), err)
 		}
 	}
 	return ids, invalid, firstErr

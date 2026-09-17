@@ -39,16 +39,16 @@ type composeOpBody struct {
 func (a *app) handleComposeOp(c *gin.Context) {
 	name := c.Param("name")
 	if name == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "project name is required"})
+		refuse(c, http.StatusBadRequest, "invalid_project_name", "project name is required", nil)
 		return
 	}
 	var body composeOpBody
 	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		refuse(c, http.StatusBadRequest, "invalid_body", "invalid request body: "+echo(err.Error()), nil)
 		return
 	}
 	if !projectOps[body.Op] {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "op must be one of up|down|pull|restart|recreate|update"})
+		refuse(c, http.StatusBadRequest, "invalid_op", "op must be one of up|down|pull|restart|recreate|update", nil)
 		return
 	}
 	// One fresh list serves both the live-project fallback and the self view, so the
@@ -62,7 +62,7 @@ func (a *app) handleComposeOp(c *gin.Context) {
 		entry, ok = a.projects.resolve(name, groupComposeProjects(summaries))
 	}
 	if !ok {
-		c.JSON(http.StatusNotFound, gin.H{"error": "unknown project: " + name})
+		refuse(c, http.StatusNotFound, "unknown_project", "unknown project: "+echo(name), nil)
 		return
 	}
 	// Refuse what can never run BEFORE anything that could create a job: a refusal
@@ -83,9 +83,9 @@ func (a *app) handleComposeOp(c *gin.Context) {
 	// silently ignoring — the caller asked for something and deserves to be told it
 	// was not honoured.
 	if !validBudgetSeconds(body.HealthTimeoutS) || !validBudgetSeconds(body.SwapTimeoutS) {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": fmt.Sprintf("health_timeout_s and swap_timeout_s must be between 0 and %d seconds (0 = use the project/node default)",
-				int(maxBudget/time.Second))})
+		refuse(c, http.StatusBadRequest, "invalid_budget",
+			fmt.Sprintf("health_timeout_s and swap_timeout_s must be between 0 and %d seconds (0 = use the project/node default)",
+				int(maxBudget/time.Second)), nil)
 		return
 	}
 	// An override image is written into the project's compose file or .env and then
@@ -94,9 +94,9 @@ func (a *app) handleComposeOp(c *gin.Context) {
 	// worse than a bad deadline: an unchecked value with a newline appends lines to
 	// the stack's .env, and compose honours every one of them on the next `up`.
 	if body.OverrideImage != "" && !validImageRef(body.OverrideImage) {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "override_image must be a plain image reference (registry/name:tag[@sha256:…]); " +
-				"whitespace, control characters and shell or interpolation metacharacters are refused"})
+		refuse(c, http.StatusBadRequest, "invalid_override_image",
+			"override_image must be a plain image reference (registry/name:tag[@sha256:…]); "+
+				"whitespace, control characters and shell or interpolation metacharacters are refused", nil)
 		return
 	}
 	j := a.reg.start(context.Background(), JobRequest{
@@ -192,25 +192,29 @@ type registerProjectBody struct {
 	EnvFiles     []string          `json:"env_files,omitempty"`
 	Files        map[string]string `json:"files,omitempty"`
 	Deploy       bool              `json:"deploy,omitempty"`
+	// Replace must be true to register onto a project that already exists (see
+	// refuseProjectExists). The Ansible module and the editor send it; a cross-host
+	// copy onto an existing name does not.
+	Replace bool `json:"replace,omitempty"`
 }
 
 func (a *app) handleRegisterProject(c *gin.Context) {
 	var body registerProjectBody
 	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		refuse(c, http.StatusBadRequest, "invalid_body", "invalid request body: "+echo(err.Error()), nil)
 		return
 	}
 	// Input first: a malformed request is a 400 whatever the capability would be.
 	if body.Name == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+		refuse(c, http.StatusBadRequest, "invalid_project_name", "name is required", nil)
 		return
 	}
-	if !validProjectName(body.Name) {
+	if !validProjectName(body.Name) || len(body.Name) > maxProjectNameLen {
 		refuseInvalidName(c, body.Name)
 		return
 	}
 	if len(body.Files) == 0 && body.WorkingDir == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "working_dir or files is required"})
+		refuse(c, http.StatusBadRequest, "invalid_body", "working_dir or files is required", nil)
 		return
 	}
 	entry := ProjectEntry{
@@ -224,13 +228,19 @@ func (a *app) handleRegisterProject(c *gin.Context) {
 		// Inline files always land under ComposeRoot; decide on that directory.
 		entry.WorkingDir = filepath.Join(a.cfg.ComposeRoot, body.Name)
 	}
-	if !filepath.IsAbs(entry.WorkingDir) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "working_dir must be absolute", "working_dir": entry.WorkingDir})
+	if !filepath.IsAbs(entry.WorkingDir) || len(entry.WorkingDir) > maxPathLen {
+		refuse(c, http.StatusBadRequest, "invalid_working_dir",
+			fmt.Sprintf("working_dir must be an absolute path of at most %d bytes", maxPathLen),
+			gin.H{"working_dir": entry.WorkingDir})
 		return
 	}
 	entry.WorkingDir = filepath.Clean(entry.WorkingDir)
 	if err := validateDeclaredPaths(entry); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error(), "code": "project_path_outside_working_dir", "working_dir": entry.WorkingDir})
+		refuse(c, http.StatusBadRequest, "project_path_outside_working_dir", err.Error(), gin.H{"working_dir": entry.WorkingDir})
+		return
+	}
+	if err := validateBundlePaths(body.Files); err != nil {
+		refuse(c, http.StatusBadRequest, "invalid_file_path", err.Error(), nil)
 		return
 	}
 	summaries, view, proceed := a.selfForMutation(c)
@@ -245,17 +255,15 @@ func (a *app) handleRegisterProject(c *gin.Context) {
 		refuseSelfProject(c, entry)
 		return
 	}
-	if body.Deploy {
-		if from, moved := a.relocation(entry, summaries); moved {
-			refuseRelocationDeploy(c, entry, from)
-			return
-		}
+	if existingDir, exists := a.existingProject(entry.Name, summaries); exists && !body.Replace {
+		refuseProjectExists(c, entry.Name, existingDir)
+		return
 	}
 	if len(body.Files) == 0 && capa.Editable {
 		// A path-only register under ComposeRoot claims managed:true. Make that claim
 		// true now, not an empty bundle discovered later.
 		if err := composeFilesPresent(entry); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error(), "working_dir": entry.WorkingDir})
+			refuse(c, http.StatusBadRequest, "compose_files_missing", err.Error(), gin.H{"working_dir": entry.WorkingDir})
 			return
 		}
 	}
@@ -265,7 +273,8 @@ func (a *app) handleRegisterProject(c *gin.Context) {
 	if len(body.Files) > 0 {
 		dir, written, err := writeProjectFiles(a.cfg.ComposeRoot, body.Name, body.Files)
 		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			// Paths were validated above, so what is left is I/O: transient.
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "write project files: " + echo(err.Error())})
 			return
 		}
 		entry.WorkingDir = dir
@@ -287,51 +296,18 @@ func (a *app) handleRegisterProject(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
-// relocation reports whether registering entry moves an existing project: the name
-// is already registered, or already running, with a different working dir. from is
-// that existing dir.
-func (a *app) relocation(entry ProjectEntry, summaries []container.Summary) (from string, moved bool) {
-	if e, ok := a.projects.get(entry.Name); ok {
-		return e.WorkingDir, filepath.Clean(e.WorkingDir) != entry.WorkingDir
+// existingProject reports whether name already exists: registered, or running as
+// containers labelled with that project. existingDir is its working dir.
+func (a *app) existingProject(name string, summaries []container.Summary) (existingDir string, exists bool) {
+	if e, ok := a.projects.get(name); ok {
+		return e.WorkingDir, true
 	}
 	for _, p := range groupComposeProjects(summaries) {
-		if p.Name == entry.Name {
-			return p.WorkingDir, filepath.Clean(p.WorkingDir) != entry.WorkingDir
+		if p.Name == name {
+			return p.WorkingDir, true
 		}
 	}
 	return "", false
-}
-
-// composeDefaultFiles are the names compose auto-discovers in a working dir, in its
-// own preference order.
-var composeDefaultFiles = []string{"compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"}
-
-// composeFilesPresent checks a path-only entry's compose files can be read: each
-// declared file, or — with none declared — one compose auto-discovery would find.
-func composeFilesPresent(e ProjectEntry) error {
-	readable := func(p string) bool {
-		f, err := os.Open(p)
-		if err != nil {
-			return false
-		}
-		defer f.Close()
-		st, err := f.Stat()
-		return err == nil && st.Mode().IsRegular()
-	}
-	if files := e.absComposeFiles(); len(files) > 0 {
-		for _, f := range files {
-			if !readable(f) {
-				return fmt.Errorf("compose file %s for %s is missing or unreadable", f, e.Name)
-			}
-		}
-		return nil
-	}
-	for _, name := range composeDefaultFiles {
-		if readable(filepath.Join(e.WorkingDir, name)) {
-			return nil
-		}
-	}
-	return fmt.Errorf("no compose file (%s) in %s for %s", strings.Join(composeDefaultFiles, ", "), e.WorkingDir, e.Name)
 }
 
 func (a *app) handleDeregisterProject(c *gin.Context) {
@@ -373,7 +349,7 @@ func (a *app) handleProjectBundle(c *gin.Context) {
 	name := c.Param("name")
 	entry, ok := a.projects.get(name)
 	if !ok {
-		c.JSON(http.StatusNotFound, gin.H{"error": "unknown project: " + name})
+		refuse(c, http.StatusNotFound, "unknown_project", "unknown project: "+echo(name), nil)
 		return
 	}
 	view, ok := a.viewForRead(c)
@@ -403,24 +379,24 @@ func (a *app) handleCopyProject(c *gin.Context) {
 	name := c.Param("name")
 	var body copyProjectBody
 	if err := c.ShouldBindJSON(&body); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		refuse(c, http.StatusBadRequest, "invalid_body", "invalid request body: "+echo(err.Error()), nil)
 		return
 	}
 	if body.NewName == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "new_name is required"})
+		refuse(c, http.StatusBadRequest, "invalid_project_name", "new_name is required", nil)
 		return
 	}
-	if !validProjectName(body.NewName) {
+	if !validProjectName(body.NewName) || len(body.NewName) > maxProjectNameLen {
 		refuseInvalidName(c, body.NewName)
 		return
 	}
-	if _, exists := a.projects.get(body.NewName); exists {
-		c.JSON(http.StatusConflict, gin.H{"error": "project already exists: " + body.NewName})
+	if existing, exists := a.projects.get(body.NewName); exists {
+		refuseProjectExists(c, body.NewName, existing.WorkingDir)
 		return
 	}
 	src, ok := a.projects.get(name)
 	if !ok {
-		c.JSON(http.StatusNotFound, gin.H{"error": "unknown project: " + name})
+		refuse(c, http.StatusNotFound, "unknown_project", "unknown project: "+echo(name), nil)
 		return
 	}
 	_, view, proceed := a.selfForMutation(c)
@@ -456,7 +432,7 @@ func (a *app) handleCopyProject(c *gin.Context) {
 	}
 	dir, written, err := writeProjectFiles(a.cfg.ComposeRoot, body.NewName, files)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "write project files: " + echo(err.Error())})
 		return
 	}
 	entry := ProjectEntry{Name: body.NewName, WorkingDir: dir, ComposeFiles: composeFileNames(written)}
@@ -497,17 +473,18 @@ func (a *app) readBundle(e ProjectEntry) (projectBundle, error) {
 		}
 		return string(data), true
 	}
-	for _, p := range e.absComposeFiles() {
+	// The same files a compose load reads (resolveLoadPaths), so the editor shows
+	// what the stack actually runs from.
+	paths, err := resolveLoadPaths(e)
+	if err != nil {
+		return b, nil // no compose file: an empty bundle, as before
+	}
+	for _, p := range paths.config {
 		if content, ok := read(p); ok {
 			b.ComposeFiles = append(b.ComposeFiles, bundleFile{Name: filepath.Base(p), Content: content})
 		}
 	}
-	seen := map[string]struct{}{}
-	for _, p := range envFilesToLoad(e) {
-		if _, dup := seen[p]; dup {
-			continue
-		}
-		seen[p] = struct{}{}
+	for _, p := range paths.env {
 		if content, ok := read(p); ok {
 			b.EnvFiles = append(b.EnvFiles, bundleFile{Name: filepath.Base(p), Content: content})
 		}
@@ -523,7 +500,10 @@ func writeProjectFiles(root, name string, files map[string]string) (string, []st
 		return "", nil, fmt.Errorf("compose root not configured")
 	}
 	if strings.ContainsAny(name, "/\\") || name == "." || name == ".." {
-		return "", nil, fmt.Errorf("invalid project name %q", name)
+		return "", nil, fmt.Errorf("invalid project name %q", echo(name))
+	}
+	if err := validateBundlePaths(files); err != nil {
+		return "", nil, err
 	}
 	dir := filepath.Join(root, name)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -531,10 +511,7 @@ func writeProjectFiles(root, name string, files map[string]string) (string, []st
 	}
 	var written []string
 	for rel, content := range files {
-		clean := strings.TrimPrefix(filepath.Clean("/"+rel), "/")
-		if clean == "" || clean == "." || strings.HasPrefix(clean, "..") {
-			return "", nil, fmt.Errorf("invalid file path %q", rel)
-		}
+		clean := cleanBundlePath(rel)
 		full := filepath.Join(dir, clean)
 		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 			return "", nil, err
@@ -545,6 +522,28 @@ func writeProjectFiles(root, name string, files map[string]string) (string, []st
 		written = append(written, clean)
 	}
 	return dir, written, nil
+}
+
+func cleanBundlePath(rel string) string {
+	return strings.TrimPrefix(filepath.Clean("/"+rel), "/")
+}
+
+// validateBundlePaths is the deterministic half of writing a bundle: every file
+// path stays inside the project dir and fits the filesystem. What fails after it
+// is I/O.
+func validateBundlePaths(files map[string]string) error {
+	for rel := range files {
+		clean := cleanBundlePath(rel)
+		if clean == "" || clean == "." || strings.HasPrefix(clean, "..") || len(clean) > maxPathLen {
+			return fmt.Errorf("invalid file path %q", echo(rel))
+		}
+		for _, part := range strings.Split(clean, "/") {
+			if len(part) > maxProjectNameLen {
+				return fmt.Errorf("invalid file path %q: a component exceeds %d bytes", echo(rel), maxProjectNameLen)
+			}
+		}
+	}
+	return nil
 }
 
 // composeFileNames filters a written-file list down to the compose YAML files,

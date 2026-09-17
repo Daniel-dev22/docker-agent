@@ -195,8 +195,9 @@ func TestIdempotencySurvivesRestart(t *testing.T) {
 	}
 	e1.waitJobs(t)
 	// A claim the "crashed" process never settled.
-	_, err := e1.a.events.DB().Exec(`INSERT INTO idempotency_keys (method, path, key, fingerprint, state, created_at_ns)
-		VALUES ('POST', '/v1/containers/gdrive-agent/stop', 'k-orphan', ?, 'in_flight', ?)`, bodyFingerprint(nil), time.Now().UnixNano())
+	_, err := e1.a.events.DB().Exec(`INSERT INTO idempotency_keys (method, path_sha, key, fingerprint, state, created_at_ns, proc)
+		VALUES ('POST', ?, 'k-orphan', ?, 'in_flight', ?, 'dead-process')`,
+		pathSHA("/v1/containers/gdrive-agent/stop"), bodyFingerprint(nil), time.Now().UnixNano())
 	must(t, err)
 	e1.a.events.close()
 
@@ -225,8 +226,8 @@ func TestIdempotencyPruneBounds(t *testing.T) {
 	tx, err := db.Begin()
 	must(t, err)
 	insert := func(key, state string, at time.Time) {
-		_, err := tx.Exec(`INSERT INTO idempotency_keys (method, path, key, fingerprint, state, status, body, created_at_ns)
-			VALUES ('POST', '/v1/x', ?, 'fp', ?, 202, '{}', ?)`, key, state, at.UnixNano())
+		_, err := tx.Exec(`INSERT INTO idempotency_keys (method, path_sha, key, fingerprint, state, status, body, created_at_ns, proc)
+			VALUES ('POST', 'x', ?, 'fp', ?, 202, '{}', ?, 'previous-process')`, key, state, at.UnixNano())
 		must(t, err)
 	}
 	for i := range 10 {
@@ -265,11 +266,11 @@ func TestIdempotencyPruneBounds(t *testing.T) {
 		tx, err := db.Begin()
 		must(t, err)
 		for i := range 5 {
-			_, err := tx.Exec(`INSERT INTO idempotency_keys (method, path, key, fingerprint, state, status, body, created_at_ns)
-				VALUES ('POST', '/v1/x', ?, 'fp', 'done', 202, '{}', ?)`, fmt.Sprintf("stale-%d", i), now.Add(-idempotencyWindow-time.Second).UnixNano())
+			_, err := tx.Exec(`INSERT INTO idempotency_keys (method, path_sha, key, fingerprint, state, status, body, created_at_ns, proc)
+				VALUES ('POST', 'x', ?, 'fp', 'done', 202, '{}', ?, 'previous-process')`, fmt.Sprintf("stale-%d", i), now.Add(-idempotencyWindow-time.Second).UnixNano())
 			must(t, err)
-			_, err = tx.Exec(`INSERT INTO idempotency_keys (method, path, key, fingerprint, state, status, body, created_at_ns)
-				VALUES ('POST', '/v1/x', ?, 'fp', 'done', 202, '{}', ?)`, fmt.Sprintf("fresh-%d", i), now.Add(-idempotencyWindow+time.Minute).UnixNano())
+			_, err = tx.Exec(`INSERT INTO idempotency_keys (method, path_sha, key, fingerprint, state, status, body, created_at_ns, proc)
+				VALUES ('POST', 'x', ?, 'fp', 'done', 202, '{}', ?, 'previous-process')`, fmt.Sprintf("fresh-%d", i), now.Add(-idempotencyWindow+time.Minute).UnixNano())
 			must(t, err)
 		}
 		must(t, tx.Commit())
@@ -303,13 +304,14 @@ func TestIdempotencyRowSize(t *testing.T) {
 	const rows = 1000
 	for i := range rows {
 		key := fmt.Sprintf("ansible-%s-%08d", strings.Repeat("f", 36), i)
-		_, _, err := s.claim(context.Background(), "POST", "/v1/projects/duplicacy-agent-api/op", key, strings.Repeat("a", 64))
+		scope := pathSHA("/v1/projects/duplicacy-agent-api/op")
+		_, _, err := s.claim(context.Background(), "POST", scope, key, strings.Repeat("a", 64))
 		must(t, err)
-		must(t, s.record(context.Background(), "POST", "/v1/projects/duplicacy-agent-api/op", key, 409, body))
+		must(t, s.record(context.Background(), pendingAnswer{method: "POST", pathSHA: scope, key: key, fp: strings.Repeat("a", 64), status: 409, body: body}))
 	}
 	perRow := float64(size()-before) / rows
 	t.Logf("%.0f bytes/row", perRow)
-	// idempotencyMaxRows' comment sizes the table from this figure (815 B/row).
+	// idempotencyMaxRows' comment sizes the table from this figure (856 B/row).
 	if perRow > 1024 {
 		t.Fatalf("%.0f bytes/row: re-derive idempotencyMaxRows", perRow)
 	}
@@ -419,15 +421,42 @@ func TestIdempotencyClaimSettledOnPanicAndRecordFailure(t *testing.T) {
 	_, err := db.Exec(`CREATE TRIGGER fail_record BEFORE UPDATE ON idempotency_keys
 		BEGIN SELECT RAISE(ABORT, 'disk full'); END`)
 	must(t, err)
-	t.Run("acted-but-unrecorded-stays-in-flight", func(t *testing.T) {
+	e.a.idem.retryBase = 20 * time.Millisecond
+	t.Run("acted-but-unrecorded-is-served-from-memory-then-lands", func(t *testing.T) {
 		r := e.doKeyed(t, http.MethodPost, "/v1/containers/gdrive-agent/stop", "k-acted", "")
 		if r.status != http.StatusAccepted {
 			t.Fatalf("got %d %s", r.status, r.body)
 		}
 		dup := e.doKeyed(t, http.MethodPost, "/v1/containers/gdrive-agent/stop", "k-acted", "")
-		if dup.status != http.StatusConflict || dup.code() != "idempotency_key_in_flight" {
-			t.Fatalf("a request that acted must not be re-run: %d %s", dup.status, dup.body)
+		if dup.status != r.status || !bytes.Equal(dup.body, r.body) || dup.replayed != "true" {
+			t.Fatalf("a retry must get the answer the request already gave: %d %s", dup.status, dup.body)
 		}
+		if n := idemRows(t, db, "key = 'k-acted' AND state = 'done'"); n != 0 {
+			t.Fatal("precondition: the durable write is still failing")
+		}
+		_, err := db.Exec(`DROP TRIGGER fail_record`)
+		must(t, err)
+		deadline := time.Now().Add(3 * time.Second)
+		for idemRows(t, db, "key = 'k-acted' AND state = 'done'") == 0 {
+			if time.Now().After(deadline) {
+				t.Fatal("the background writer never stored the answer")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		// A new process over the same database replays it from disk.
+		fresh, err := newIdempotencyStore(db)
+		must(t, err)
+		outcome, rec, err := fresh.claim(context.Background(), "POST", pathSHA("/v1/containers/gdrive-agent/stop"), "k-acted", bodyFingerprint(nil))
+		must(t, err)
+		if outcome != idemReplay || !bytes.Equal(rec.body, r.body) || rec.status != r.status {
+			t.Fatalf("after the write landed: outcome %v %d %s", outcome, rec.status, rec.body)
+		}
+		if n := e.eng.mutationCount(); n != 1 {
+			t.Fatalf("engine saw %d mutations, want 1", n)
+		}
+		_, err = db.Exec(`CREATE TRIGGER fail_record BEFORE UPDATE ON idempotency_keys
+			BEGIN SELECT RAISE(ABORT, 'disk full'); END`)
+		must(t, err)
 	})
 	t.Run("refusal-unrecorded-is-released", func(t *testing.T) {
 		must(t, e.a.projects.register(ProjectEntry{Name: "outside", WorkingDir: "/srv/containers/outside"}))

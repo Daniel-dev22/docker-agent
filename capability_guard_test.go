@@ -412,64 +412,85 @@ func TestRefusalTextNamesTheAllowedOps(t *testing.T) {
 
 // --- register: relocation, declared paths, compose presence ---
 
-func TestRegisterRelocationCannotDeploy(t *testing.T) {
+func TestRegisterOntoAnExistingProjectNeedsReplace(t *testing.T) {
 	e := newCapEnv(t, testSelfID, defaultContainers)
-	// traefik is Ansible-owned outside the root in this scenario.
+	// traefik: registered AND running. gdrive-agent: running only (no registry entry).
 	e.eng.set(func(f *fakeEngine) { f.containers[1].workingDir = "/srv/containers/traefik" })
 	must(t, e.a.projects.register(ProjectEntry{Name: "traefik", WorkingDir: "/srv/containers/traefik"}))
+	inline := map[string]string{"docker-compose.yml": "services: {}\n"}
 
-	status, body := e.do(t, http.MethodPost, "/v1/projects/traefik/op", map[string]any{"op": "up"})
-	if status != http.StatusConflict {
-		t.Fatalf("precondition: up in place is refused, got %d %v", status, body)
-	}
+	t.Run("new-name-without-replace", func(t *testing.T) {
+		status, body := e.do(t, http.MethodPost, "/v1/projects", map[string]any{"name": "brand-new", "files": inline})
+		if status != http.StatusOK {
+			t.Fatalf("got %d %v", status, body)
+		}
+	})
 
-	status, body = e.do(t, http.MethodPost, "/v1/projects",
-		map[string]any{"name": "traefik", "files": map[string]string{"docker-compose.yml": "services: {evil: {}}\n"}, "deploy": true})
-	if status != http.StatusConflict || body["code"] != "project_relocation_requires_separate_up" || body["working_dir"] != "/srv/containers/traefik" {
-		t.Fatalf("got %d %v", status, body)
+	refused := []struct {
+		name string
+		body map[string]any
+		dir  string
+	}{
+		{"registered-without-replace", map[string]any{"name": "traefik", "files": inline, "deploy": true}, "/srv/containers/traefik"},
+		{"registered-same-dir-without-replace", map[string]any{"name": "traefik", "working_dir": "/srv/containers/traefik"}, "/srv/containers/traefik"},
+		{"live-label-only-without-replace", map[string]any{"name": "gdrive-agent", "files": inline}, "/srv/containers/gdrive-agent"},
 	}
-	if _, err := os.Stat(filepath.Join(e.root, "traefik")); !os.IsNotExist(err) {
-		t.Fatalf("a refused relocation wrote files: %v", err)
+	for _, c := range refused {
+		t.Run(c.name, func(t *testing.T) {
+			status, body := e.do(t, http.MethodPost, "/v1/projects", c.body)
+			if status != http.StatusConflict || body["code"] != "project_exists" || body["working_dir"] != c.dir {
+				t.Fatalf("got %d %v", status, body)
+			}
+			if _, err := os.Stat(filepath.Join(e.root, c.body["name"].(string))); !os.IsNotExist(err) {
+				t.Fatalf("a refused register wrote files: %v", err)
+			}
+		})
 	}
 	if got, _ := e.a.projects.get("traefik"); got.WorkingDir != "/srv/containers/traefik" {
-		t.Fatalf("registry changed: %+v", got)
+		t.Fatalf("registry changed by a refusal: %+v", got)
+	}
+	if _, ok := e.a.projects.get("gdrive-agent"); ok {
+		t.Fatal("registry changed by a refusal")
 	}
 	if n := len(e.a.reg.list()); n != 0 {
 		t.Fatalf("no job may start; registry holds %d", n)
 	}
 
-	t.Run("live-label-only-project-counts", func(t *testing.T) {
-		status, body := e.do(t, http.MethodPost, "/v1/projects",
-			map[string]any{"name": "gdrive-agent", "files": map[string]string{"docker-compose.yml": "services: {}\n"}, "deploy": true})
-		if status != http.StatusConflict || body["code"] != "project_relocation_requires_separate_up" {
-			t.Fatalf("got %d %v", status, body)
-		}
-	})
-
-	t.Run("same-dir-reregister-with-deploy-still-works", func(t *testing.T) {
+	t.Run("replace-same-dir-deploys", func(t *testing.T) {
 		dir := e.writeCompose(t, "stable", "services: {}\n")
 		must(t, e.a.projects.register(ProjectEntry{Name: "stable", WorkingDir: dir}))
-		status, body := e.do(t, http.MethodPost, "/v1/projects", map[string]any{"name": "stable", "working_dir": dir + "/", "deploy": true})
+		status, body := e.do(t, http.MethodPost, "/v1/projects", map[string]any{"name": "stable", "working_dir": dir + "/", "deploy": true, "replace": true})
 		if status != http.StatusOK || body["job_id"] == nil {
 			t.Fatalf("got %d %v", status, body)
 		}
 	})
-
-	t.Run("move-without-deploy-then-up-through-the-gate", func(t *testing.T) {
+	t.Run("replace-different-dir-deploys-through-the-gate", func(t *testing.T) {
 		status, body := e.do(t, http.MethodPost, "/v1/projects",
-			map[string]any{"name": "traefik", "files": map[string]string{"docker-compose.yml": "services: {}\n"}})
-		if status != http.StatusOK {
+			map[string]any{"name": "traefik", "files": inline, "deploy": true, "replace": true})
+		if status != http.StatusOK || body["job_id"] == nil {
 			t.Fatalf("got %d %v", status, body)
 		}
 		if got, _ := e.a.projects.get("traefik"); got.WorkingDir != filepath.Join(e.root, "traefik") {
 			t.Fatalf("not re-pointed: %+v", got)
 		}
-		// Now under the root: up is allowed; down stays refused (control path).
-		if status, body := e.do(t, http.MethodPost, "/v1/projects/traefik/op", map[string]any{"op": "up"}); status != http.StatusAccepted {
-			t.Fatalf("up after the move: %d %v", status, body)
+	})
+	t.Run("replace-still-meets-the-capability-gate", func(t *testing.T) {
+		// Re-pointed at a dir outside the root: the deploy is refused, nothing registered.
+		status, body := e.do(t, http.MethodPost, "/v1/projects",
+			map[string]any{"name": "gdrive-agent", "working_dir": "/srv/containers/elsewhere", "deploy": true, "replace": true})
+		if status != http.StatusConflict || body["code"] != "project_not_operable" {
+			t.Fatalf("got %d %v", status, body)
 		}
-		if status, _ := e.do(t, http.MethodPost, "/v1/projects/traefik/op", map[string]any{"op": "down"}); status != http.StatusConflict {
-			t.Fatalf("down after the move: %d", status)
+		if _, ok := e.a.projects.get("gdrive-agent"); ok {
+			t.Fatal("a refused deploy registered the project")
+		}
+	})
+	t.Run("copy-onto-an-existing-name", func(t *testing.T) {
+		e.writeCompose(t, "owned", "services: {}\n")
+		must(t, e.a.projects.register(ProjectEntry{Name: "owned", WorkingDir: filepath.Join(e.root, "owned"), ComposeFiles: []string{"docker-compose.yml"}}))
+		status, body := e.do(t, http.MethodPost, "/v1/projects/owned/copy", map[string]any{"new_name": "traefik"})
+		if status != http.StatusConflict || body["code"] != "project_exists" {
+			t.Fatalf("got %d %v", status, body)
 		}
 	})
 }
@@ -577,24 +598,18 @@ func TestBundleReadsOnlyConfinedEditableFiles(t *testing.T) {
 	})
 
 	t.Run("loading-the-project-refuses-escaping-files", func(t *testing.T) {
+		// Refused by the pre-load check, before compose is involved.
 		entry, _ := e.a.projects.get("owned")
-		if err := confineProjectFiles(entry, e.root); err == nil || !strings.Contains(err.Error(), "outside docker-agent's compose root") {
-			t.Fatalf("got %v", err)
+		cb := &composeBackend{root: e.root}
+		if _, err := cb.loadProject(context.Background(), entry); err == nil || !strings.Contains(err.Error(), "outside docker-agent's compose root") {
+			t.Fatalf("loadProject must refuse the escaping files first: %v", err)
 		}
-		clean := ProjectEntry{Name: "clean", WorkingDir: e.writeCompose(t, "clean", "services: {}\n")}
-		if err := confineProjectFiles(clean, e.root); err != nil {
-			t.Fatalf("a confined project must load: %v", err)
-		}
-		// A discovered (undeclared) compose file that is a symlink out of the root.
 		disc := filepath.Join(e.root, "disc")
 		must(t, os.MkdirAll(disc, 0o755))
 		must(t, os.Symlink(token, filepath.Join(disc, "compose.yaml")))
-		if err := confineProjectFiles(ProjectEntry{Name: "disc", WorkingDir: disc}, e.root); err == nil {
-			t.Fatal("a discovered compose file resolving outside the root must refuse the load")
-		}
-		cb := &composeBackend{root: e.root}
-		if _, err := cb.loadProject(context.Background(), entry); err == nil || !strings.Contains(err.Error(), "outside") {
-			t.Fatalf("loadProject must apply the confinement first: %v", err)
+		if _, err := cb.loadProject(context.Background(), ProjectEntry{Name: "disc", WorkingDir: disc}); err == nil ||
+			!strings.Contains(err.Error(), "outside docker-agent's compose root") {
+			t.Fatalf("a discovered compose file resolving outside the root must refuse the load: %v", err)
 		}
 	})
 }

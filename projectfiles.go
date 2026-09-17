@@ -1,19 +1,25 @@
 package main
 
-// Where a project's compose and env files may live.
+// Which files a project reads, and where they may live.
 //
 // A registry entry names its files: compose_files and env_files, absolute or
 // relative to the working dir. Nothing structural stops such a path from pointing
-// anywhere the agent's container can read — a path-only register naming
-// /etc/docker-agent/bearer-token as an env file, or a docker-compose.yml under
-// ComposeRoot that is a symlink out of it — and the bundle endpoint returns file
-// CONTENT, over an API reachable in-network with no bearer. So two rules:
+// anywhere the agent's container can read — an env file naming
+// /etc/docker-agent/bearer-token, a docker-compose.yml under ComposeRoot that is a
+// symlink out of it, an `include:` or `extends.file` in the compose model, a
+// service `env_file:` — and a compose load echoes parse errors into the job log,
+// and the bundle endpoint returns file CONTENT, over an API reachable in-network
+// with no bearer. So:
 //
-//   - At register time, every declared path must stay inside the entry's working
-//     dir (lexically, and after resolving symlinks when the file is visible).
-//   - Whenever the agent READS project files (bundle, copy, loading the compose
-//     model), every file must resolve — symlinks followed — under ComposeRoot.
-//     A file that does not is skipped by the bundle and refuses the load.
+//   - resolveLoadPaths is THE resolver: it absolutises compose and env paths
+//     against the working dir, and its output is exactly what compose is given.
+//     Compose is always handed explicit config paths, so its own discovery —
+//     COMPOSE_FILE, default names, the override file, the walk up parent
+//     directories — never runs.
+//   - Register rejects declared paths escaping the working dir.
+//   - Every read — bundle, copy, compose load — confines each file, symlinks
+//     followed, under ComposeRoot; the load also confines what compose reaches
+//     from inside the model (loadGuard, compose.go).
 
 import (
 	"errors"
@@ -22,19 +28,100 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/compose-spec/compose-go/v2/cli"
 )
 
-// declaredProjectPaths returns the entry's declared compose and env file paths,
-// each made absolute against the working dir.
-func declaredProjectPaths(e ProjectEntry) []string {
-	out := make([]string, 0, len(e.ComposeFiles)+len(e.EnvFiles))
-	for _, f := range append(append([]string{}, e.ComposeFiles...), e.EnvFiles...) {
-		if !filepath.IsAbs(f) && e.WorkingDir != "" {
-			f = filepath.Join(e.WorkingDir, f)
-		}
-		out = append(out, filepath.Clean(f))
+// loadPaths is what a project load reads before compose parses anything.
+type loadPaths struct {
+	config []string // compose files, in load order
+	env    []string // project env files (interpolation)
+}
+
+func (p loadPaths) all() []string { return append(append([]string{}, p.config...), p.env...) }
+
+// absAgainst makes f absolute against the working dir.
+func absAgainst(workingDir, f string) string {
+	if filepath.IsAbs(f) || workingDir == "" {
+		return filepath.Clean(f)
 	}
-	return out
+	return filepath.Join(workingDir, f)
+}
+
+// resolveLoadPaths resolves the files compose will load for e, exactly as they
+// will be passed to it.
+//
+//   - Declared compose files, absolutised; with none declared, the first of
+//     compose's own default names present in the working dir, plus the first
+//     override file there — the pair compose's discovery would pick, minus its
+//     walk up the parent directories.
+//   - Declared env files, absolutised (compose would resolve a relative one
+//     against the process cwd, "/"); with none declared, the working dir's .env
+//     when it is a file — compose's own default.
+func resolveLoadPaths(e ProjectEntry) (loadPaths, error) {
+	var p loadPaths
+	for _, f := range e.ComposeFiles {
+		p.config = append(p.config, absAgainst(e.WorkingDir, f))
+	}
+	if len(p.config) == 0 {
+		if main := firstPresent(e.WorkingDir, cli.DefaultFileNames); main != "" {
+			p.config = append(p.config, main)
+			if override := firstPresent(e.WorkingDir, cli.DefaultOverrideFileNames); override != "" {
+				p.config = append(p.config, override)
+			}
+		}
+	}
+	if len(p.config) == 0 {
+		return p, fmt.Errorf("no compose file (%s) in %s", strings.Join(cli.DefaultFileNames, ", "), echo(e.WorkingDir))
+	}
+	for _, f := range e.EnvFiles {
+		p.env = append(p.env, absAgainst(e.WorkingDir, f))
+	}
+	if len(e.EnvFiles) == 0 && e.WorkingDir != "" {
+		dotenv := filepath.Join(e.WorkingDir, ".env")
+		if st, err := os.Stat(dotenv); err == nil && !st.IsDir() {
+			p.env = append(p.env, dotenv)
+		}
+	}
+	return p, nil
+}
+
+func firstPresent(dir string, names []string) string {
+	if dir == "" {
+		return ""
+	}
+	for _, n := range names {
+		p := filepath.Join(dir, n)
+		if _, err := os.Lstat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
+// composeFilesPresent: a path-only register under ComposeRoot claims managed:true,
+// so every compose file the load would read must be a readable regular file.
+func composeFilesPresent(e ProjectEntry) error {
+	paths, err := resolveLoadPaths(e)
+	if err != nil {
+		return err
+	}
+	for _, f := range paths.config {
+		if !readableFile(f) {
+			return fmt.Errorf("compose file %s for %s is missing or unreadable", echo(f), echo(e.Name))
+		}
+	}
+	return nil
+}
+
+func readableFile(p string) bool {
+	f, err := os.Open(p)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	return err == nil && st.Mode().IsRegular()
 }
 
 // within reports whether path is dir or inside it (lexical; both cleaned).
@@ -57,9 +144,13 @@ func validateDeclaredPaths(e ProjectEntry) error {
 	}
 	wd := filepath.Clean(e.WorkingDir)
 	realWD, wdErr := filepath.EvalSymlinks(wd)
-	for _, p := range declaredProjectPaths(e) {
+	for _, f := range append(append([]string{}, e.ComposeFiles...), e.EnvFiles...) {
+		if len(f) > maxPathLen {
+			return fmt.Errorf("a declared path is longer than %d bytes", maxPathLen)
+		}
+		p := absAgainst(wd, f)
 		if !within(p, wd) {
-			return fmt.Errorf("%s is outside the project's working dir %s", p, wd)
+			return fmt.Errorf("%s is outside the project's working dir %s", echo(p), echo(wd))
 		}
 		if wdErr != nil {
 			continue
@@ -69,7 +160,7 @@ func validateDeclaredPaths(e ProjectEntry) error {
 			continue // not visible here
 		}
 		if !within(real, realWD) {
-			return fmt.Errorf("%s resolves to %s, outside the project's working dir %s", p, real, wd)
+			return fmt.Errorf("%s resolves to %s, outside the project's working dir %s", echo(p), echo(real), echo(wd))
 		}
 	}
 	return nil
@@ -92,53 +183,33 @@ func confinedUnder(path, root string) (bool, error) {
 	return within(real, realRoot), nil
 }
 
-// composeFilesToLoad is what loading the project reads: the declared compose
-// files, or — with none declared — whichever of compose's default names exist in
-// the working dir.
-func composeFilesToLoad(e ProjectEntry) []string {
-	if files := e.absComposeFiles(); len(files) > 0 {
-		return files
-	}
-	var out []string
-	for _, name := range composeDefaultFiles {
-		p := filepath.Join(e.WorkingDir, name)
-		if _, err := os.Lstat(p); err == nil {
-			out = append(out, p)
-		}
-	}
-	return out
+// errOutsideRoot is the refusal every confinement check returns. Its text names
+// the path, never content.
+type errOutsideRoot struct{ path, root string }
+
+func (e errOutsideRoot) Error() string {
+	return fmt.Sprintf("%s resolves outside docker-agent's compose root (%s); refusing to read it", echo(e.path), e.root)
 }
 
-// envFilesToLoad is every env file loading reads: the declared ones plus the
-// working dir's .env.
-func envFilesToLoad(e ProjectEntry) []string {
-	var out []string
-	for _, ef := range e.EnvFiles {
-		if !filepath.IsAbs(ef) && e.WorkingDir != "" {
-			ef = filepath.Join(e.WorkingDir, ef)
+// confinePath refuses a file that resolves outside root, or whose lexical path
+// already does when it does not exist. A missing file under root is left to
+// compose to report.
+func confinePath(p, root string) error {
+	ok, err := confinedUnder(p, root)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		realRoot, rerr := filepath.EvalSymlinks(root)
+		if rerr != nil {
+			return fmt.Errorf("resolve compose root: %w", rerr)
 		}
-		out = append(out, ef)
-	}
-	if e.WorkingDir != "" {
-		out = append(out, filepath.Join(e.WorkingDir, ".env"))
-	}
-	return out
-}
-
-// confineProjectFiles refuses a load whose compose or env files resolve outside
-// root. A file that does not exist is left to compose to report.
-func confineProjectFiles(e ProjectEntry, root string) error {
-	for _, p := range append(composeFilesToLoad(e), envFilesToLoad(e)...) {
-		ok, err := confinedUnder(p, root)
-		if errors.Is(err, fs.ErrNotExist) {
-			continue
+		if !within(filepath.Clean(p), root) && !within(filepath.Clean(p), realRoot) {
+			return errOutsideRoot{p, root}
 		}
-		if err != nil {
-			return fmt.Errorf("check %s: %w", p, err)
-		}
-		if !ok {
-			return fmt.Errorf("%s resolves outside docker-agent's compose root (%s); refusing to read it", p, root)
-		}
+		return nil
+	case err != nil:
+		return fmt.Errorf("check %s: %w", echo(p), err)
+	case !ok:
+		return errOutsideRoot{p, root}
 	}
 	return nil
 }

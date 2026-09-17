@@ -90,6 +90,8 @@ func newApp(ctx context.Context, cfg Config) (*app, error) {
 }
 
 func (a *app) close() {
+	// Stop the idempotency writers before the database they write to closes.
+	a.idem.close()
 	if a.events != nil {
 		a.events.close()
 	}

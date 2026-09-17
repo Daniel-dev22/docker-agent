@@ -164,8 +164,12 @@ timeout, a dropped connection) can resend without running the operation twice.
   self_identity_unavailable` — releases the key, so a retry can succeed once the daemon answers.
 - A claim still in flight when the agent died is released at boot: any job it had started was
   interrupted and failed by the orphan sweep, so a retry correctly runs again.
-- Keys are honoured for 24 hours and the table is capped at 5,000 recorded answers (~815 bytes
-  each, measured), oldest first. Choose a new key per logical operation, not per retry.
+- A keyed request body is capped at 1 MiB (`413 {"code":"request_too_large"}`); the largest real
+  register body on the fleet is 12 KB.
+- Keys are honoured for 24 hours. The table is bounded by rows (5,000 answers) and by bytes (2 MiB
+  of answers), oldest first; with both caps binding the whole database measured 5.1 MiB.
+- If an answer cannot be stored after the request acted, it is served to retries from memory while
+  it is written in the background. Choose a new key per logical operation, not per retry.
 
 Without the header, every endpoint behaves exactly as described below.
 
@@ -235,10 +239,18 @@ front never relays a scary error and a viewer simply stops paging.
 `{name, files:{"<relpath>":"<content>"}, deploy:true}`, which writes the files under
 `$COMPOSE_ROOT/<name>/` (rejecting any path escaping that directory) and optionally `up`s them
 immediately. The inline form is how a stack is copied to a different host: `GET` the source's
-bundle, `POST` it to the target agent. `400` on a missing name, a name compose would normalise
-(`invalid_project_name`), a bad path, or a path-only register under `$COMPOSE_ROOT` whose compose
-files are missing; `409` for the agent's own project name or a `deploy` the capability refuses;
-`500` on a persist failure. Every refusal happens before any file is written.
+bundle, `POST` it to the target agent.
+
+Registering onto a project that **already exists** — registered, or running as containers labelled
+with that project — requires `"replace": true`, whatever the directory or `deploy`; otherwise it is
+`409 project_exists` carrying the existing `working_dir`. This is accident protection (a copy or a
+typo re-pointing someone else's stack), not a security boundary: the API is unauthenticated
+in-network. With `replace:true`, re-pointing and deploying in one request is allowed, and the
+deploy still goes through the capability gate for the new entry. Ansible and the editor send
+`replace:true`; a cross-host copy does not.
+
+Every refusal happens before any file is written; the codes are in the table under Mounts. A write
+that fails after validation is a `500` (transient).
 
 **Op** accepts `up | down | pull | restart | recreate | update`. It returns:
 - `400` if `op` is not one of those,
@@ -498,11 +510,26 @@ ID starts with `db`.
 | Copy of a project whose files are not visible | 409 | `project_not_editable` |
 | Container verb on the agent's own container | 409 | `self_container` |
 | `stop`/`kill`/`remove` on the control-path container | 409 | `control_path_container` |
-| Register/copy with a name compose would normalise | 400 | `invalid_project_name` |
+| Register/copy with a name compose would normalise, or longer than 255 bytes | 400 | `invalid_project_name` |
+| Register/copy onto an existing project without `replace:true` | 409 | `project_exists` |
+| Register: relative, or longer than 4096 bytes, `working_dir` | 400 | `invalid_working_dir` |
+| Register: a declared compose/env path escaping the working dir | 400 | `project_path_outside_working_dir` |
+| Register: an inline file path that is empty or has a >255-byte component | 400 | `invalid_file_path` |
+| Register: a path-only project under the root with no readable compose file | 400 | `compose_files_missing` |
+| Unknown project (op, copy source, bundle) | 404 | `unknown_project` |
+| Malformed body, or a required field missing | 400 | `invalid_body` |
+| Op not one of the six | 400 | `invalid_op` |
+| `health_timeout_s` / `swap_timeout_s` out of range | 400 | `invalid_budget` |
+| `override_image` not a plain image reference | 400 | `invalid_override_image` |
+| Bulk `action` not one of start/stop/restart/kill/remove | 400 | `invalid_action` |
+| More than 100 distinct targets | 400 | `too_many_targets` |
+| An ambiguous, malformed, or >255-byte container reference | 400 | `invalid_target` |
 | The container list or a target inspect failed | 503 | `self_identity_unavailable` |
 
-Project refusals carry `working_dir`; container refusals carry `targets`. A bulk request naming any
-protected container is refused whole.
+Every deterministic 4xx carries a `code` — a consumer may treat a code-less 4xx as transient — and
+echoes caller input clipped to 512 bytes. Project refusals carry `working_dir`; container refusals
+carry `targets`. A bulk request naming any protected container is refused whole. The idempotency
+codes are under Idempotency-Key.
 
 ---
 

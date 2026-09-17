@@ -324,10 +324,60 @@ func newCapEnv(t *testing.T, selfID string, containers func(root string) []fakeC
 	self := &selfIdentity{containerID: selfID, controlPathName: "traefik"}
 	a := &app{cfg: cfg, docker: dc, projects: reg, reg: jobs, compose: &composeBackend{}, self: self}
 	r := gin.New()
+	r.Use(auditRefusalCodes(t))
 	registerRoutes(r, a)
 	env := &capEnv{r: r, a: a, eng: eng, root: root}
 	t.Cleanup(func() { env.waitJobs(t) })
 	return env
+}
+
+// refusalRoutes are the routes whose every deterministic 4xx must carry a code.
+var refusalRoutes = map[string]bool{
+	"POST /v1/projects":               true,
+	"POST /v1/projects/:name/op":      true,
+	"POST /v1/projects/:name/copy":    true,
+	"GET /v1/projects/:name/bundle":   true,
+	"POST /v1/containers/:id/start":   true,
+	"POST /v1/containers/:id/stop":    true,
+	"POST /v1/containers/:id/restart": true,
+	"DELETE /v1/containers/:id":       true,
+	"POST /v1/containers/bulk":        true,
+}
+
+type auditWriter struct {
+	gin.ResponseWriter
+	buf bytes.Buffer
+}
+
+func (w *auditWriter) Write(b []byte) (int, error) {
+	w.buf.Write(b)
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *auditWriter) WriteString(s string) (int, error) {
+	w.buf.WriteString(s)
+	return w.ResponseWriter.WriteString(s)
+}
+
+// auditRefusalCodes fails the test for every 4xx a refusal route returns without a
+// code — across the whole suite, so a future code-less refusal fails whatever test
+// happens to reach it. Consumers retry a code-less 4xx as transient.
+func auditRefusalCodes(t *testing.T) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		aw := &auditWriter{ResponseWriter: c.Writer}
+		c.Writer = aw
+		c.Next()
+		status := aw.Status()
+		if status < 400 || status >= 500 || !refusalRoutes[c.Request.Method+" "+c.FullPath()] {
+			return
+		}
+		var body struct {
+			Code string `json:"code"`
+		}
+		if err := json.Unmarshal(aw.buf.Bytes(), &body); err != nil || body.Code == "" {
+			t.Errorf("%s %s answered %d without a code: %s", c.Request.Method, c.Request.URL.Path, status, clipTo(aw.buf.String(), 300))
+		}
+	}
 }
 
 func (e *capEnv) do(t *testing.T, method, path string, body any) (int, map[string]any) {

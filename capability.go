@@ -136,16 +136,16 @@ func refuseProjectOp(c *gin.Context, e ProjectEntry, composeRoot string, capa pr
 	switch {
 	case capa.Blocked == blockedInvalidName:
 		msg = fmt.Sprintf("%q is not a valid compose project name: compose would act on %q instead. "+
-			"Deregister it and register the stack under a lowercase name.", e.Name, loader.NormalizeProjectName(e.Name))
+			"Deregister it and register the stack under a lowercase name.", echo(e.Name), echo(loader.NormalizeProjectName(e.Name)))
 	case op == opComposeDown && capa.controlPath:
 		msg = fmt.Sprintf("%s runs this agent's control-path proxy: `down` would leave the agent unreachable "+
-			"with nothing able to start it again. %s", e.Name, allowedSentence(capa.Allowed))
+			"with nothing able to start it again. %s", echo(e.Name), allowedSentence(capa.Allowed))
 	default:
 		msg = fmt.Sprintf("compose files for %s are at %s, outside docker-agent's compose root (%s): %s loads "+
 			"the compose files, which the agent cannot see. %s",
-			e.Name, e.WorkingDir, composeRoot, op, allowedSentence(capa.Allowed))
+			echo(e.Name), echo(e.WorkingDir), composeRoot, op, allowedSentence(capa.Allowed))
 	}
-	c.JSON(http.StatusConflict, gin.H{"error": msg, "code": "project_not_operable", "working_dir": e.WorkingDir})
+	refuse(c, http.StatusConflict, "project_not_operable", msg, gin.H{"working_dir": e.WorkingDir})
 	return true
 }
 
@@ -160,11 +160,11 @@ func refuseProjectEdit(c *gin.Context, e ProjectEntry, composeRoot string, capa 
 		return true
 	}
 	msg := fmt.Sprintf("compose files for %s are at %s, outside docker-agent's compose root (%s), "+
-		"so they cannot be read or rewritten here", e.Name, e.WorkingDir, composeRoot)
+		"so they cannot be read or rewritten here", echo(e.Name), echo(e.WorkingDir), composeRoot)
 	if capa.Blocked == blockedInvalidName {
-		msg = fmt.Sprintf("%q is not a valid compose project name", e.Name)
+		msg = fmt.Sprintf("%q is not a valid compose project name", echo(e.Name))
 	}
-	c.JSON(http.StatusConflict, gin.H{"error": msg, "code": "project_not_editable", "working_dir": e.WorkingDir})
+	refuse(c, http.StatusConflict, "project_not_editable", msg, gin.H{"working_dir": e.WorkingDir})
 	return true
 }
 
@@ -178,46 +178,42 @@ func allowedSentence(allowed []string) string {
 }
 
 func refuseSelfProject(c *gin.Context, e ProjectEntry) {
-	c.JSON(http.StatusConflict, gin.H{
-		"error": fmt.Sprintf("%s is docker-agent's own stack: acting on it would stop or remove the agent mid-job, "+
-			"leaving the host with no agent. The agent is updated by Ansible (docker-agent/deploy.yml).", e.Name),
-		"code":        "self_project",
-		"working_dir": e.WorkingDir,
-	})
+	refuse(c, http.StatusConflict, "self_project",
+		fmt.Sprintf("%s is docker-agent's own stack: acting on it would stop or remove the agent mid-job, "+
+			"leaving the host with no agent. The agent is updated by Ansible (docker-agent/deploy.yml).", echo(e.Name)),
+		gin.H{"working_dir": e.WorkingDir})
 }
 
+// refuseInvalidName: a name compose would reinterpret, or one no directory can
+// carry.
 func refuseInvalidName(c *gin.Context, name string) {
-	c.JSON(http.StatusBadRequest, gin.H{
-		"error": fmt.Sprintf("%q is not a valid compose project name: use lowercase letters, digits, '-' and '_', "+
-			"starting with a letter or digit (compose would act on %q)", name, loader.NormalizeProjectName(name)),
-		"code": "invalid_project_name",
-	})
+	if len(name) > maxProjectNameLen {
+		refuse(c, http.StatusBadRequest, "invalid_project_name",
+			fmt.Sprintf("project name is %d bytes; the limit is %d (a directory name)", len(name), maxProjectNameLen), nil)
+		return
+	}
+	refuse(c, http.StatusBadRequest, "invalid_project_name",
+		fmt.Sprintf("%q is not a valid compose project name: use lowercase letters, digits, '-' and '_', "+
+			"starting with a letter or digit (compose would act on %q)", echo(name), echo(loader.NormalizeProjectName(name))), nil)
 }
 
-// refuseRelocationDeploy: a register that moves an existing project to a different
-// working dir must not deploy in the same request. The deploy would run `up` on
-// the NEW files against the project's live containers before the capability gate
-// had ever seen the new location — a stack the agent refuses to `up` in place (for
-// instance an Ansible-owned stack outside ComposeRoot) could be replaced by
-// re-registering it. Register without deploy, then `up` through the op endpoint.
-func refuseRelocationDeploy(c *gin.Context, e ProjectEntry, from string) {
-	c.JSON(http.StatusConflict, gin.H{
-		"error": fmt.Sprintf("%s already exists at %s: registering it at %s moves it, and a move cannot deploy in the "+
-			"same request. Register without deploy, then run `up` through POST /v1/projects/%s/op.",
-			e.Name, from, e.WorkingDir, e.Name),
-		"code":        "project_relocation_requires_separate_up",
-		"working_dir": from,
-	})
+// refuseProjectExists: registering onto a project that already exists — in the
+// registry, or as running containers labelled with that project — must say so
+// with replace:true. This is accident protection, not a security boundary (the API
+// is unauthenticated in-network): it stops a copy or a typo from silently
+// re-pointing and redeploying a stack someone else owns.
+func refuseProjectExists(c *gin.Context, name, existingDir string) {
+	refuse(c, http.StatusConflict, "project_exists",
+		fmt.Sprintf("project %s already exists (at %s); send \"replace\": true to re-point it", echo(name), echo(existingDir)),
+		gin.H{"working_dir": existingDir})
 }
 
 func refuseSelfUnavailable(c *gin.Context, err error, targets []string) {
-	body := gin.H{
-		"error": "cannot confirm this request does not target docker-agent itself or its control-path proxy: " +
-			err.Error() + ". Retry once the Docker daemon answers.",
-		"code": "self_identity_unavailable",
-	}
+	fields := gin.H{}
 	if targets != nil {
-		body["targets"] = targets
+		fields["targets"] = targets
 	}
-	c.JSON(http.StatusServiceUnavailable, body)
+	refuse(c, http.StatusServiceUnavailable, "self_identity_unavailable",
+		"cannot confirm this request does not target docker-agent itself or its control-path proxy: "+
+			echo(err.Error())+". Retry once the Docker daemon answers.", fields)
 }
