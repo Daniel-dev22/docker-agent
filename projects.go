@@ -223,32 +223,39 @@ func (r *composeRegistry) enrichFromLive(live []ComposeProject) {
 }
 
 // mergeKnown adds stopped-but-registered projects (absent from the live label
-// grouping) to the fleet snapshot as zero-container entries, and flags each
-// returned project Managed only when the agent actually owns its compose files
-// (working dir under ComposeRoot → created via register/copy → editable here).
-// Externally-provisioned stacks appear but Managed=false, so a UI greys out Edit
-// instead of offering an edit that cannot read the files.
-func (r *composeRegistry) mergeKnown(live []ComposeProject) []ComposeProject {
+// grouping) to the fleet snapshot as zero-container entries, and stamps EVERY
+// returned project — registered, registry-only and ad-hoc live — with its
+// capabilities (projectCapabilities). A registered entry's working dir wins over
+// the live label: it is the path an op would actually load. selfProject is the
+// agent's own compose project ("" when unknown).
+func (r *composeRegistry) mergeKnown(live []ComposeProject, selfProject string) []ComposeProject {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	seen := make(map[string]int, len(live))
 	for i, p := range live {
 		seen[p.Name] = i
 	}
+	for i := range live {
+		wd := live[i].WorkingDir
+		if e, ok := r.byName[live[i].Name]; ok {
+			wd = e.WorkingDir
+		}
+		live[i].stampCapability(projectCapabilities(live[i].Name, wd, r.composeRoot, selfProject))
+	}
 	for name, e := range r.byName {
-		managed := underComposeRoot(e.WorkingDir, r.composeRoot)
-		if idx, ok := seen[name]; ok {
-			live[idx].Managed = managed
+		if _, ok := seen[name]; ok {
 			continue
 		}
-		live = append(live, ComposeProject{
-			Name:       name,
-			WorkingDir: e.WorkingDir,
-			Managed:    managed,
-		})
+		p := ComposeProject{Name: name, WorkingDir: e.WorkingDir}
+		p.stampCapability(projectCapabilities(name, e.WorkingDir, r.composeRoot, selfProject))
+		live = append(live, p)
 	}
 	sort.Slice(live, func(i, j int) bool { return live[i].Name < live[j].Name })
 	return live
+}
+
+func (p *ComposeProject) stampCapability(c projectCapability) {
+	p.Operable, p.Managed, p.OpsBlocked = c.Operable, c.Editable, c.Blocked
 }
 
 // projectEntryFromLive builds an entry from a label-derived ComposeProject. The

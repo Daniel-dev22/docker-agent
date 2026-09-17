@@ -52,10 +52,10 @@ func newFleetHub(a *app) *fleetHub {
 		if a.images != nil {
 			stampImageStatus(containers, projects, a.images)
 		}
-		// Merge stopped-but-registered projects so a managed stack appears even
-		// when all its containers are down, and flag running ones as Managed.
+		// Merge stopped-but-registered projects so a known stack appears even when
+		// all its containers are down, and stamp every project's capabilities.
 		if a.projects != nil {
-			projects = a.projects.mergeKnown(projects)
+			projects = a.projects.mergeKnown(projects, a.self.projectName(ctx))
 		}
 		return fleetEnvelope{
 			Type: "snapshot",

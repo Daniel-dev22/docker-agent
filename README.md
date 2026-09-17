@@ -407,6 +407,25 @@ provisioned by something else, its files are outside the agent's mount, and it i
 shares a path prefix is not "under" the root. It needs no migration and no persisted provenance
 flag, which is exactly why it is structural.
 
+**Operable vs editable, and the agent's own stack.** Every project in the snapshot carries three
+flags from one function (`projectCapabilities`, `capability.go`), and every mutating endpoint
+enforces the same function, so a UI keyed on the snapshot never offers an op the agent refuses:
+
+| Field | Meaning | Refused with 409 when false |
+|---|---|---|
+| `operable` | Compose ops (`up`/`down`/`pull`/`restart`/`recreate`/`update`) can run | `code: project_not_operable` or `self_project` |
+| `managed` | The files can be read and rewritten (edit, copy) | `code: project_not_editable` |
+| `ops_blocked` | Why not operable: `outside_compose_root` or `self` | — |
+
+A stack outside `$COMPOSE_ROOT` is neither: compose must read the files to load the project, and
+the container cannot see them. The agent's **own** stack is never operable wherever its files
+live, and its own container refuses start/stop/restart/remove (`code: self_container`, bulk
+requests refused whole): compose or the daemon would stop the container running the job, the
+process dies mid-operation, and the host is left with no agent. The agent learns its container ID
+from `/proc/self/mountinfo` and its compose project from one inspect (retried, throttled); the
+result — or why it failed — is in the `self` block of `GET /health/ready`, which never gates on
+it. Update the agent with whatever deployed it.
+
 ---
 
 ## Controller contract

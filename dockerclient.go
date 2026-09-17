@@ -89,13 +89,22 @@ type ComposeProject struct {
 	ContainerCount int      `json:"container_count"`
 	RunningCount   int      `json:"running_count"`
 	Containers     []string `json:"containers"`
-	// Managed is true when docker-agent owns this stack's compose files: it was
-	// created via register/copy and its working dir lives under ComposeRoot, so
-	// the agent can read/write it and a UI can offer in-place editing. False =
-	// externally-provisioned (another tool, or ad-hoc) — discovered only, files
-	// live outside the agent's mount, so editing is not offered. Set by
-	// composeRegistry.mergeKnown when building the fleet snapshot.
-	Managed bool `json:"managed,omitempty"`
+	// Capability flags, all from projectCapabilities and stamped by
+	// composeRegistry.mergeKnown onto EVERY project in the snapshot.
+	//
+	// Operable: the agent can run compose ops (up/down/pull/restart/recreate/
+	// update) on this stack — its files are inside the agent's ComposeRoot mount
+	// and it is not the agent's own stack. The op endpoint refuses exactly when
+	// this is false, so a UI that hides ops on false never offers a refused one.
+	Operable bool `json:"operable"`
+	// Managed: the agent may read and rewrite the stack's compose files (edit in
+	// place, copy). Never omitempty — false IS the signal; omitting it made every
+	// `managed === false` check downstream unreachable.
+	Managed bool `json:"managed"`
+	// OpsBlocked says why Operable is false: "self" (the agent's own stack) or
+	// "outside_compose_root" (files live outside the agent's mount). Empty when
+	// operable.
+	OpsBlocked string `json:"ops_blocked,omitempty"`
 
 	// Rolled-up image-outdated status, computed from the project's
 	// containers during the fleet merge: outdated if ANY service is outdated.
@@ -516,6 +525,20 @@ func (d *dockerClient) inspectState(ctx context.Context, nameOrID string) (conta
 		}
 	}
 	return st, nil
+}
+
+// containerIdentity returns a container's full ID, name and labels — what self
+// identity needs to recognise the agent's own container and compose project.
+func (d *dockerClient) containerIdentity(ctx context.Context, nameOrID string) (string, string, map[string]string, error) {
+	resp, err := d.cli.ContainerInspect(ctx, nameOrID)
+	if err != nil {
+		return "", "", nil, err
+	}
+	var labels map[string]string
+	if resp.Config != nil {
+		labels = resp.Config.Labels
+	}
+	return resp.ID, resp.Name, labels, nil
 }
 
 // containerNetworks returns the set of network names a container is currently

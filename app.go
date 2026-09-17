@@ -26,14 +26,18 @@ type app struct {
 	fleet     *fleetHub
 	images    *imageChecker
 	discovery *discoveryPusher
+	// self is this agent's own container + compose project, which no endpoint
+	// may act on (selfid.go).
+	self *selfIdentity
 }
 
-func newApp(_ context.Context, cfg Config) (*app, error) {
+func newApp(ctx context.Context, cfg Config) (*app, error) {
 	cc := buildControlCenterClient(cfg)
 	dc, err := newDockerClient(cfg.DockerHost)
 	if err != nil {
 		return nil, fmt.Errorf("docker client: %w", err)
 	}
+	self := newSelfIdentity(ctx, "/proc/self/mountinfo", dc)
 	events, err := newEventBuffer(cfg, cc)
 	if err != nil {
 		return nil, fmt.Errorf("event buffer: %w", err)
@@ -60,7 +64,7 @@ func newApp(_ context.Context, cfg Config) (*app, error) {
 	reg := newJobRegistry(cfg, eng, events)
 	reg.setHook(events.handleJobEvent)
 
-	a := &app{cfg: cfg, cc: cc, docker: dc, compose: cb, projects: projects, events: events, reg: reg}
+	a := &app{cfg: cfg, cc: cc, docker: dc, compose: cb, projects: projects, events: events, reg: reg, self: self}
 	a.images = newImageChecker(cfg, dc, cc)
 	eng.setImageChecker(a.images)               // the update engine reuses strategy + clients
 	a.images.setProjectPlanner(eng.planProject) // coupled-project status = the update's dry-run (DRY)

@@ -48,12 +48,20 @@ func (a *app) handleComposeOp(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "op must be one of up|down|pull|restart|recreate|update"})
 		return
 	}
-	if a.compose == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "compose backend unavailable on this host"})
+	entry, ok := a.resolveProject(c.Request.Context(), name)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "unknown project: " + name})
 		return
 	}
-	if !a.projectKnown(c.Request.Context(), name) {
-		c.JSON(http.StatusNotFound, gin.H{"error": "unknown project: " + name})
+	// Refuse what can never run BEFORE anything that could create a job: a refusal
+	// is a decision, and a failed job row would read as an attempt that broke. It
+	// also outranks a transiently unavailable backend below — retrying cannot fix it.
+	capa := projectCapabilities(entry.Name, entry.WorkingDir, a.cfg.ComposeRoot, a.self.projectName(c.Request.Context()))
+	if refuseProject(c, entry.Name, entry.WorkingDir, a.cfg.ComposeRoot, capa, false) {
+		return
+	}
+	if a.compose == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "compose backend unavailable on this host"})
 		return
 	}
 	// Bound the one-shot budgets HERE, not only at the router. The router validates
@@ -100,22 +108,22 @@ func validBudgetSeconds(v int) bool {
 	return v == 0 || (v > 0 && time.Duration(v)*time.Second > 0 && time.Duration(v)*time.Second <= maxBudget)
 }
 
-// projectKnown reports whether the name is in the durable registry or among the
-// currently-running compose projects (so an ad-hoc running stack is operable).
-func (a *app) projectKnown(ctx context.Context, name string) bool {
-	if _, ok := a.projects.get(name); ok {
-		return true
+// resolveProject returns the entry an op would run against: the durable registry
+// first, then the currently-running compose projects (so an ad-hoc running stack
+// is still addressable). The engine resolves the same way at run time.
+func (a *app) resolveProject(ctx context.Context, name string) (ProjectEntry, bool) {
+	if e, ok := a.projects.get(name); ok {
+		return e, true
+	}
+	if a.docker == nil {
+		return ProjectEntry{}, false
 	}
 	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if _, live, err := a.docker.snapshot(cctx); err == nil {
-		for _, p := range live {
-			if p.Name == name {
-				return true
-			}
-		}
+		return a.projects.resolve(name, live)
 	}
-	return false
+	return ProjectEntry{}, false
 }
 
 // --- project registry CRUD ---
@@ -149,12 +157,24 @@ func (a *app) handleRegisterProject(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
 		return
 	}
+	selfProject := a.self.projectName(c.Request.Context())
+	if selfProject != "" && body.Name == selfProject {
+		refuseProject(c, body.Name, body.WorkingDir, a.cfg.ComposeRoot, projectCapability{Blocked: blockedSelf}, false)
+		return
+	}
 	entry := ProjectEntry{
 		Name:         body.Name,
 		WorkingDir:   body.WorkingDir,
 		ComposeFiles: body.ComposeFiles,
 		Profiles:     body.Profiles,
 		EnvFiles:     body.EnvFiles,
+	}
+	// deploy=true is a compose op: refuse it before registering anything when the
+	// entry could not run one. Only a path-only register can point outside
+	// ComposeRoot — inline files are always written under it.
+	if body.Deploy && len(body.Files) == 0 && refuseProject(c, body.Name, entry.WorkingDir, a.cfg.ComposeRoot,
+		projectCapabilities(body.Name, entry.WorkingDir, a.cfg.ComposeRoot, selfProject), false) {
+		return
 	}
 	if len(body.Files) > 0 {
 		dir, written, err := writeProjectFiles(a.cfg.ComposeRoot, body.Name, body.Files)
@@ -257,6 +277,18 @@ func (a *app) handleCopyProject(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "unknown project: " + name})
 		return
 	}
+	// A copy reads the source's files, so the source must be editable; and the copy
+	// must not take the agent's own project name, whose `up` would recreate — or
+	// remove as an orphan — the agent itself.
+	selfProject := a.self.projectName(c.Request.Context())
+	if refuseProject(c, src.Name, src.WorkingDir, a.cfg.ComposeRoot,
+		projectCapabilities(src.Name, src.WorkingDir, a.cfg.ComposeRoot, selfProject), true) {
+		return
+	}
+	if selfProject != "" && body.NewName == selfProject {
+		refuseProject(c, body.NewName, "", a.cfg.ComposeRoot, projectCapability{Blocked: blockedSelf}, false)
+		return
+	}
 	bundle, err := a.readBundle(src)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -294,7 +326,8 @@ func (a *app) handleCopyProject(c *gin.Context) {
 // whose working dir is outside the agent's bind-mounted
 // ComposeRoot returns an empty/partial bundle + its working_dir, so the UI shows
 // its graceful "not editable, files live at <working_dir>" notice instead of a
-// raw 500. (Such stacks are also flagged Managed=false up front — see mergeKnown.)
+// raw 500. (Such stacks are also flagged managed:false up front — see mergeKnown —
+// and copy refuses them before reaching here.)
 func (a *app) readBundle(e ProjectEntry) (projectBundle, error) {
 	b := projectBundle{Name: e.Name, WorkingDir: e.WorkingDir}
 	for _, p := range e.absComposeFiles() {

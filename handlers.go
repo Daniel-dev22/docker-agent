@@ -9,8 +9,14 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-func (a *app) handleLiveness(c *gin.Context)  { c.JSON(http.StatusOK, gin.H{"status": "ok"}) }
-func (a *app) handleReadiness(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ready"}) }
+func (a *app) handleLiveness(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) }
+
+// handleReadiness reports, but never gates on, self identity: an unresolved
+// identity disarms only the own-container guard, and hiding the pod would take
+// every other op down with it.
+func (a *app) handleReadiness(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"status": "ready", "self": a.self.status()})
+}
 
 // ---------------------------------------------------------------------------
 // Container lifecycle — every op is a SHORT async job: it returns 202 + job id,
@@ -52,6 +58,10 @@ func (a *app) startContainerJob(c *gin.Context, op string) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "container id is required"})
 		return
 	}
+	if a.self.isSelfContainer(c.Request.Context(), id) {
+		refuseSelfContainer(c, op, []string{id})
+		return
+	}
 	var body containerOpBody
 	_ = c.ShouldBindJSON(&body) // optional; empty body leaves zero values
 	j := a.reg.start(context.Background(), JobRequest{
@@ -78,6 +88,18 @@ func (a *app) handleContainerBulk(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "ids must be non-empty"})
 		return
 	}
+	// All or nothing: a bulk request naming the agent is refused whole, so no
+	// partial fan-out runs against the rest of the selection.
+	var selfTargets []string
+	for _, id := range body.IDs {
+		if a.self.isSelfContainer(c.Request.Context(), id) {
+			selfTargets = append(selfTargets, id)
+		}
+	}
+	if len(selfTargets) > 0 {
+		refuseSelfContainer(c, opContainerBulkPrefix+body.Action, selfTargets)
+		return
+	}
 	j := a.reg.start(context.Background(), JobRequest{
 		Operation:  opContainerBulkPrefix + body.Action,
 		Target:     fmt.Sprintf("%d container(s)", len(body.IDs)),
@@ -87,6 +109,17 @@ func (a *app) handleContainerBulk(c *gin.Context) {
 		TriggerKey: orDefault(body.TriggerKey, "ui"),
 	})
 	c.JSON(http.StatusAccepted, gin.H{"job_id": j.ID, "state": j.snapshot().State, "count": len(body.IDs)})
+}
+
+// refuseSelfContainer writes the 409 for a container op aimed at the agent itself:
+// the daemon would stop the process running the job before it could report.
+func refuseSelfContainer(c *gin.Context, op string, targets []string) {
+	c.JSON(http.StatusConflict, gin.H{
+		"error": fmt.Sprintf("refusing %s on docker-agent's own container: the agent would stop mid-job. "+
+			"The agent is managed by Ansible (docker-agent/deploy.yml).", op),
+		"code":    "self_container",
+		"targets": targets,
+	})
 }
 
 func orDefault(v, def string) string {
