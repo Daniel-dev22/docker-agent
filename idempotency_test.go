@@ -514,8 +514,8 @@ func TestIdempotencyShutdownIsBoundedWithAWriterMidAttempt(t *testing.T) {
 		t.Fatalf("precondition: the lock was taken %v after the answer, too close to the writer's first attempt at %v", since, firstRetry)
 	}
 	// The writer's first attempt starts at firstRetry and waits on the lock; shut
-	// down well inside that wait.
-	time.Sleep(time.Until(answered.Add(firstRetry + 200*time.Millisecond)))
+	// down early in that wait, so what remains of it is most of a budget.
+	time.Sleep(time.Until(answered.Add(firstRetry + 100*time.Millisecond)))
 	store.mu.Lock()
 	pending := len(store.pending)
 	store.mu.Unlock()
@@ -523,10 +523,18 @@ func TestIdempotencyShutdownIsBoundedWithAWriterMidAttempt(t *testing.T) {
 		t.Fatalf("precondition: the answer is pending (%d)", pending)
 	}
 
+	// The bound is the budget itself: the writer's attempt ends by its own
+	// deadline, which is before close's, and the final writes wait only for what is
+	// left. The allowance is for scheduling, not for another wait — a close() that
+	// let the writer's remaining wait run first takes the budget plus most of a
+	// second budget (measured 3.2–3.5s).
+	const overhead = 300 * time.Millisecond
 	start := time.Now()
 	store.close()
 	e.a.events.close()
-	if elapsed := time.Since(start); elapsed > idempotencyCloseBudget+time.Second {
+	elapsed := time.Since(start)
+	t.Logf("shutdown took %v", elapsed)
+	if elapsed > idempotencyCloseBudget+overhead {
 		t.Fatalf("shutdown took %v with a writer waiting on a locked database; budget %v", elapsed, idempotencyCloseBudget)
 	}
 }
