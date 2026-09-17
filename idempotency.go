@@ -11,7 +11,7 @@ package main
 //   - Scope is (method, path, key); the path is stored as its SHA-256 so a row's
 //     size does not depend on it. The request body is fingerprinted: the same key
 //     with a different body is the caller's bug, 422 idempotency_key_reused.
-//   - A keyed request body is capped (maxJobRequestBytes, 413 request_too_large).
+//   - The request body is already bounded by boundedBody (bodylimit.go).
 //   - The claim is taken atomically (INSERT … ON CONFLICT DO NOTHING) BEFORE the
 //     handler runs, so a concurrent duplicate gets 409 idempotency_key_in_flight
 //     and never executes.
@@ -55,13 +55,6 @@ const (
 	idempotencyHeader         = "Idempotency-Key"
 	idempotencyReplayedHeader = "Idempotency-Replayed"
 	idempotencyMaxKeyLen      = 128
-
-	// maxJobRequestBytes caps a keyed request's body. The largest real register
-	// body on the fleet — every registered project's bundle on all 10 agents,
-	// re-encoded as POST /v1/projects {name, files, deploy} — is 12,047 bytes
-	// (kd-nuc01 otbr, measured 2026-09-17). 1 MiB is 87x that: room for a much
-	// larger stack, while a request can no longer make the store keep megabytes.
-	maxJobRequestBytes = 1 << 20
 
 	// idempotencyWindow: a key is honoured for 24h. A retry exists to recover from
 	// a lost response within one operator action or one playbook run; a day
@@ -514,14 +507,9 @@ func (a *app) idempotent() gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "idempotency store not configured"})
 			return
 		}
-		raw, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, maxJobRequestBytes))
+		// boundedBody has already read at most maxRequestBodyBytes into memory.
+		raw, err := io.ReadAll(c.Request.Body)
 		if err != nil {
-			var tooLarge *http.MaxBytesError
-			if errors.As(err, &tooLarge) {
-				refuse(c, http.StatusRequestEntityTooLarge, "request_too_large",
-					fmt.Sprintf("request body exceeds %d bytes", maxJobRequestBytes), nil)
-				return
-			}
 			refuse(c, http.StatusBadRequest, "invalid_body", "read request body: "+echo(err.Error()), nil)
 			return
 		}

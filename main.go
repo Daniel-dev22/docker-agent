@@ -70,6 +70,9 @@ func main() {
 }
 
 func registerRoutes(r *gin.Engine, app *app) {
+	// Every request body is bounded before any route reads it (bodylimit.go).
+	r.Use(boundedBody())
+
 	r.GET("/health/live", app.handleLiveness)
 	r.GET("/health/ready", app.handleReadiness)
 

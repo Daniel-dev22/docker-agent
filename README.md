@@ -133,7 +133,9 @@ listing) and `reconcile`.
 
 ## HTTP API
 
-Everything listens on `:8080`. All bodies are JSON.
+Everything listens on `:8080`. All bodies are JSON, and every request body is capped at 1 MiB
+(`413 {"code":"request_too_large"}`, refused before any handler reads it); the largest real one on
+the fleet is a 12 KB register.
 
 The async pattern is uniform: **any mutation returns `202 Accepted` with a `job_id`**, and you
 observe the result on `/ws/jobs/:id/logs`, `GET /v1/jobs/:id`, or the next `/ws/fleet` snapshot.
@@ -164,8 +166,6 @@ timeout, a dropped connection) can resend without running the operation twice.
   self_identity_unavailable` — releases the key, so a retry can succeed once the daemon answers.
 - A claim still in flight when the agent died is released at boot: any job it had started was
   interrupted and failed by the orphan sweep, so a retry correctly runs again.
-- A keyed request body is capped at 1 MiB (`413 {"code":"request_too_large"}`); the largest real
-  register body on the fleet is 12 KB.
 - Keys are honoured for 24 hours. The table is bounded by rows (5,000 answers) and by bytes (2 MiB
   of answers), oldest first; with both caps binding the whole database measured 5.1 MiB.
 - If an answer cannot be stored after the request acted, it is served to retries from memory while

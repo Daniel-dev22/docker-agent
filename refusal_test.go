@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -81,7 +82,7 @@ func TestEveryRefusalCarriesACode(t *testing.T) {
 		if r := e.doKeyed(t, "POST", "/v1/containers/gdrive-agent/stop", "bad\x01key", ""); r.status != 400 || r.code() != "invalid_idempotency_key" {
 			t.Fatalf("got %d %s", r.status, r.body)
 		}
-		big := `{"action":"stop","ids":["` + strings.Repeat("x", maxJobRequestBytes) + `"]}`
+		big := `{"action":"stop","ids":["` + strings.Repeat("x", maxRequestBodyBytes) + `"]}`
 		if r := e.doKeyed(t, "POST", "/v1/containers/bulk", "k-big", big); r.status != http.StatusRequestEntityTooLarge || r.code() != "request_too_large" {
 			t.Fatalf("got %d %s", r.status, clipTo(string(r.body), 300))
 		}
@@ -95,6 +96,76 @@ func TestEveryRefusalCarriesACode(t *testing.T) {
 			t.Fatalf("got %d %s", r.status, r.body)
 		}
 	})
+	e.waitJobs(t)
+}
+
+// countingReader serves n bytes and records how many were read.
+type countingReader struct {
+	remaining, read int
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	if r.remaining == 0 {
+		return 0, io.EOF
+	}
+	n := min(len(p), r.remaining)
+	for i := range n {
+		p[i] = 'x'
+	}
+	r.remaining -= n
+	r.read += n
+	return n, nil
+}
+
+// TestEveryBodyIsBounded: an un-keyed request is bounded too, and an oversized
+// body is refused without reading past the limit.
+func TestEveryBodyIsBounded(t *testing.T) {
+	e := newCapEnv(t, testSelfID, defaultContainers)
+	routes := []struct{ method, path string }{
+		{"POST", "/v1/projects"},
+		{"POST", "/v1/projects/owned/op"},
+		{"POST", "/v1/projects/owned/copy"},
+		{"POST", "/v1/containers/gdrive-agent/stop"},
+		{"DELETE", "/v1/containers/gdrive-agent"},
+		{"POST", "/v1/containers/bulk"},
+		{"POST", "/v1/jobs/j/cancel"},
+		{"POST", "/v1/images/refresh"},
+	}
+	for _, rt := range routes {
+		t.Run("chunked"+rt.method+rt.path, func(t *testing.T) {
+			body := &countingReader{remaining: 2 * maxRequestBodyBytes}
+			req := httptest.NewRequest(rt.method, rt.path, body)
+			req.ContentLength = -1 // undeclared: the limit must stop the read itself
+			w := httptest.NewRecorder()
+			e.r.ServeHTTP(w, req)
+			if w.Code != http.StatusRequestEntityTooLarge || !strings.Contains(w.Body.String(), `"request_too_large"`) {
+				t.Fatalf("got %d %s", w.Code, clipTo(w.Body.String(), 200))
+			}
+			if body.read > maxRequestBodyBytes+1 {
+				t.Fatalf("read %d bytes of an oversized body; the limit is %d", body.read, maxRequestBodyBytes)
+			}
+		})
+		t.Run("declared"+rt.method+rt.path, func(t *testing.T) {
+			body := &countingReader{remaining: maxRequestBodyBytes + 1}
+			req := httptest.NewRequest(rt.method, rt.path, body)
+			req.ContentLength = maxRequestBodyBytes + 1
+			w := httptest.NewRecorder()
+			e.r.ServeHTTP(w, req)
+			if w.Code != http.StatusRequestEntityTooLarge || body.read != 0 {
+				t.Fatalf("got %d after reading %d bytes, want 413 before reading", w.Code, body.read)
+			}
+		})
+	}
+	t.Run("at-the-limit-is-accepted", func(t *testing.T) {
+		pad := strings.Repeat(" ", maxRequestBodyBytes-len(`{"action":"restart","ids":["gdrive-agent"]}`))
+		status, _ := e.do(t, "POST", "/v1/containers/bulk", json.RawMessage(`{"action":"restart","ids":["gdrive-agent"]}`+pad))
+		if status != http.StatusAccepted {
+			t.Fatalf("a body of exactly the limit: got %d", status)
+		}
+	})
+	if n := e.eng.mutationCount(); n > 1 {
+		t.Fatalf("oversized requests acted: %d mutations", n)
+	}
 	e.waitJobs(t)
 }
 

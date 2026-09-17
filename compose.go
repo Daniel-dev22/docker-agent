@@ -36,7 +36,7 @@ type composeBackend struct {
 	cli  command.Cli
 	base api.Compose // no per-job streams — used for LoadProject / queries only
 	root string      // ComposeRoot: every file a load reads must resolve under it
-	// modelCheck is the pre-load model scan (confineModelLabelFiles). The real load
+	// modelCheck is the pre-load scan (preLoadCheck). The real load
 	// guards include/extends on its own as well — the two build their options
 	// separately, so each must hold without the other; a test swaps this out to
 	// prove it.
@@ -65,7 +65,7 @@ func newComposeBackend(cfg Config) (*composeBackend, error) {
 		return nil, fmt.Errorf("compose service: %w", err)
 	}
 	b := &composeBackend{cli: dockerCli, base: base, root: cfg.ComposeRoot}
-	b.modelCheck = b.confineModelLabelFiles
+	b.modelCheck = b.preLoadCheck
 	return b, nil
 }
 
@@ -172,17 +172,15 @@ func jobTimeoutDur(j *Job) *time.Duration {
 //     loader, and refuses an `include` or `extends.file` that escapes the root
 //     before the file is read. It also watches include events, so an included
 //     project's .env is checked before compose loads it.
-//  3. A service `label_file` is read DURING the project load, and compose's dotenv
-//     parser quotes a line it cannot parse. So the raw model is loaded first
-//     (compose-go's LoadModel: includes and extends applied, paths resolved, no
-//     label or env file read) and every service label_file in it is confined.
+//  3. Pre-load scans (modelCheck), for what compose reads with no hook at all:
+//     every `include:` entry's paths, env_file and project_directory, recursively
+//     (includescan.go), then — from the raw model, loaded with includes and extends
+//     applied but no label or env file read — every service `label_file`. Include
+//     processing and label_file loading both read files, and compose's dotenv
+//     parser quotes a line it cannot parse.
 //  4. Service environment resolution — reading every service `env_file` — is
 //     deferred. After the load, every service env_file and label_file in the
 //     project is confined, and only then is the environment resolved.
-//
-// Not reachable from any hook compose-go exposes, and so not confined here: an
-// include's own `env_file` and a custom include `project_directory`. Both are read
-// during include processing, before either the model or the project exists.
 func (b *composeBackend) loadProject(ctx context.Context, e ProjectEntry) (*types.Project, error) {
 	paths, err := resolveLoadPaths(e)
 	if err != nil {
@@ -230,10 +228,10 @@ func (b *composeBackend) loadProject(ctx context.Context, e ProjectEntry) (*type
 	return project.WithServicesEnvironmentResolved(false)
 }
 
-// confineModelLabelFiles loads the raw model with the same files, environment and
-// guard as the real load, and confines every service label_file before compose
-// would read one.
-func (b *composeBackend) confineModelLabelFiles(ctx context.Context, e ProjectEntry, paths loadPaths, guard *loadGuard) error {
+// preLoadCheck confines what compose reads with no hook, before any load does: the
+// include tree (includescan.go), then every service label_file in the raw model.
+// Both run with the same files and environment as the real load.
+func (b *composeBackend) preLoadCheck(ctx context.Context, e ProjectEntry, paths loadPaths, guard *loadGuard) error {
 	fns := []cli.ProjectOptionsFn{
 		cli.WithWorkingDirectory(e.WorkingDir),
 		cli.WithOsEnv,
@@ -248,6 +246,10 @@ func (b *composeBackend) confineModelLabelFiles(ctx context.Context, e ProjectEn
 	}
 	opts, err := cli.NewProjectOptions(paths.config, fns...)
 	if err != nil {
+		return err
+	}
+	scan := includeScan{root: b.root, remotes: b.remoteLoaders(), onProjectDir: guard.addBase}
+	if err := scan.scan(ctx, paths.config, e.WorkingDir, e.WorkingDir, opts.Environment, 0, nil); err != nil {
 		return err
 	}
 	model, err := opts.LoadModel(ctx)
@@ -297,12 +299,14 @@ func (b *composeBackend) remoteLoaders() []loader.ResourceLoader {
 // so compose never opens it; every other reference falls through to compose's own
 // loaders unchanged.
 //
-// A relative reference is resolved by compose against the working dir of the load
+// A relative reference is resolved by compose against the directory of the load
 // context it appears in — the project's, or an included project's — which the
-// loader interface does not pass. The guard therefore checks it against every
-// working dir the load has entered (the project's, and each include's, learned
-// from include events that fire before the include is resolved) and refuses if any
-// resolution escapes.
+// loader interface does not pass. The guard therefore checks it against every such
+// directory it knows and refuses if any resolution escapes. It knows the project's
+// working dir, every included project's directory from the include scan, and — on
+// its own, for a top-level include — the directory an include event names. A
+// nested include's event carries a directory RELATIVE to its includer, which is
+// never used as a base: resolving against it would refuse legitimate files.
 type loadGuard struct {
 	root    string
 	remotes []loader.ResourceLoader
@@ -314,6 +318,15 @@ type loadGuard struct {
 
 func newLoadGuard(root, workingDir string, remotes []loader.ResourceLoader) *loadGuard {
 	return &loadGuard{root: root, remotes: remotes, bases: map[string]struct{}{filepath.Clean(workingDir): {}}}
+}
+
+func (g *loadGuard) addBase(dir string) {
+	if !filepath.IsAbs(dir) {
+		return
+	}
+	g.mu.Lock()
+	g.bases[filepath.Clean(dir)] = struct{}{}
+	g.mu.Unlock()
 }
 
 func (g *loadGuard) violation() error {
@@ -394,19 +407,11 @@ func (g *loadGuard) listen(event string, metadata map[string]any) {
 	case []string:
 		refs = v
 	}
-	if wd == "" || len(refs) == 0 {
-		return
-	}
-	g.mu.Lock()
-	g.bases[filepath.Clean(wd)] = struct{}{}
-	g.mu.Unlock()
-	if g.isRemote(refs[0]) {
-		return
+	if !filepath.IsAbs(wd) || len(refs) == 0 || g.isRemote(refs[0]) {
+		return // a nested include: its directories come from the include scan
 	}
 	projectDir := filepath.Dir(absAgainst(wd, refs[0]))
-	g.mu.Lock()
-	g.bases[projectDir] = struct{}{}
-	g.mu.Unlock()
+	g.addBase(projectDir)
 	dotenv := filepath.Join(projectDir, ".env")
 	if _, err := os.Lstat(dotenv); err == nil {
 		if err := confinePath(dotenv, g.root); err != nil {

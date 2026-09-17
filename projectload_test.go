@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 const loadSecret = "SECRET-TOKEN-7f3a"
@@ -209,6 +210,135 @@ func TestProjectLoadIsConfined(t *testing.T) {
 		}
 		if p.Services["app"].Image != "alpine:3.20" {
 			t.Fatalf("the override was not applied: %q", p.Services["app"].Image)
+		}
+	})
+	// Include processing reads an include's env_file and stats its project_directory
+	// with no loader or listener; the pre-load include scan must refuse first.
+	must(t, os.WriteFile(filepath.Join(l.outside, "unparsable.env"), []byte(loadSecret+" !@#\n"), 0o600))
+	t.Run("include-env-file-outside", func(t *testing.T) {
+		for i, entry := range []string{
+			"  - path: lib/compose.yaml\n    env_file: " + filepath.Join(l.outside, "unparsable.env"),
+			"  - path: lib/compose.yaml\n    env_file:\n      - " + filepath.Join(l.outside, "unparsable.env"),
+		} {
+			name := fmt.Sprintf("incenv%d", i)
+			dir := l.project(t, name, map[string]string{
+				"compose.yaml":     "include:\n" + entry + "\nservices:\n  app:\n    image: alpine\n",
+				"lib/compose.yaml": "services:\n  sidecar:\n    image: busybox\n",
+			})
+			_, err := l.cb.loadProject(ctx, ProjectEntry{Name: name, WorkingDir: dir})
+			refused(t, err)
+		}
+	})
+	t.Run("include-env-file-relative-escape", func(t *testing.T) {
+		dir := l.project(t, "incenvrel", map[string]string{
+			"compose.yaml":     "services:\n  app:\n    image: alpine\n",
+			"lib/compose.yaml": "services:\n  sidecar:\n    image: busybox\n",
+		})
+		rel, err := filepath.Rel(dir, filepath.Join(l.outside, "unparsable.env"))
+		must(t, err)
+		must(t, os.WriteFile(filepath.Join(dir, "compose.yaml"),
+			[]byte("include:\n  - path: lib/compose.yaml\n    env_file: "+rel+"\nservices:\n  app:\n    image: alpine\n"), 0o644))
+		_, err = l.cb.loadProject(ctx, ProjectEntry{Name: "incenvrel", WorkingDir: dir})
+		refused(t, err)
+	})
+	t.Run("include-project-directory-outside", func(t *testing.T) {
+		must(t, os.WriteFile(filepath.Join(l.outside, ".env"), []byte(loadSecret+" !@#\n"), 0o600))
+		dir := l.project(t, "incpd", map[string]string{
+			"compose.yaml":     "include:\n  - path: lib/compose.yaml\n    project_directory: " + l.outside + "\nservices:\n  app:\n    image: alpine\n",
+			"lib/compose.yaml": "services:\n  sidecar:\n    image: busybox\n",
+		})
+		_, err := l.cb.loadProject(ctx, ProjectEntry{Name: "incpd", WorkingDir: dir})
+		refused(t, err)
+	})
+	t.Run("include-string-and-list-forms-outside", func(t *testing.T) {
+		for i, entry := range []string{
+			"  - " + filepath.Join(l.outside, "inc.yaml"),
+			"  - path:\n      - lib/compose.yaml\n      - " + filepath.Join(l.outside, "inc.yaml"),
+		} {
+			name := fmt.Sprintf("incform%d", i)
+			dir := l.project(t, name, map[string]string{
+				"compose.yaml":     "include:\n" + entry + "\nservices:\n  app:\n    image: alpine\n",
+				"lib/compose.yaml": "services:\n  sidecar:\n    image: busybox\n",
+			})
+			_, err := l.cb.loadProject(ctx, ProjectEntry{Name: name, WorkingDir: dir})
+			refused(t, err)
+		}
+	})
+	t.Run("nested-include-outside-at-depth-2", func(t *testing.T) {
+		dir := l.project(t, "incdeep", map[string]string{
+			"compose.yaml":     "include:\n  - a/compose.yaml\nservices:\n  app:\n    image: alpine\n",
+			"a/compose.yaml":   "include:\n  - b/compose.yaml\nservices:\n  a:\n    image: busybox\n",
+			"a/b/compose.yaml": "include:\n  - path: c.yaml\n    env_file: " + filepath.Join(l.outside, "unparsable.env") + "\nservices:\n  b:\n    image: busybox\n",
+			"a/b/c.yaml":       "services:\n  c:\n    image: busybox\n",
+		})
+		_, err := l.cb.loadProject(ctx, ProjectEntry{Name: "incdeep", WorkingDir: dir})
+		refused(t, err)
+	})
+	t.Run("nested-include-inside-loads", func(t *testing.T) {
+		dir := l.project(t, "incdeepok", map[string]string{
+			"compose.yaml":     "include:\n  - a/compose.yaml\nservices:\n  app:\n    image: alpine\n",
+			"a/compose.yaml":   "include:\n  - path: b/compose.yaml\n    env_file: " + filepath.Join(l.root, "incdeepok", "a", "b", "b.env") + "\nservices:\n  a:\n    image: busybox\n",
+			"a/b/compose.yaml": "services:\n  b:\n    image: ${B_IMAGE}\n",
+			"a/b/b.env":        "B_IMAGE=busybox:1.36\n",
+		})
+		p, err := l.cb.loadProject(ctx, ProjectEntry{Name: "incdeepok", WorkingDir: dir})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.Services["b"].Image != "busybox:1.36" {
+			t.Fatalf("a confined nested include with its env_file must still load: %+v", p.Services["b"])
+		}
+	})
+	// compose resolves a nested include's relative env_file against the includer's
+	// RELATIVE working dir — the process cwd. The scan must confine that file, not
+	// the one a reader of the YAML would expect.
+	t.Run("nested-relative-env-file-resolves-like-compose", func(t *testing.T) {
+		cwd, err := os.Getwd()
+		must(t, err)
+		dir := l.project(t, "incquirk", map[string]string{
+			"compose.yaml":     "include:\n  - a/compose.yaml\nservices:\n  app:\n    image: alpine\n",
+			"a/compose.yaml":   "include:\n  - path: b/compose.yaml\n    env_file: quirk.env\nservices:\n  a:\n    image: busybox\n",
+			"a/b/compose.yaml": "services:\n  b:\n    image: busybox\n",
+			"a/quirk.env":      "X=1\n",
+		})
+		// compose opens <cwd>/a/quirk.env (outside the root), not <dir>/a/quirk.env.
+		_, err = l.cb.loadProject(ctx, ProjectEntry{Name: "incquirk", WorkingDir: dir})
+		if within(cwd, l.root) {
+			t.Skip("test cwd is under the compose root")
+		}
+		refused(t, err)
+	})
+	t.Run("include-cycle-is-refused-without-hanging", func(t *testing.T) {
+		dir := l.project(t, "inccycle", map[string]string{
+			"compose.yaml":   "include:\n  - a/compose.yaml\nservices:\n  app:\n    image: alpine\n",
+			"a/compose.yaml": "include:\n  - ../compose.yaml\nservices:\n  a:\n    image: busybox\n",
+		})
+		done := make(chan error, 1)
+		go func() {
+			_, err := l.cb.loadProject(ctx, ProjectEntry{Name: "inccycle", WorkingDir: dir})
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			if err == nil || !strings.Contains(err.Error(), "cycle") {
+				t.Fatalf("got %v, want an include cycle refusal", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("an include cycle hung the load")
+		}
+	})
+	t.Run("include-depth-is-bounded", func(t *testing.T) {
+		files := map[string]string{}
+		dirPath := ""
+		for i := range maxIncludeDepth + 2 {
+			files[filepath.Join(dirPath, "compose.yaml")] = fmt.Sprintf("include:\n  - d/compose.yaml\nservices:\n  s%d:\n    image: busybox\n", i)
+			dirPath = filepath.Join(dirPath, "d")
+		}
+		files[filepath.Join(dirPath, "compose.yaml")] = "services:\n  leaf:\n    image: busybox\n"
+		dir := l.project(t, "incdepth", files)
+		_, err := l.cb.loadProject(ctx, ProjectEntry{Name: "incdepth", WorkingDir: dir})
+		if err == nil || !strings.Contains(err.Error(), "nest deeper") {
+			t.Fatalf("got %v, want the depth bound", err)
 		}
 	})
 	// The real load's own guard, with the model pre-scan out of the way: each must
