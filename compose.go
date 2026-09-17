@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -168,16 +167,17 @@ func jobTimeoutDur(j *Job) *time.Duration {
 //  1. resolveLoadPaths decides the compose and env files, and exactly those are
 //     passed: compose's discovery (COMPOSE_FILE, default names, the override
 //     file, the parent-directory walk) never runs. Each is confined first.
-//  2. A loadGuard sits in compose's resource-loader chain ahead of its local
-//     loader, and refuses an `include` or `extends.file` that escapes the root
-//     before the file is read. It also watches include events, so an included
-//     project's .env is checked before compose loads it.
-//  3. Pre-load scans (modelCheck), for what compose reads with no hook at all:
-//     every `include:` entry's paths, env_file and project_directory, recursively
-//     (includescan.go), then — from the raw model, loaded with includes and extends
-//     applied but no label or env file read — every service `label_file`. Include
-//     processing and label_file loading both read files, and compose's dotenv
-//     parser quotes a line it cannot parse.
+//  2. The pre-load scan (modelCheck → projectscan.go) walks every include and
+//     extends reference the way compose resolves it, from each reference's exact
+//     base, and confines every file it reaches — including an include's env_file
+//     and project_directory, which compose reads with no hook at all. Then, from
+//     the raw model (includes and extends applied, no label or env file read),
+//     every service `label_file` is confined. Include processing and label_file
+//     loading both read files, and compose's dotenv parser quotes a line it cannot
+//     parse.
+//  3. A loadGuard sits in compose's resource-loader chain ahead of its local
+//     loader and lets through only the references the scan approved, refusing any
+//     other one before it is read: it fails CLOSED.
 //  4. Service environment resolution — reading every service `env_file` — is
 //     deferred. After the load, every service env_file and label_file in the
 //     project is confined, and only then is the environment resolved.
@@ -191,7 +191,7 @@ func (b *composeBackend) loadProject(ctx context.Context, e ProjectEntry) (*type
 			return nil, err
 		}
 	}
-	guard := newLoadGuard(b.root, e.WorkingDir, b.remoteLoaders())
+	guard := newLoadGuard(b.remoteLoaders(), paths.config)
 	if err := b.modelCheck(ctx, e, paths, guard); err != nil {
 		return nil, err
 	}
@@ -205,7 +205,6 @@ func (b *composeBackend) loadProject(ctx context.Context, e ProjectEntry) (*type
 			cli.WithResourceLoader(guard),
 			cli.WithoutEnvironmentResolution,
 		},
-		LoadListeners: []api.LoadListener{guard.listen},
 	})
 	if v := guard.violation(); v != nil {
 		return nil, v // compose's error, if any, may quote the refused file
@@ -228,9 +227,10 @@ func (b *composeBackend) loadProject(ctx context.Context, e ProjectEntry) (*type
 	return project.WithServicesEnvironmentResolved(false)
 }
 
-// preLoadCheck confines what compose reads with no hook, before any load does: the
-// include tree (includescan.go), then every service label_file in the raw model.
-// Both run with the same files and environment as the real load.
+// preLoadCheck confines what compose reads, before any load does: every include and
+// extends reference from its exact base (projectscan.go), approving each for the
+// guard, then every service label_file in the raw model. Both run with the same
+// files and environment as the real load.
 func (b *composeBackend) preLoadCheck(ctx context.Context, e ProjectEntry, paths loadPaths, guard *loadGuard) error {
 	fns := []cli.ProjectOptionsFn{
 		cli.WithWorkingDirectory(e.WorkingDir),
@@ -239,7 +239,6 @@ func (b *composeBackend) preLoadCheck(ctx context.Context, e ProjectEntry, paths
 		cli.WithDotEnv,
 		cli.WithName(e.Name),
 		cli.WithResourceLoader(guard),
-		cli.WithLoadOptions(func(o *loader.Options) { o.Listeners = append(o.Listeners, guard.listen) }),
 	}
 	for _, r := range b.remoteLoaders() {
 		fns = append(fns, cli.WithResourceLoader(r))
@@ -248,7 +247,7 @@ func (b *composeBackend) preLoadCheck(ctx context.Context, e ProjectEntry, paths
 	if err != nil {
 		return err
 	}
-	scan := includeScan{root: b.root, remotes: b.remoteLoaders(), onProjectDir: guard.addBase}
+	scan := projectScan{root: b.root, remotes: b.remoteLoaders(), approve: guard.approve}
 	if err := scan.scan(ctx, paths.config, e.WorkingDir, e.WorkingDir, opts.Environment, 0, nil); err != nil {
 		return err
 	}
@@ -294,38 +293,33 @@ func (b *composeBackend) remoteLoaders() []loader.ResourceLoader {
 	}
 }
 
-// loadGuard is a compose-go ResourceLoader placed ahead of the local loader. It
-// accepts only a LOCAL reference that escapes the compose root and fails its load,
-// so compose never opens it; every other reference falls through to compose's own
-// loaders unchanged.
-//
-// A relative reference is resolved by compose against the directory of the load
-// context it appears in — the project's, or an included project's — which the
-// loader interface does not pass. The guard therefore checks it against every such
-// directory it knows and refuses if any resolution escapes. It knows the project's
-// working dir, every included project's directory from the include scan, and — on
-// its own, for a top-level include — the directory an include event names. A
-// nested include's event carries a directory RELATIVE to its includer, which is
-// never used as a base: resolving against it would refuse legitimate files.
+// loadGuard is a compose-go ResourceLoader placed ahead of the local loader. A
+// resource loader is asked about every `include` path and `extends.file`, but is
+// never told the directory compose will resolve a relative one against — so the
+// guard does not try to resolve anything. The pre-load scan resolved every
+// reference from its exact base and confined it; the guard lets through exactly
+// the reference strings the scan approved (and the project's own compose files),
+// and claims and refuses every other local reference before compose reads it.
+// A reference the scan did not predict is refused, not guessed at.
 type loadGuard struct {
-	root    string
 	remotes []loader.ResourceLoader
 
-	mu    sync.Mutex
-	bases map[string]struct{}
-	err   error
+	mu       sync.Mutex
+	approved map[string]struct{}
+	err      error
 }
 
-func newLoadGuard(root, workingDir string, remotes []loader.ResourceLoader) *loadGuard {
-	return &loadGuard{root: root, remotes: remotes, bases: map[string]struct{}{filepath.Clean(workingDir): {}}}
-}
-
-func (g *loadGuard) addBase(dir string) {
-	if !filepath.IsAbs(dir) {
-		return
+func newLoadGuard(remotes []loader.ResourceLoader, configFiles []string) *loadGuard {
+	g := &loadGuard{remotes: remotes, approved: map[string]struct{}{}}
+	for _, f := range configFiles {
+		g.approve(f)
 	}
+	return g
+}
+
+func (g *loadGuard) approve(ref string) {
 	g.mu.Lock()
-	g.bases[filepath.Clean(dir)] = struct{}{}
+	g.approved[ref] = struct{}{}
 	g.mu.Unlock()
 }
 
@@ -333,14 +327,6 @@ func (g *loadGuard) violation() error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.err
-}
-
-func (g *loadGuard) refuse(err error) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.err == nil {
-		g.err = err
-	}
 }
 
 func (g *loadGuard) isRemote(ref string) bool {
@@ -352,72 +338,35 @@ func (g *loadGuard) isRemote(ref string) bool {
 	return false
 }
 
-// escape returns the refusal for a local reference, or nil when every resolution
-// stays under the root.
-func (g *loadGuard) escape(ref string) error {
-	if filepath.IsAbs(ref) {
-		return confinePath(ref, g.root)
-	}
-	g.mu.Lock()
-	bases := make([]string, 0, len(g.bases))
-	for b := range g.bases {
-		bases = append(bases, b)
-	}
-	g.mu.Unlock()
-	for _, b := range bases {
-		if err := confinePath(filepath.Join(b, ref), g.root); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (g *loadGuard) Accept(ref string) bool {
 	if g.isRemote(ref) {
 		return false
 	}
-	if err := g.escape(ref); err != nil {
-		g.refuse(err)
-		return true
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if _, ok := g.approved[ref]; ok {
+		return false
 	}
-	return false
+	if g.err == nil {
+		g.err = errUnscannedRef{ref}
+	}
+	return true
 }
 
 func (g *loadGuard) Load(_ context.Context, ref string) (string, error) {
 	if err := g.violation(); err != nil {
 		return "", err
 	}
-	return "", fmt.Errorf("refusing to load %s", echo(ref))
+	return "", errUnscannedRef{ref}
 }
 
 func (g *loadGuard) Dir(ref string) string { return filepath.Dir(ref) }
 
-// listen records each include's working dir (and the included project's
-// directory) as a base for later relative references, and checks the included
-// project's .env — which compose reads without consulting any loader.
-func (g *loadGuard) listen(event string, metadata map[string]any) {
-	if event != "include" {
-		return
-	}
-	wd, _ := metadata["workingdir"].(string)
-	var refs []string
-	switch v := metadata["path"].(type) {
-	case types.StringList:
-		refs = v
-	case []string:
-		refs = v
-	}
-	if !filepath.IsAbs(wd) || len(refs) == 0 || g.isRemote(refs[0]) {
-		return // a nested include: its directories come from the include scan
-	}
-	projectDir := filepath.Dir(absAgainst(wd, refs[0]))
-	g.addBase(projectDir)
-	dotenv := filepath.Join(projectDir, ".env")
-	if _, err := os.Lstat(dotenv); err == nil {
-		if err := confinePath(dotenv, g.root); err != nil {
-			g.refuse(err)
-		}
-	}
+// errUnscannedRef: compose asked for a file the pre-load scan never approved.
+type errUnscannedRef struct{ ref string }
+
+func (e errUnscannedRef) Error() string {
+	return fmt.Sprintf("compose referenced %s, which the pre-load scan did not confine; refusing to read it", echo(e.ref))
 }
 
 // ---------------------------------------------------------------------------

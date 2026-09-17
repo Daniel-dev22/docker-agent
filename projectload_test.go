@@ -332,7 +332,7 @@ func TestProjectLoadIsConfined(t *testing.T) {
 	t.Run("include-depth-is-bounded", func(t *testing.T) {
 		files := map[string]string{}
 		dirPath := ""
-		for i := range maxIncludeDepth + 2 {
+		for i := range maxScanDepth + 2 {
 			files[filepath.Join(dirPath, "compose.yaml")] = fmt.Sprintf("include:\n  - d/compose.yaml\nservices:\n  s%d:\n    image: busybox\n", i)
 			dirPath = filepath.Join(dirPath, "d")
 		}
@@ -345,13 +345,119 @@ func TestProjectLoadIsConfined(t *testing.T) {
 	})
 	// The real load's own guard, with the model pre-scan out of the way: each must
 	// refuse on its own.
-	t.Run("real-load-guard-holds-without-the-model-scan", func(t *testing.T) {
+	// Two levels deep, `../../` resolves against the INCLUDED project's directory —
+	// inside the stack — not the project's working dir.
+	t.Run("deep-include-extends-loads", func(t *testing.T) {
+		dir := l.project(t, "deepext", map[string]string{
+			"compose.yaml":     "include:\n  - a/compose.yaml\nservices:\n  app:\n    image: alpine\n",
+			"a/compose.yaml":   "include:\n  - b/compose.yaml\n",
+			"a/b/compose.yaml": "services:\n  deep:\n    extends:\n      file: ../../base.yml\n      service: base\n",
+			"base.yml":         "services:\n  base:\n    image: busybox:deep\n",
+		})
+		p, err := l.cb.loadProject(ctx, ProjectEntry{Name: "deepext", WorkingDir: dir})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.Services["deep"].Image != "busybox:deep" {
+			t.Fatalf("deep extends not applied: %+v", p.Services["deep"])
+		}
+	})
+	t.Run("deep-include-include-loads", func(t *testing.T) {
+		dir := l.project(t, "deepinc", map[string]string{
+			"compose.yaml":     "include:\n  - a/compose.yaml\nservices:\n  app:\n    image: alpine\n",
+			"a/compose.yaml":   "include:\n  - b/compose.yaml\n",
+			"a/b/compose.yaml": "include:\n  - ../../lib.yml\n",
+			"lib.yml":          "services:\n  lib:\n    image: busybox:lib\n",
+		})
+		p, err := l.cb.loadProject(ctx, ProjectEntry{Name: "deepinc", WorkingDir: dir})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.Services["lib"].Image != "busybox:lib" {
+			t.Fatalf("deep include not applied: %+v", p.Services)
+		}
+	})
+	t.Run("chained-extends-loads", func(t *testing.T) {
+		dir := l.project(t, "chain", map[string]string{
+			"compose.yaml":          "services:\n  app:\n    extends:\n      file: bases/mid.yml\n      service: mid\n",
+			"bases/mid.yml":         "services:\n  mid:\n    extends:\n      file: deeper/root.yml\n      service: root\n    environment:\n      MID: \"1\"\n",
+			"bases/deeper/root.yml": "services:\n  root:\n    image: busybox:chain\n",
+		})
+		p, err := l.cb.loadProject(ctx, ProjectEntry{Name: "chain", WorkingDir: dir})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.Services["app"].Image != "busybox:chain" {
+			t.Fatalf("chained extends not applied: %+v", p.Services["app"])
+		}
+	})
+	t.Run("extends-cycle-is-refused-without-hanging", func(t *testing.T) {
+		dir := l.project(t, "extcycle", map[string]string{
+			"compose.yaml": "services:\n  app:\n    extends:\n      file: a.yml\n      service: a\n",
+			"a.yml":        "services:\n  a:\n    extends:\n      file: b.yml\n      service: b\n",
+			"b.yml":        "services:\n  b:\n    extends:\n      file: a.yml\n      service: a\n",
+		})
+		done := make(chan error, 1)
+		go func() {
+			_, err := l.cb.loadProject(ctx, ProjectEntry{Name: "extcycle", WorkingDir: dir})
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatal("an extends cycle loaded")
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("an extends cycle hung the load")
+		}
+	})
+	// A reference that escapes from its exact base is refused, even beside a deep
+	// include that — from some other base — would have kept it inside.
+	must(t, os.WriteFile(filepath.Join(l.outside, "base.yml"), []byte("services:\n  base:\n    image: "+loadSecret+"\n"), 0o644))
+	t.Run("extends-escaping-its-own-base-beside-a-deep-include", func(t *testing.T) {
+		outsideRel, err := filepath.Rel(filepath.Join(l.root, "escdeep"), filepath.Join(l.outside, "base.yml"))
+		must(t, err)
+		dir := l.project(t, "escdeep", map[string]string{
+			"compose.yaml":       "include:\n  - x/y/z/compose.yaml\nservices:\n  app:\n    extends:\n      file: " + outsideRel + "\n      service: base\n",
+			"x/y/z/compose.yaml": "services:\n  deep:\n    image: busybox\n",
+		})
+		_, err = l.cb.loadProject(ctx, ProjectEntry{Name: "escdeep", WorkingDir: dir})
+		refused(t, err)
+	})
+	t.Run("chained-extends-escaping", func(t *testing.T) {
+		dir := l.project(t, "chainesc", map[string]string{
+			"compose.yaml":  "services:\n  app:\n    extends:\n      file: bases/mid.yml\n      service: mid\n",
+			"bases/mid.yml": "services:\n  mid:\n    extends:\n      file: " + filepath.Join(l.outside, "base.yml") + "\n      service: base\n",
+		})
+		_, err := l.cb.loadProject(ctx, ProjectEntry{Name: "chainesc", WorkingDir: dir})
+		refused(t, err)
+	})
+	// The project's own .env: resolved by resolveLoadPaths, and confined before
+	// compose parses it.
+	t.Run("top-level-dotenv-symlinked-outside", func(t *testing.T) {
+		unparsable := filepath.Join(l.outside, "dotenv-unparsable")
+		must(t, os.WriteFile(unparsable, []byte(loadSecret+" !@#\n"), 0o600))
+		dir := l.project(t, "dotenvout", map[string]string{"compose.yaml": "services:\n  app:\n    image: alpine\n"})
+		must(t, os.Symlink(unparsable, filepath.Join(dir, ".env")))
+		_, err := l.cb.loadProject(ctx, ProjectEntry{Name: "dotenvout", WorkingDir: dir})
+		refused(t, err)
+	})
+	// With the pre-load scan out of the way nothing is approved: the real load's
+	// guard must refuse every include and extends reference — even ones inside the
+	// root — rather than guess at a base.
+	t.Run("real-load-guard-fails-closed-without-the-scan", func(t *testing.T) {
 		noScan, err := newComposeBackend(Config{DockerHost: newFakeEngine(t).host(), ComposeRoot: l.root})
 		must(t, err)
 		noScan.modelCheck = func(context.Context, ProjectEntry, loadPaths, *loadGuard) error { return nil }
-		for _, name := range []string{"incabs", "increl", "incdotenv", "extabs"} {
+		for _, name := range []string{"incabs", "increl", "incok", "extabs", "extok"} {
 			_, err := noScan.loadProject(ctx, ProjectEntry{Name: name, WorkingDir: filepath.Join(l.root, name)})
-			refused(t, err)
+			if err == nil || !strings.Contains(err.Error(), "pre-load scan did not confine") {
+				t.Fatalf("%s: want a fail-closed refusal, got %v", name, err)
+			}
+		}
+		// The project's own compose files are approved without the scan.
+		if _, err := noScan.loadProject(ctx, ProjectEntry{Name: "overrideok", WorkingDir: filepath.Join(l.root, "overrideok")}); err != nil {
+			t.Fatalf("a project with no references must still load: %v", err)
 		}
 	})
 	t.Run("no-compose-file-does-not-walk-up", func(t *testing.T) {
@@ -383,7 +489,7 @@ func TestProjectLoadIsConfined(t *testing.T) {
 func TestIncludeScanRules(t *testing.T) {
 	ctx := context.Background()
 	l := newLoadEnv(t)
-	scan := includeScan{root: l.root}
+	scan := projectScan{root: l.root}
 	run := func(t *testing.T, name string, files map[string]string) error {
 		t.Helper()
 		dir := l.project(t, name, files)
@@ -449,24 +555,19 @@ func TestIncludeScanRules(t *testing.T) {
 	})
 }
 
-func TestLoadGuardBases(t *testing.T) {
-	root := t.TempDir()
-	g := newLoadGuard(root, root, nil)
-	g.addBase("relative/dir")
-	if len(g.bases) != 1 {
-		t.Fatalf("a relative base was added: %v", g.bases)
+func TestLoadGuardApprovedSet(t *testing.T) {
+	g := newLoadGuard(nil, []string{"/root/p/compose.yaml"})
+	if g.Accept("/root/p/compose.yaml") || g.violation() != nil {
+		t.Fatal("a project compose file is approved")
 	}
-
-	// A nested include event names a working dir relative to its includer. Used as
-	// a base, or to locate a .env, it points at the process cwd.
-	cwd := t.TempDir()
-	secret := filepath.Join(t.TempDir(), "secret")
-	must(t, os.WriteFile(secret, []byte("x"), 0o600))
-	must(t, os.MkdirAll(filepath.Join(cwd, "a", "b"), 0o755))
-	must(t, os.Symlink(secret, filepath.Join(cwd, "a", "b", ".env")))
-	t.Chdir(cwd)
-	g.listen("include", map[string]any{"path": types.StringList{"b/compose.yaml"}, "workingdir": "a"})
-	if v := g.violation(); v != nil || len(g.bases) != 1 {
-		t.Fatalf("a nested include event was resolved against the cwd: %v %v", v, g.bases)
+	g.approve("lib/compose.yaml")
+	if g.Accept("lib/compose.yaml") || g.violation() != nil {
+		t.Fatal("an approved reference falls through to compose's loaders")
+	}
+	if !g.Accept("other/compose.yaml") {
+		t.Fatal("an unapproved reference must be claimed")
+	}
+	if _, err := g.Load(context.Background(), "other/compose.yaml"); err == nil || g.violation() == nil {
+		t.Fatalf("an unapproved reference must be refused: %v", err)
 	}
 }
