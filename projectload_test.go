@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/compose-spec/compose-go/v2/types"
 )
 
 const loadSecret = "SECRET-TOKEN-7f3a"
@@ -374,4 +376,97 @@ func TestProjectLoadIsConfined(t *testing.T) {
 			t.Fatal("COMPOSE_FILE from .env chose the compose file")
 		}
 	})
+}
+
+// TestIncludeScanRules exercises the include scan on its own, so each rule is
+// proven without the load guard or another rule refusing the same input first.
+func TestIncludeScanRules(t *testing.T) {
+	ctx := context.Background()
+	l := newLoadEnv(t)
+	scan := includeScan{root: l.root}
+	run := func(t *testing.T, name string, files map[string]string) error {
+		t.Helper()
+		dir := l.project(t, name, files)
+		return scan.scan(ctx, []string{filepath.Join(dir, "compose.yaml")}, dir, dir, types.Mapping{}, 0, nil)
+	}
+	must(t, os.WriteFile(filepath.Join(l.outside, "inc.yaml"), []byte("services:\n  x:\n    image: busybox\n"), 0o644))
+
+	t.Run("include-path-outside-with-project-directory-inside", func(t *testing.T) {
+		err := run(t, "rulepath", map[string]string{
+			"compose.yaml": "include:\n  - path: " + filepath.Join(l.outside, "inc.yaml") + "\n    project_directory: .\n    env_file: /dev/null\n",
+		})
+		if err == nil || !strings.Contains(err.Error(), "inc.yaml") || !strings.Contains(err.Error(), "outside docker-agent's compose root") {
+			t.Fatalf("got %v", err)
+		}
+	})
+	t.Run("project-directory-outside-without-an-env-file", func(t *testing.T) {
+		empty := t.TempDir() // outside the root, no .env
+		err := run(t, "rulepd", map[string]string{
+			"compose.yaml":     "include:\n  - path: lib/compose.yaml\n    project_directory: " + empty + "\n",
+			"lib/compose.yaml": "services:\n  x:\n    image: busybox\n",
+		})
+		if err == nil || !strings.Contains(err.Error(), filepath.Base(empty)) {
+			t.Fatalf("got %v", err)
+		}
+	})
+	t.Run("string-form", func(t *testing.T) {
+		err := run(t, "rulestring", map[string]string{"compose.yaml": "include:\n  - " + filepath.Join(l.outside, "inc.yaml") + "\n"})
+		refused(t, err)
+	})
+	t.Run("cycle", func(t *testing.T) {
+		err := run(t, "rulecycle", map[string]string{
+			"compose.yaml":   "include:\n  - a/compose.yaml\n",
+			"a/compose.yaml": "include:\n  - ../compose.yaml\n",
+		})
+		if err == nil || !strings.Contains(err.Error(), "include cycle") {
+			t.Fatalf("got %v", err)
+		}
+	})
+	t.Run("nested-interpolation-sees-the-include-env-file", func(t *testing.T) {
+		abs := filepath.Join(l.root, "ruleenv", "a", "vars.env")
+		err := run(t, "ruleenv", map[string]string{
+			"compose.yaml":   "include:\n  - path: a/compose.yaml\n    env_file: " + abs + "\n",
+			"a/vars.env":     "INC=" + filepath.Join(l.outside, "inc.yaml") + "\n",
+			"a/compose.yaml": "include:\n  - ${INC}\n",
+		})
+		refused(t, err)
+	})
+	t.Run("nested-relative-env-file-uses-compose-working-dir", func(t *testing.T) {
+		// compose resolves this env_file against the includer's RELATIVE working dir
+		// ("a") — from the process cwd — so that is the file that must be confined.
+		t.Chdir(l.outside)
+		must(t, os.MkdirAll(filepath.Join(l.outside, "a"), 0o755))
+		must(t, os.WriteFile(filepath.Join(l.outside, "a", "quirk.env"), []byte("X=1\n"), 0o644))
+		err := run(t, "rulequirk", map[string]string{
+			"compose.yaml":     "include:\n  - a/compose.yaml\n",
+			"a/compose.yaml":   "include:\n  - path: b/compose.yaml\n    env_file: quirk.env\n",
+			"a/b/compose.yaml": "services:\n  x:\n    image: busybox\n",
+			"a/quirk.env":      "X=1\n",
+		})
+		if err == nil || !strings.Contains(err.Error(), filepath.Join(l.outside, "a", "quirk.env")) {
+			t.Fatalf("the scan must confine the file compose opens (<cwd>/a/quirk.env): %v", err)
+		}
+	})
+}
+
+func TestLoadGuardBases(t *testing.T) {
+	root := t.TempDir()
+	g := newLoadGuard(root, root, nil)
+	g.addBase("relative/dir")
+	if len(g.bases) != 1 {
+		t.Fatalf("a relative base was added: %v", g.bases)
+	}
+
+	// A nested include event names a working dir relative to its includer. Used as
+	// a base, or to locate a .env, it points at the process cwd.
+	cwd := t.TempDir()
+	secret := filepath.Join(t.TempDir(), "secret")
+	must(t, os.WriteFile(secret, []byte("x"), 0o600))
+	must(t, os.MkdirAll(filepath.Join(cwd, "a", "b"), 0o755))
+	must(t, os.Symlink(secret, filepath.Join(cwd, "a", "b", ".env")))
+	t.Chdir(cwd)
+	g.listen("include", map[string]any{"path": types.StringList{"b/compose.yaml"}, "workingdir": "a"})
+	if v := g.violation(); v != nil || len(g.bases) != 1 {
+		t.Fatalf("a nested include event was resolved against the cwd: %v %v", v, g.bases)
+	}
 }
