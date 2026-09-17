@@ -539,6 +539,37 @@ codes are under Idempotency-Key.
 
 ---
 
+## API consumers
+
+| Consumer | Where | Uses |
+|---|---|---|
+| control-center | the router's `/api/docker/:node/*` proxy; the frontend's stack editor, copy and fleet pages | register (`replace:true` from the editor), copy, ops, container verbs; reads `allowed_ops` / `operable` / `managed` / `ops_blocked` and refusal `code`s |
+| Ansible | `plugins/module_utils/docker_agent_client.py` — the one client behind the `docker_agent_stack` module and `system_monitor` | register (`replace:true`), ops |
+| Test harness | control-center `tools/docker-agent-test` | every endpoint; asserts `409 project_exists` without `replace` |
+
+### Rollout order: consumers first, agents last
+
+A contract change ships to every consumer **before** any agent runs it. The changes are safe in
+that direction and only in that direction:
+
+- **A request field the agent now requires.** Registering onto an existing project needs
+  `"replace": true`. An old agent binds request bodies with `ShouldBindJSON` and no
+  `DisallowUnknownFields`, so it ignores `replace` — a new consumer works against it. An old
+  consumer against a new agent gets `409 project_exists` on every re-register: Ansible's re-run
+  of a deployed stack fails, and so does an editor save.
+- **Response fields the agent now adds** — `allowed_ops`, `operable`, `ops_blocked`, a refusal's
+  `code` and `retryable`. A consumer deployed first reads an old agent's responses without them,
+  so it must treat a missing field as *not reported*, never as a refusal or as "nothing allowed".
+- **`Idempotency-Key`** is optional. An old agent ignores the header, so a consumer that sends it
+  gets replay protection only once the agent is upgraded, and must not depend on it before then.
+
+So the order is: control-center (router and frontend, both sites) → the Ansible release
+(`docker_agent_client.py`, rolled out to the fleet) → the agents, host by host, through Ansible —
+the agent is never updated through its own API. The harness asserts the new refusal, so run it
+against an upgraded agent.
+
+---
+
 ## Controller contract
 
 The agent is not standalone: it expects a controller implementing five endpoints under the
