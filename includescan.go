@@ -101,9 +101,7 @@ func (s includeScan) scanInclude(ctx context.Context, inc types.IncludeConfig, l
 				return fmt.Errorf("include cycle: %s", echo(strings.Join(append(chain, p), " → ")))
 			}
 		}
-		if err := confinePath(p, s.root); err != nil {
-			return err
-		}
+		// Confined by the recursive scan below, before the file is read.
 		paths = append(paths, p)
 	}
 	if len(paths) == 0 {
@@ -201,11 +199,7 @@ func (s includeScan) includesOf(ctx context.Context, file, workingDir string, en
 	if !ok {
 		return nil, nil
 	}
-	for i, entry := range raw {
-		if p, ok := entry.(string); ok {
-			raw[i] = map[string]any{"path": p}
-		}
-	}
+	// Transform decodes the string form ("- file.yaml") itself, as compose does.
 	var includes []types.IncludeConfig
 	if err := loader.Transform(raw, &includes); err != nil {
 		return nil, fmt.Errorf("parse include in %s: %w", echo(file), err)
