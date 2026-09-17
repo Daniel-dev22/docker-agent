@@ -155,6 +155,34 @@ func TestMutationListIsBounded(t *testing.T) {
 	}
 }
 
+func TestTargetInspectsAreBounded(t *testing.T) {
+	e := newCapEnv(t, testSelfID, defaultContainers)
+	prev := selfListTimeout
+	selfListTimeout = 150 * time.Millisecond
+	t.Cleanup(func() { selfListTimeout = prev })
+	hang := make(chan struct{})
+	e.eng.set(func(f *fakeEngine) { f.inspectHang = hang })
+	t.Cleanup(func() { close(hang) })
+
+	done := make(chan int, 1)
+	go func() {
+		status, _ := e.do(t, http.MethodPost, "/v1/containers/bulk",
+			map[string]any{"action": "restart", "ids": []string{"a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8"}})
+		done <- status
+	}()
+	select {
+	case status := <-done:
+		if status != http.StatusServiceUnavailable {
+			t.Fatalf("got %d, want 503", status)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("hung inspects held the request past its bound")
+	}
+	if n := len(e.a.reg.list()); n != 0 {
+		t.Fatalf("no job may start; registry holds %d", n)
+	}
+}
+
 func TestGetProjectsRejectsAViewThatNeverFoundSelf(t *testing.T) {
 	e := newCapEnv(t, testSelfID, func(root string) []fakeContainer { return defaultContainers(root)[1:] })
 	if _, _, err := e.a.observeNow(context.Background()); err != nil {

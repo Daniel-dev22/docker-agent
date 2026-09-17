@@ -112,6 +112,7 @@ type fakeEngine struct {
 	// inspectErrFor fails only these references.
 	inspectErrFor map[string]bool
 	inspectDelay  time.Duration
+	inspectHang   chan struct{} // non-nil: inspects block until closed or the request ends
 	inFlight      int
 	maxInFlight   int
 	lists         int
@@ -216,6 +217,16 @@ func (f *fakeEngine) serve(w http.ResponseWriter, r *http.Request) {
 		}()
 		if delay > 0 {
 			time.Sleep(delay)
+		}
+		f.mu.Lock()
+		ihang := f.inspectHang
+		f.mu.Unlock()
+		if ihang != nil {
+			select {
+			case <-ihang:
+			case <-r.Context().Done():
+				return
+			}
 		}
 		if fail {
 			writeJSON(http.StatusInternalServerError, map[string]string{"message": "inspect timed out"})
