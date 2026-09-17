@@ -244,6 +244,7 @@ func TestIdempotencyPruneBounds(t *testing.T) {
 	if n := idemRows(t, db, "key LIKE 'old-%'"); n != 0 {
 		t.Fatalf("%d rows older than the window survived", n)
 	}
+
 	if n := idemRows(t, db, "state = 'done'"); n != idempotencyMaxRows {
 		t.Fatalf("%d recorded rows after prune, want the cap %d", n, idempotencyMaxRows)
 	}
@@ -255,6 +256,33 @@ func TestIdempotencyPruneBounds(t *testing.T) {
 	if idemRows(t, db, "key = 'recent-00050'") != 1 || idemRows(t, db, "key = 'live-claim'") != 1 {
 		t.Fatal("prune removed a row it must keep")
 	}
+
+	// The age bound must hold on its own, far below the row cap — above, the cap
+	// would have evicted the old rows anyway.
+	t.Run("age-bound-below-the-cap", func(t *testing.T) {
+		_, err := db.Exec(`DELETE FROM idempotency_keys`)
+		must(t, err)
+		tx, err := db.Begin()
+		must(t, err)
+		for i := range 5 {
+			_, err := tx.Exec(`INSERT INTO idempotency_keys (method, path, key, fingerprint, state, status, body, created_at_ns)
+				VALUES ('POST', '/v1/x', ?, 'fp', 'done', 202, '{}', ?)`, fmt.Sprintf("stale-%d", i), now.Add(-idempotencyWindow-time.Second).UnixNano())
+			must(t, err)
+			_, err = tx.Exec(`INSERT INTO idempotency_keys (method, path, key, fingerprint, state, status, body, created_at_ns)
+				VALUES ('POST', '/v1/x', ?, 'fp', 'done', 202, '{}', ?)`, fmt.Sprintf("fresh-%d", i), now.Add(-idempotencyWindow+time.Minute).UnixNano())
+			must(t, err)
+		}
+		must(t, tx.Commit())
+		if _, err := store.prune(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if n := idemRows(t, db, "key LIKE 'stale-%'"); n != 0 {
+			t.Fatalf("%d answers older than %v survived", n, idempotencyWindow)
+		}
+		if n := idemRows(t, db, "key LIKE 'fresh-%'"); n != 5 {
+			t.Fatalf("answers inside the window were pruned: %d left", n)
+		}
+	})
 }
 
 func TestIdempotencyRowSize(t *testing.T) {

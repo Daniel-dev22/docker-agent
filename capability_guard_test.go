@@ -545,6 +545,15 @@ func TestBundleReadsOnlyConfinedEditableFiles(t *testing.T) {
 		t.Fatalf("only the confined compose file may be read: %+v", b)
 	}
 
+	// Non-editable for a reason other than location: the agent's own stack, with
+	// its compose file under the root where confinement alone would allow reading.
+	selfDir := e.writeCompose(t, "docker-agent", "services: {agent: {environment: [SELF-SECRET]}}\n")
+	must(t, e.a.projects.register(ProjectEntry{Name: "docker-agent", WorkingDir: selfDir, ComposeFiles: []string{"docker-compose.yml"}}))
+	status, raw, _ = get("docker-agent")
+	if status != http.StatusOK || strings.Contains(raw, "SELF-SECRET") || !strings.Contains(raw, `"compose_files":[]`) {
+		t.Fatalf("the self stack is not editable, so its bundle must be empty: %d %s", status, raw)
+	}
+
 	status, raw, b = get("external")
 	if status != http.StatusOK || strings.Contains(raw, "SECRET-TOKEN") {
 		t.Fatalf("non-editable bundle leaked content: %d %s", status, raw)
