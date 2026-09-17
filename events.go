@@ -40,6 +40,11 @@ type EventPayload struct {
 // eventoutbox, owns pending_events) plus a local compose_jobs table that gives
 // the fleet snapshot restart-survival (the in-memory registry starts empty after
 // a restart; this retains recent history for the dashboard + the orphan sweep).
+// sqliteBusyTimeout is how long a statement on events.sqlite waits for another
+// connection's lock before failing. The driver does not abandon that wait when a
+// context expires, so a write that must be bounded lowers it (onBoundedConn).
+const sqliteBusyTimeout = 5 * time.Second
+
 type eventBuffer struct {
 	cfg    Config
 	db     *sql.DB
@@ -51,7 +56,7 @@ func newEventBuffer(cfg Config, client *http.Client) (*eventBuffer, error) {
 		return nil, fmt.Errorf("mkdir config dir: %w", err)
 	}
 	dbPath := filepath.Join(cfg.ConfigDir, "events.sqlite")
-	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	db, err := sql.Open("sqlite", fmt.Sprintf("%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(%d)", dbPath, sqliteBusyTimeout.Milliseconds()))
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}

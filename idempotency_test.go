@@ -482,6 +482,49 @@ func TestIdempotencyCloseIsBounded(t *testing.T) {
 	}
 }
 
+// TestIdempotencyShutdownIsBoundedWithAWriterMidAttempt: a background writer
+// already waiting on a locked database when shutdown starts must not stretch it —
+// close(), and the database close after it, return within close's budget.
+func TestIdempotencyShutdownIsBoundedWithAWriterMidAttempt(t *testing.T) {
+	dir := t.TempDir()
+	e := newCapEnv(t, testSelfID, defaultContainers)
+	withIdempotency(t, e, dir)
+	store := e.a.idem
+	store.retryBase = 20 * time.Millisecond
+	_, err := e.a.events.DB().Exec(`CREATE TRIGGER fail_record BEFORE UPDATE ON idempotency_keys BEGIN SELECT RAISE(ABORT, 'disk full'); END`)
+	must(t, err)
+	if r := e.doKeyed(t, http.MethodPost, "/v1/containers/gdrive-agent/stop", "k-mid", ""); r.status != http.StatusAccepted {
+		t.Fatalf("got %d", r.status)
+	}
+	e.waitJobs(t)
+
+	holder, err := sql.Open("sqlite", filepath.Join(dir, "events.sqlite")+"?_pragma=journal_mode(WAL)")
+	must(t, err)
+	defer holder.Close()
+	tx, err := holder.Begin()
+	must(t, err)
+	_, err = tx.Exec(`INSERT INTO idempotency_keys (method, path_sha, key, fingerprint, state, created_at_ns, proc)
+		VALUES ('POST', 'x', 'lock-holder', 'fp', 'in_flight', 0, 'other')`)
+	must(t, err)
+	defer tx.Rollback()
+	// The writer retried every few tens of milliseconds while the trigger failed
+	// it; its next attempt waits on the holder's lock before the trigger can run.
+	time.Sleep(300 * time.Millisecond)
+	store.mu.Lock()
+	pending := len(store.pending)
+	store.mu.Unlock()
+	if pending != 1 {
+		t.Fatalf("precondition: the answer is pending (%d)", pending)
+	}
+
+	start := time.Now()
+	store.close()
+	e.a.events.close()
+	if elapsed := time.Since(start); elapsed > idempotencyCloseBudget+time.Second {
+		t.Fatalf("shutdown took %v with a writer waiting on a locked database; budget %v", elapsed, idempotencyCloseBudget)
+	}
+}
+
 func TestIdempotencyClaimSettledOnPanicAndRecordFailure(t *testing.T) {
 	e := newCapEnv(t, testSelfID, defaultContainers)
 	withIdempotency(t, e, t.TempDir())

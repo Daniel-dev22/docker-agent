@@ -20,7 +20,9 @@ package main
 //     retry can succeed later.
 //   - An answer to a request that ACTED but could not be stored is kept in memory
 //     and served to retries while a background writer keeps trying to store it;
-//     close() makes one last bounded attempt at every such answer on shutdown.
+//     close() makes one last attempt at every such answer on shutdown. Every
+//     attempt waits for a locked database at most idempotencyCloseBudget, so
+//     close() — the writers' last attempts and its own — returns within it.
 //     Only an answer that still cannot be written then is lost — its claim stays in
 //     flight, the boot sweep releases it, and a retry re-runs the request.
 //   - Claims still in flight when the process died cannot have a recorded answer;
@@ -39,6 +41,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -94,10 +97,12 @@ const (
 	idempotencyMaxPending = 1024
 	idempotencyRetryMax   = time.Minute
 
-	// idempotencyCloseBudget bounds close()'s final writes of pending answers,
-	// all of them together. Shutdown is the HTTP server's 10s drain (main.go) plus
-	// this; a sqlite write that has not landed in 2s during shutdown is not going
-	// to, and the process must still exit.
+	// idempotencyCloseBudget bounds close(): a background writer's attempt in
+	// flight when it starts, then its own final writes of every pending answer,
+	// all together — so a writer's attempt waits at most this long too. Shutdown
+	// is the HTTP server's 10s drain (main.go) plus this; a sqlite write that has
+	// not landed in 2s during shutdown is not going to, and the process must still
+	// exit.
 	idempotencyCloseBudget = 2 * time.Second
 )
 
@@ -170,13 +175,16 @@ func newIdempotencyStore(db *sql.DB) (*idempotencyStore, error) {
 }
 
 // close stops the background writers, waits for them, then makes one final
-// attempt to store every answer still pending — all within idempotencyCloseBudget.
-// An answer stored here is replayed after the restart instead of the request
+// attempt to store every answer still pending — all within idempotencyCloseBudget,
+// measured from the call. A writer's attempt in flight began before the call and
+// waits at most the budget, so it ends inside it; the final writes get what is
+// left. An answer stored here is replayed after the restart instead of the request
 // being re-run.
 func (s *idempotencyStore) close() {
 	if s == nil {
 		return
 	}
+	deadline := time.Now().Add(idempotencyCloseBudget)
 	s.closing.Do(func() { close(s.done) })
 	s.writers.Wait()
 
@@ -189,43 +197,71 @@ func (s *idempotencyStore) close() {
 	if len(pending) == 0 {
 		return
 	}
-	// The sqlite driver does not abandon a lock wait when a context expires: the
-	// wait is sqlite's own busy_timeout (5s on this database), so the bound is set
-	// there. Every final write goes through one connection whose busy_timeout is the
-	// budget, restored before the connection returns to the pool.
-	deadline := time.Now().Add(idempotencyCloseBudget)
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
-	conn, err := s.db.Conn(ctx)
-	if err != nil {
-		slog.Error("idempotency answers lost at shutdown — no connection", "lost", len(pending), "error", err)
-		return
-	}
-	defer func() {
-		_, _ = conn.ExecContext(context.Background(), `PRAGMA busy_timeout = 5000`)
-		_ = conn.Close()
-	}()
 	stored := 0
-	for _, a := range pending {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			break
+	err := s.onBoundedConn(ctx, func(conn *sql.Conn, waitAtMost func(time.Duration) error) error {
+		for _, a := range pending {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return context.DeadlineExceeded
+			}
+			if err := waitAtMost(remaining); err != nil {
+				return err
+			}
+			if err := s.recordOn(ctx, conn, a); err != nil && !errors.Is(err, errClaimLost) {
+				continue
+			}
+			stored++
+			s.mu.Lock()
+			delete(s.pending, scopeKey(a.method, a.pathSHA, a.key))
+			s.mu.Unlock()
 		}
-		if _, err := conn.ExecContext(ctx, fmt.Sprintf(`PRAGMA busy_timeout = %d`, remaining.Milliseconds())); err != nil {
-			break
-		}
-		if err := s.recordOn(ctx, conn, a); err != nil && !errors.Is(err, errClaimLost) {
-			continue
-		}
-		stored++
-		s.mu.Lock()
-		delete(s.pending, scopeKey(a.method, a.pathSHA, a.key))
-		s.mu.Unlock()
-	}
+		return nil
+	})
 	if stored < len(pending) {
 		slog.Error("idempotency answers lost at shutdown — their requests re-run on retry",
-			"lost", len(pending)-stored, "stored", stored)
+			"lost", len(pending)-stored, "stored", stored, "error", err)
 	}
+}
+
+// recordWithin makes one attempt to store a, waiting at most d for a locked
+// database.
+func (s *idempotencyStore) recordWithin(a pendingAnswer, d time.Duration) error {
+	deadline := time.Now().Add(d)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+	return s.onBoundedConn(ctx, func(conn *sql.Conn, waitAtMost func(time.Duration) error) error {
+		if err := waitAtMost(time.Until(deadline)); err != nil {
+			return err
+		}
+		return s.recordOn(ctx, conn, a)
+	})
+}
+
+// onBoundedConn runs fn on one pooled connection whose lock wait fn lowers with
+// waitAtMost: the sqlite driver does not abandon a lock wait when a context
+// expires — the wait is busy_timeout — so a bound on a write is set there. The
+// connection goes back to the pool with sqliteBusyTimeout restored, or is
+// discarded when that fails, never pooled with a wait that gives up early.
+func (s *idempotencyStore) onBoundedConn(ctx context.Context, fn func(conn *sql.Conn, waitAtMost func(time.Duration) error) error) error {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if _, err := conn.ExecContext(context.Background(), fmt.Sprintf(`PRAGMA busy_timeout = %d`, sqliteBusyTimeout.Milliseconds())); err != nil {
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		}
+		_ = conn.Close()
+	}()
+	return fn(conn, func(d time.Duration) error {
+		if d <= 0 {
+			return context.DeadlineExceeded
+		}
+		_, err := conn.ExecContext(ctx, fmt.Sprintf(`PRAGMA busy_timeout = %d`, max(d.Milliseconds(), 1)))
+		return err
+	})
 }
 
 func pathSHA(path string) string {
@@ -367,7 +403,7 @@ func (s *idempotencyStore) keepPending(a pendingAnswer) bool {
 				return // close() makes the final attempt
 			case <-time.After(wait):
 			}
-			err := s.record(context.Background(), a)
+			err := s.recordWithin(a, idempotencyCloseBudget)
 			if err == nil || errors.Is(err, errClaimLost) {
 				if err != nil {
 					slog.Warn("idempotency answer could not be stored: key re-claimed by another request", "key", a.key)
