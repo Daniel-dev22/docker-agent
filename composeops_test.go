@@ -159,6 +159,8 @@ func TestNarrowedOpsWorkFromLabels(t *testing.T) {
 	must(t, err)
 	e.a.compose = cb
 	must(t, e.a.projects.register(ProjectEntry{Name: "duplicacy", WorkingDir: "/srv/duplicacy"}))
+	// The agent's own stack allows no op, so nothing on it is narrowable.
+	must(t, e.a.projects.register(ProjectEntry{Name: "docker-agent", WorkingDir: "/srv/containers/docker-agent"}))
 	must(t, os.MkdirAll(filepath.Join(e.root, "broken"), 0o755))
 	must(t, os.WriteFile(filepath.Join(e.root, "broken", "compose.yaml"), []byte("services: [not, a, map]\n"), 0o644))
 	must(t, e.a.projects.register(ProjectEntry{Name: "broken", WorkingDir: filepath.Join(e.root, "broken")}))
@@ -204,12 +206,17 @@ func TestNarrowedOpsWorkFromLabels(t *testing.T) {
 		Projects []map[string]any `json:"projects"`
 	}
 	must(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	seen := map[bool]bool{}
 	for _, p := range resp.Projects {
 		ops, _ := p["allowed_ops"].([]any)
 		narrowable := slices.ContainsFunc(ops, func(o any) bool { return o != "update" })
+		seen[narrowable] = true
 		if p["service_ops"] != narrowable {
 			t.Errorf("%s: service_ops=%v with allowed_ops %v — the advertisement must match what the ops honour", p["name"], p["service_ops"], ops)
 		}
+	}
+	if !seen[true] || !seen[false] {
+		t.Fatalf("fixture: the list must hold a narrowable project and one that is not: %s", w.Body.String())
 	}
 }
 
