@@ -362,7 +362,7 @@ func (w *auditWriter) WriteString(s string) (int, error) {
 // auditRefusalCodes fails the test for every 4xx a refusal route returns without a
 // code — across the whole suite, so a future code-less refusal fails whatever test
 // happens to reach it. Consumers retry a code-less 4xx as transient.
-func auditRefusalCodes(t *testing.T) gin.HandlerFunc {
+func auditRefusalCodes(t interface{ Errorf(string, ...any) }) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		aw := &auditWriter{ResponseWriter: c.Writer}
 		c.Writer = aw

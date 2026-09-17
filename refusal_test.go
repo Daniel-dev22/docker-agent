@@ -211,6 +211,43 @@ func TestRetryableContract(t *testing.T) {
 	})
 }
 
+type errorRecorder struct{ msgs []string }
+
+func (r *errorRecorder) Errorf(format string, args ...any) {
+	r.msgs = append(r.msgs, fmt.Sprintf(format, args...))
+}
+
+// TestRefusalAuditCatches is the audit's negative control: an audit that never
+// fires would leave every other refusal test vacuous.
+func TestRefusalAuditCatches(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		report bool
+	}{
+		{"coded-final", 409, `{"code":"project_exists","error":"x"}`, false},
+		{"allowlisted-retryable", 409, `{"code":"idempotency_key_in_flight","retryable":true}`, false},
+		{"code-less-4xx", 400, `{"error":"x"}`, true},
+		{"final-code-marked-retryable", 409, `{"code":"project_exists","retryable":true}`, true},
+		{"allowlisted-code-not-marked", 409, `{"code":"idempotency_key_in_flight"}`, true},
+		{"5xx-ignored", 500, `{"error":"x"}`, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rec := &errorRecorder{}
+			r := gin.New()
+			r.Use(auditRefusalCodes(rec))
+			r.POST("/v1/projects", func(g *gin.Context) { g.Data(c.status, "application/json", []byte(c.body)) })
+			r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/projects", nil))
+			if got := len(rec.msgs) > 0; got != c.report {
+				t.Fatalf("audit reported %v (%v), want %v", got, rec.msgs, c.report)
+			}
+		})
+	}
+}
+
 // failingReader returns some bytes and then an I/O error.
 type failingReader struct{ sent bool }
 
