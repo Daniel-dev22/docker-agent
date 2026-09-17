@@ -185,7 +185,7 @@ func TestEveryBodyIsBounded(t *testing.T) {
 // TestRetryableContract pins which refusals are not final. A coded 4xx is
 // dead-lettered by consumers; only these codes may say "retry".
 func TestRetryableContract(t *testing.T) {
-	if want := map[string]bool{"idempotency_key_in_flight": true}; !reflect.DeepEqual(retryableCodes, want) {
+	if want := map[string]bool{"idempotency_key_in_flight": true, "project_busy": true}; !reflect.DeepEqual(retryableCodes, want) {
 		t.Fatalf("retryableCodes = %v: a new retryable 4xx is a contract change for every consumer", retryableCodes)
 	}
 

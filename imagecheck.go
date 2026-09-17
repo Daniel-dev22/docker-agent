@@ -838,6 +838,14 @@ func (ic *imageChecker) checkUnit(ctx context.Context, c ContainerStatus, info i
 	res.SourceRevision, res.BuildContext = prov.Revision, prov.Context
 	res.SourceStatus = ic.sourceStatus(ctx, prov)
 
+	// A container created from an image ID has no reference to check: parsed as
+	// one, `sha256:…` is a repository named "sha256" on Docker Hub, and the check
+	// reported a registry 401 instead of the actual problem.
+	if isImageID(c.Image) {
+		res.Error = imageIDError(orDefault(c.ComposeService, c.Name), c.Image).Error()
+		return res
+	}
+
 	strat := ic.resolveStrategy(c, info, ref)
 	res.VersionSource = strat.label()
 

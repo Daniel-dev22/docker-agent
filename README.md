@@ -105,7 +105,9 @@ One flat `package main`. 29 source files plus 13 test files.
 | `stackengine.go` | `updateProject` — the whole pipeline (below), plus the rollback baseline, per-service tag persistence, rollback, and the failed-container log dump. |
 | `resolvers.go` | The four `ImageResolver` kinds and the selection logic; the upstream-compose fetch/cache/interpolate path. |
 | `healthwait.go` | Two-stage wait: container-ID swap detection, then a health poll with crash-loop (restart-count) detection. |
-| `tagwrite.go` | Writes a resolved tag back to the on-host compose scalar or `.env` var (YAML node round-trip, atomic write), returning the previous value so a rollback is reversible per service. |
+| `tagwrite.go` | Writes resolved images into the project's own files: one token in place (the compose scalar where compose takes the image from, or the value of its `.env` assignment), verified by reloading the project, reverted byte for byte. Refuses — changing nothing — whatever cannot be written that way. |
+| `envscan.go` | compose-go's dotenv parser with byte offsets kept, so an assignment can be rewritten in place — and a `KEY=` line inside another variable's quoted value is never mistaken for one. |
+| `projectlock.go` | Per-project serialisation: every project job, and the register/copy writes, hold the project's lock. |
 | `netreconcile.go` | Post-update check that no container came back attached to fewer networks than its service declares; one corrective `up --force-recreate` if so. Best-effort, never fails the update. |
 
 ### Image checking
@@ -197,6 +199,14 @@ curls `/health/ready`.
 A job object is `{id, project?, operation, target?, state, started_at, completed_at?, exit_code,
 error?, line_count, trigger_key?}` with `state` one of
 `pending|running|completed|failed|cancelled`.
+
+**One change per project at a time.** Every project-scoped job (`up`, `down`, `pull`, `restart`,
+`recreate`, `update`) holds its project's lock for its whole run; a second one on the same
+project waits, `running`, with `queued: waiting for job <id> (<op>) on project <name>` in its
+log. The wait honours cancellation and gives up after `DOCKER_COMPOSE_OP_TIMEOUT`, then the op
+runs with its own full timeout. Container verbs and jobs on other projects are not held up.
+Without it, two updates on one stack each rewrote the same `.env`: measured against the real
+writer, 2,000 concurrent pairs tore 367 files and lost 814 updates.
 
 ### Container lifecycle (6)
 
@@ -316,12 +326,28 @@ All three write coalesced frames (a burst of N queued log lines becomes one fram
    target cannot be resolved fails the update rather than silently redeploying the old pin and
    reporting success. For non-`registry` resolvers, an empty plan means *up to date* and the
    update stops cleanly — no needless force-recreate.
-3. **Apply.** Mutate the in-memory project **and** persist each tag to the on-host compose file
-   or `.env` (`tagwrite.go`), keeping the previous value per service. If persistence fails, the
-   already-written tags are reverted and the update fails — running state must never get ahead
-   of disk, or the next manual `compose up` would silently downgrade.
+3. **Persist.** Write each target into the project's files (`tagwrite.go`), then deploy the
+   project **as it now loads from disk** — so what runs is exactly what the next `compose up`
+   reads. The write:
+   - changes one token per service and nothing else: a literal image where compose takes it
+     from (the last compose file, and the last YAML document in it, that sets it); a
+     `${VAR}` image as the value of VAR's assignment in the env file compose takes it from,
+     keeping its quotes, inline comment and line ending — or a new `VAR=` line when nothing
+     declares it; a template whose only variable part is a trailing tag (`reg/app:${TAG}`,
+     `…:${TAG:-release}`) as the value of that tag variable;
+   - refuses, changing nothing, whatever cannot be written that way: an anchored or aliased
+     image, a tagged, block or escaped scalar, a merge key, a template that varies anything
+     but a trailing tag, a variable declared by a bare inheriting line or set in the agent's
+     own environment, a spelling that would not read back as the image;
+   - is **verified**: the project is reloaded with the agent's loader, every target must
+     resolve to its new image, and no other service, variable use, network or volume may
+     differ — a later assignment that shadows the write, or another service that shares the
+     variable, puts the original bytes back and fails the update.
+
+   Running state never gets ahead of disk: if persistence fails, nothing was written.
 4. **Pull, then `up --force-recreate`.** Both in-process, with progress streaming into the job
-   log. A pull failure reverts the persisted tags (nothing has been recreated yet).
+   log. A pull failure reverts the written files to their exact prior bytes (nothing has been
+   recreated yet).
 5. **Health-wait** (`healthwait.go`), in two stages:
    - *Swap detection* — wait for container IDs to change. Partial-update tolerant: it succeeds
      as soon as all containers have swapped, or once one has swapped plus a 20s grace for the
@@ -332,7 +358,9 @@ All three write coalesced frames (a burst of N queued log lines becomes one fram
      stopped container. Containers with no shell (so no healthcheck can ever report) are
      excluded — see `DOCKER_HEALTH_EXCLUDES`.
 6. **Rollback on failure.** Dump the tail of each unhealthy container's logs into the job log,
-   revert the persisted tags for the affected services, redeploy them pinned to their
+   revert the persisted tags for the affected services — each file rebuilt from its original
+   bytes with only the kept services' edits, never by writing an old value back; a file changed
+   by hand since the update is left alone and reported — redeploy them pinned to their
    pre-update image IDs with `PullPolicy: never`, and re-health-wait to report whether the
    rollback itself came back healthy. Scope is `per-container` by default (only the unhealthy
    services roll back; healthy updated ones keep their new version) or `whole-stack` for a
@@ -520,7 +548,8 @@ ID starts with `db`.
 | Malformed body, or a required field missing | 400 | `invalid_body` |
 | Op not one of the six | 400 | `invalid_op` |
 | `health_timeout_s` / `swap_timeout_s` out of range | 400 | `invalid_budget` |
-| `override_image` not a plain image reference | 400 | `invalid_override_image` |
+| `override_image` not an image reference by docker's own grammar (`distribution/reference`), or an image ID (`sha256:…`) | 400 | `invalid_override_image` |
+| Register or copy while another change holds the project for longer than 10s | 409 | `project_busy` (`"retryable": true`, `holder`) |
 | Bulk `action` not one of start/stop/restart/kill/remove | 400 | `invalid_action` |
 | More than 100 distinct targets | 400 | `too_many_targets` |
 | An ambiguous, malformed, or >255-byte container reference | 400 | `invalid_target` |
@@ -528,8 +557,9 @@ ID starts with `db`.
 | The container list or a target inspect failed | 503 | `self_identity_unavailable` |
 
 **Refusal semantics.** Every 4xx carries a `code`, and a coded 4xx is **final**: retrying the same
-request gets the same answer. The one exception says so with `"retryable": true` — currently only
-`idempotency_key_in_flight`, whose answer is still coming; a new retryable code is a contract change
+request gets the same answer. The exceptions say so with `"retryable": true` — only
+`idempotency_key_in_flight`, whose answer is still coming, and `project_busy`, whose project is
+being changed by the job or request named in `holder`; a new retryable code is a contract change
 for every consumer (the test suite pins the set). A failure that is not the caller's — a request
 body that could not be read, a write that failed, the Docker daemon not answering — is a 5xx, and
 only `503 self_identity_unavailable` carries a code there. Refusals echo caller input clipped to 512
@@ -562,6 +592,12 @@ that direction and only in that direction:
   so it must treat a missing field as *not reported*, never as a refusal or as "nothing allowed".
 - **`Idempotency-Key`** is optional. An old agent ignores the header, so a consumer that sends it
   gets replay protection only once the agent is upgraded, and must not depend on it before then.
+- **`409 project_busy`** is new and retryable: a register or copy onto a project a job is
+  changing. A consumer should retry after the named holder finishes; one that does not yet know
+  the code surfaces it as an error, which is safe — nothing was written.
+- **`override_image` validation is stricter**: docker's reference grammar, and no image IDs. A
+  value control-api accepted and the old agent took (`traefik:`, `sha256:…`) is now `400
+  invalid_override_image`.
 
 So the order is: control-center (router and frontend, both sites) → the Ansible release
 (`docker_agent_client.py`, rolled out to the fleet) → the agents, host by host, through Ansible —

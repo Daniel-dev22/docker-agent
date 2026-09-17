@@ -270,6 +270,11 @@ func (a *app) handleRegisterProject(c *gin.Context) {
 	if body.Deploy && refuseProjectOp(c, entry, a.cfg.ComposeRoot, capa, opComposeUp) {
 		return
 	}
+	release, locked := a.lockForRequest(c, entry.Name, "a register request")
+	if !locked {
+		return
+	}
+	defer release()
 	if len(body.Files) > 0 {
 		dir, written, err := writeProjectFiles(a.cfg.ComposeRoot, body.Name, body.Files)
 		if err != nil {
@@ -286,6 +291,7 @@ func (a *app) handleRegisterProject(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	release() // the deploy job takes the lock itself, in turn
 	resp := gin.H{"registered": entry.Name}
 	if body.Deploy && a.compose != nil {
 		j := a.reg.start(context.Background(), JobRequest{
@@ -418,11 +424,23 @@ func (a *app) handleCopyProject(c *gin.Context) {
 	if body.Deploy && refuseProjectOp(c, dst, a.cfg.ComposeRoot, dstCapa, opComposeUp) {
 		return
 	}
+	// The source is read under its lock, so the copy never takes a compose file
+	// from before a running update's write and an env file from after it.
+	releaseSrc, locked := a.lockForRequest(c, src.Name, "a copy request")
+	if !locked {
+		return
+	}
 	bundle, err := a.readBundle(src)
+	releaseSrc()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	release, locked := a.lockForRequest(c, body.NewName, "a copy request")
+	if !locked {
+		return
+	}
+	defer release()
 	files := map[string]string{}
 	for _, f := range bundle.ComposeFiles {
 		files[f.Name] = f.Content
@@ -440,6 +458,7 @@ func (a *app) handleCopyProject(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	release()
 	resp := gin.H{"copied": body.NewName, "working_dir": dir}
 	if body.Deploy && a.compose != nil {
 		j := a.reg.start(context.Background(), JobRequest{
@@ -495,6 +514,29 @@ func (a *app) readBundle(e ProjectEntry) (projectBundle, error) {
 // writeProjectFiles writes a bundle's files under <root>/<name>/, rejecting any
 // path that escapes the project dir. Returns the created dir + the relative
 // names written.
+// requestLockWait bounds how long a register or copy request waits for its
+// project's lock before answering 409 project_busy: long enough for a restart or
+// a quick up, far shorter than an update, which can hold it for many minutes.
+var requestLockWait = 10 * time.Second
+
+// lockForRequest takes project's lock for a synchronous request. When it cannot
+// within requestLockWait (or the caller goes away), the request has been answered
+// and locked is false.
+func (a *app) lockForRequest(c *gin.Context, project, who string) (release func(), locked bool) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), requestLockWait)
+	defer cancel()
+	holder := "another change"
+	release, err := a.reg.eng.locks.acquire(ctx, project, who, func(h string) { holder = h })
+	if err != nil {
+		refuseProjectBusy(c, project, holder)
+		return nil, false
+	}
+	return release, true
+}
+
+// writeProjectFiles writes inline files under root/name. Each file is written
+// atomically, and only where it resolves inside the compose root: a symlink left
+// in the project directory is not a way to write outside it.
 func writeProjectFiles(root, name string, files map[string]string) (string, []string, error) {
 	if root == "" {
 		return "", nil, fmt.Errorf("compose root not configured")
@@ -516,7 +558,10 @@ func writeProjectFiles(root, name string, files map[string]string) (string, []st
 		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 			return "", nil, err
 		}
-		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+		if err := confinePath(full, root); err != nil {
+			return "", nil, err
+		}
+		if err := writeFileAtomic(full, []byte(content), 0o644); err != nil {
 			return "", nil, err
 		}
 		written = append(written, clean)

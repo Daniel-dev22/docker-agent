@@ -418,21 +418,22 @@ func (e *engine) updateProject(ctx, parentCtx context.Context, j *Job, entry Pro
 		return nil
 	}
 
-	// 3. apply targets in-memory + persist to disk (reversible per service).
-	applyImages(project, targets)
-	diskOld, perr := e.persistTargets(j, entry, targets) // service → prior on-disk image
+	// 3. persist the targets to disk, verified, and deploy the project exactly as
+	// it now loads from disk — so what runs is what the next `compose up` reads.
+	diskOld, perr := e.persistTargets(ctx, j, entry, targets)
 	if perr != nil {
-		// A persist failure would leave running state ahead of disk (reverts on the
-		// next restart / manual `compose up`). Revert what we wrote and fail loudly.
-		e.revertDisk(j, entry, diskOld)
+		// writeServiceImages has already put back every file it touched.
 		return fmt.Errorf("persist: %w", perr)
+	}
+	if diskOld != nil {
+		project = diskOld.project
 	}
 
 	// 4. pull + up --force-recreate.
 	j.appendLine("pulling images")
 	if err := e.compose.pullProject(ctx, j, project, fleetTrigger); err != nil {
 		// No containers recreated yet — just revert any persisted tags.
-		e.revertDisk(j, entry, diskOld)
+		e.revertDisk(parentCtx, j, diskOld, nil)
 		return fmt.Errorf("pull: %w", err)
 	}
 	fleetTrigger()
@@ -481,7 +482,7 @@ func (e *engine) updateProject(ctx, parentCtx context.Context, j *Job, entry Pro
 		logCancel()
 		if freshDeploy {
 			j.appendLine("fresh deploy unhealthy — no prior version to roll back to")
-			e.revertDisk(j, entry, diskOld)
+			e.revertDisk(parentCtx, j, diskOld, nil)
 			return fmt.Errorf("health: %w", herr)
 		}
 		scope := base.servicesForContainers(res.unhealthy)
@@ -497,41 +498,40 @@ func (e *engine) updateProject(ctx, parentCtx context.Context, j *Job, entry Pro
 	return nil
 }
 
-// applyImages mutates the in-memory project so pull+up deploy the resolved tags.
-func applyImages(project *types.Project, targets map[string]string) {
-	for svc, img := range targets {
-		if s, ok := project.Services[svc]; ok {
-			s.Image = img
-			project.Services[svc] = s
-		}
+// persistTargets writes the resolved images to the project's files (tagwrite.go):
+// in place, verified by reloading the project, and reversible byte for byte. A
+// failure is fatal to the update — deploying a tag the files do not hold would be
+// undone by the next `compose up` — and leaves the files as they were. nil when
+// there is nothing to write.
+func (e *engine) persistTargets(ctx context.Context, j *Job, entry ProjectEntry, targets map[string]string) (*imageWrite, error) {
+	if len(targets) == 0 {
+		return nil, nil
 	}
+	w, err := writeServiceImages(ctx, entry, targets, e.compose.loadProject)
+	if err != nil {
+		return nil, err
+	}
+	for _, f := range w.described() {
+		j.appendLine("wrote " + f)
+	}
+	return w, nil
 }
 
-// persistTargets writes each resolved tag to the on-host compose/.env and returns
-// the prior on-disk value per service (for a reversible rollback). A persistence
-// failure is fatal: returning an error lets the caller revert the partial writes and
-// fail the update, rather than deploy a tag that disk would revert on the next
-// `compose up`. The returned map holds whatever was written before the failure.
-func (e *engine) persistTargets(j *Job, entry ProjectEntry, targets map[string]string) (map[string]priorImage, error) {
-	old := map[string]priorImage{}
-	for svc, img := range targets {
-		prev, err := setServiceImage(entry, svc, img)
-		if err != nil {
-			return old, fmt.Errorf("persist %s tag: %w", svc, err)
-		}
-		old[svc] = prev
+// revertDisk restores the files of services (nil: every service written) to the
+// bytes they held before the update (pull-failure path, and the per-service half
+// of a rollback). It is detached from the job's cancellation: a revert is the
+// safety action.
+func (e *engine) revertDisk(ctx context.Context, j *Job, w *imageWrite, services []string) {
+	if w == nil {
+		return
 	}
-	return old, nil
-}
-
-// revertDisk restores each persisted service's prior on-disk image (pull-failure
-// path, and the per-service half of a rollback).
-func (e *engine) revertDisk(j *Job, entry ProjectEntry, diskOld map[string]priorImage) {
-	for svc, prev := range diskOld {
-		if err := restoreServiceImage(entry, svc, prev); err != nil {
-			j.appendLine(fmt.Sprintf("warn: revert %s tag failed: %v", svc, err))
-		}
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+	defer cancel()
+	if err := w.revert(rctx, services, e.compose.loadProject); err != nil {
+		j.appendLine("warn: revert of the written images incomplete: " + err.Error())
+		return
 	}
+	j.appendLine("reverted the written images on disk")
 }
 
 // rollback redeploys the scope services pinned to their pre-update image IDs
@@ -548,7 +548,7 @@ func (e *engine) revertDisk(j *Job, entry ProjectEntry, diskOld map[string]prior
 // rollback is detached from cancellation entirely (WithoutCancel) and given its own
 // bounded deadline: it is the safety action, and it must be allowed to finish even
 // when the operator cancelled or the op budget ran out.
-func (e *engine) rollback(parentCtx context.Context, j *Job, entry ProjectEntry, meta resolveMeta, base projectBaseline, scope []string, diskOld map[string]priorImage, fleetTrigger func()) {
+func (e *engine) rollback(parentCtx context.Context, j *Job, entry ProjectEntry, meta resolveMeta, base projectBaseline, scope []string, diskOld *imageWrite, fleetTrigger func()) {
 	if len(scope) == 0 {
 		j.appendLine("rollback: no services in scope")
 		return
@@ -572,13 +572,7 @@ func (e *engine) rollback(parentCtx context.Context, j *Job, entry ProjectEntry,
 
 	// Revert the persisted tags for the scoped services first, so disk reflects
 	// the rollback (healthy updated services keep their new persisted tags).
-	for _, svc := range scope {
-		if prev, ok := diskOld[svc]; ok {
-			if err := restoreServiceImage(entry, svc, prev); err != nil {
-				j.appendLine(fmt.Sprintf("warn: revert %s tag failed: %v", svc, err))
-			}
-		}
-	}
+	e.revertDisk(ctx, j, diskOld, scope)
 
 	project, err := e.compose.loadProject(ctx, entry)
 	if err != nil {

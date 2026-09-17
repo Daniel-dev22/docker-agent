@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/compose-spec/compose-go/v2/types"
@@ -57,20 +55,6 @@ func TestProjectBaselineHelpers(t *testing.T) {
 	all := b.allServices()
 	if len(all) != 2 {
 		t.Fatalf("allServices = %v", all)
-	}
-}
-
-func TestApplyImages(t *testing.T) {
-	project := &types.Project{Services: types.Services{
-		"web": types.ServiceConfig{Name: "web", Image: "repo/web:1"},
-		"db":  types.ServiceConfig{Name: "db", Image: "postgres:16"},
-	}}
-	applyImages(project, map[string]string{"web": "repo/web:2", "missing": "x:1"})
-	if project.Services["web"].Image != "repo/web:2" {
-		t.Fatalf("web image = %q", project.Services["web"].Image)
-	}
-	if project.Services["db"].Image != "postgres:16" {
-		t.Fatalf("db image changed unexpectedly = %q", project.Services["db"].Image)
 	}
 }
 
@@ -138,79 +122,4 @@ func TestOverrideResolverServiceInference(t *testing.T) {
 	if _, err := (&overrideResolver{e: e, image: "z:1"}).plan(context.Background(), ambig, func(string) {}); err == nil {
 		t.Fatal("expected error for ambiguous override target")
 	}
-}
-
-func TestEnvVarRefExtraction(t *testing.T) {
-	cases := map[string]string{
-		"${TRAEFIK_IMAGE}":      "TRAEFIK_IMAGE",
-		"${VAR:-default:tag}":   "VAR",
-		"$PLAIN":                "PLAIN",
-		"ghcr.io/foo/bar:1.2.3": "",
-		"repo:tag":              "",
-	}
-	for in, want := range cases {
-		m := envVarRefRe.FindStringSubmatch(in)
-		got := ""
-		if m != nil {
-			got = m[1]
-		}
-		if got != want {
-			t.Fatalf("envVarRef(%q) = %q, want %q", in, got, want)
-		}
-	}
-}
-
-func TestSetServiceImageLiteralAndVar(t *testing.T) {
-	dir := t.TempDir()
-	compose := filepath.Join(dir, "docker-compose.yml")
-	env := filepath.Join(dir, ".env")
-	composeBody := "services:\n" +
-		"  traefik:\n" +
-		"    image: traefik:v3.0\n" +
-		"  immich:\n" +
-		"    image: ${IMMICH_IMAGE}\n"
-	if err := os.WriteFile(compose, []byte(composeBody), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(env, []byte("IMMICH_IMAGE=ghcr.io/immich-app/immich:v1.0.0\nOTHER=keep\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	entry := ProjectEntry{Name: "p", WorkingDir: dir, ComposeFiles: []string{"docker-compose.yml"}, EnvFiles: []string{".env"}}
-
-	// Literal rewrite.
-	old, err := setServiceImage(entry, "traefik", "traefik:v3.1")
-	if err != nil || old.literal != "traefik:v3.0" {
-		t.Fatalf("literal old=%+v err=%v", old, err)
-	}
-	data, _ := os.ReadFile(compose)
-	if !contains(string(data), "traefik:v3.1") {
-		t.Fatalf("compose not rewritten: %s", data)
-	}
-
-	// Var rewrite goes to .env, leaves the ${VAR} scalar intact.
-	old, err = setServiceImage(entry, "immich", "ghcr.io/immich-app/immich:v2.0.0")
-	if err != nil || old.env == nil || old.env.line != "IMMICH_IMAGE=ghcr.io/immich-app/immich:v1.0.0" {
-		t.Fatalf("var old=%+v err=%v", old, err)
-	}
-	edata, _ := os.ReadFile(env)
-	if !contains(string(edata), "IMMICH_IMAGE=ghcr.io/immich-app/immich:v2.0.0") || !contains(string(edata), "OTHER=keep") {
-		t.Fatalf(".env not updated correctly: %s", edata)
-	}
-	cdata, _ := os.ReadFile(compose)
-	if !contains(string(cdata), "${IMMICH_IMAGE}") {
-		t.Fatalf("var scalar should be preserved: %s", cdata)
-	}
-}
-
-func contains(s, sub string) bool {
-	return len(s) >= len(sub) && (indexOf(s, sub) >= 0)
-}
-
-func indexOf(s, sub string) int {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
 }

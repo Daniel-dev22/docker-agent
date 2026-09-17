@@ -208,6 +208,14 @@ func refuseProjectExists(c *gin.Context, name, existingDir string) {
 		gin.H{"working_dir": existingDir})
 }
 
+// refuseProjectBusy answers a request that could not take the project's lock
+// within requestLockWait (projectlock.go).
+func refuseProjectBusy(c *gin.Context, name, holder string) {
+	refuse(c, http.StatusConflict, "project_busy",
+		fmt.Sprintf("project %s is being changed by %s; retry when it finishes", echo(name), echo(holder)),
+		gin.H{"retryable": true, "holder": holder})
+}
+
 func refuseSelfUnavailable(c *gin.Context, err error, targets []string) {
 	fields := gin.H{}
 	if targets != nil {

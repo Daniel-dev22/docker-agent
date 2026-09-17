@@ -42,6 +42,8 @@ const (
 var retryableCodes = map[string]bool{
 	// The same key is still being handled; a retry gets its recorded answer.
 	"idempotency_key_in_flight": true,
+	// Another change to the project is running; a retry once it ends proceeds.
+	"project_busy": true,
 }
 
 // echo clips a caller-supplied value for inclusion in a refusal.

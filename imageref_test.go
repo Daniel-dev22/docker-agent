@@ -4,8 +4,6 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -47,11 +45,31 @@ var realFleetImages = []string{
 	"moby/buildkit:buildx-stable-1",
 	"nginx:alpine",
 	"postgres:16-alpine",
-	"sha256:15dc409d48a2a475ef6e54b26e211a13a97f5ea5d0b7f20bf2ee22c37ea33237",
-	"sha256:65688cd5e2071f581c8cdca102574db86b64541bb0b18f87d04b4ec3ba6096ec",
 	"traefik:v3.7.12",
 	"vaultwarden/server:latest",
 	"zwavejs/zwave-js-ui:latest",
+}
+
+// The two esphome containers run from bare image IDs: the legacy Portainer rollback
+// wrote the ID into CURRENT_ESPHOME_IMAGE and the migration copied it into .env.
+// An ID is refused as an image to deploy — it is the defect, not a value to keep.
+var realFleetImageIDs = []string{
+	"sha256:15dc409d48a2a475ef6e54b26e211a13a97f5ea5d0b7f20bf2ee22c37ea33237",
+	"sha256:65688cd5e2071f581c8cdca102574db86b64541bb0b18f87d04b4ec3ba6096ec",
+	"15dc409d48a2a475ef6e54b26e211a13a97f5ea5d0b7f20bf2ee22c37ea33237",
+}
+
+func TestValidImageRefRefusesImageIDs(t *testing.T) {
+	for _, id := range realFleetImageIDs {
+		if validImageRef(id) || !isImageID(id) {
+			t.Errorf("%q: valid=%v isImageID=%v", id, validImageRef(id), isImageID(id))
+		}
+	}
+	for _, img := range realFleetImages {
+		if isImageID(img) {
+			t.Errorf("a named reference read as an image ID: %q", img)
+		}
+	}
 }
 
 func TestValidImageRefAcceptsEveryImageInTheEstate(t *testing.T) {
@@ -93,6 +111,11 @@ func TestValidImageRefRefusesWhatWouldCorruptAFile(t *testing.T) {
 		{"-reg/app:latest", "leading dash could read as a flag"},
 		{"reg//app:latest", "empty path segment"},
 		{"reg/app@sha256:aa@sha256:bb", "two digests"},
+		{"traefik:", "an empty tag — the grammar, not the charset"},
+		{"traefik@", "an empty digest"},
+		{"traefik:v3:x", "two tags"},
+		{"Traefik:v3", "an uppercase repository"},
+		{"reg/app@sha256:abc", "a truncated digest"},
 		{strings.Repeat("a", maxImageRefLen+1), "over the length cap"},
 	}
 	for _, c := range cases {
@@ -105,8 +128,13 @@ func TestValidImageRefRefusesWhatWouldCorruptAFile(t *testing.T) {
 	if !validImageRef(base) {
 		t.Fatalf("positive control rejected: %q", base)
 	}
-	if !validImageRef(strings.Repeat("a", maxImageRefLen)) {
-		t.Error("exactly at the cap must pass")
+	// A valid reference exactly at the cap: a 128-byte tag and a sha512 digest
+	// (exactly 128 hex), with the name taking the rest.
+	suffix := ":" + strings.Repeat("t", 128) + "@sha512:" + strings.Repeat("0", 128)
+	name := "reg.example/" + strings.Repeat("a", maxImageRefLen-len(suffix)-len("reg.example/"))
+	atCap := name + suffix
+	if len(atCap) != maxImageRefLen || !validImageRef(atCap) {
+		t.Errorf("a valid reference exactly at the cap (%d bytes) must pass", len(atCap))
 	}
 }
 
@@ -171,44 +199,16 @@ func TestSafeEnvLineValue(t *testing.T) {
 	}
 }
 
-// setEnvVar must REFUSE, and must not have touched the file. A guard that rejects
-// after a partial write is not a guard.
-func TestSetEnvVarRefusesAMultilineValueAndLeavesTheFileIntact(t *testing.T) {
-	dir := t.TempDir()
-	envPath := filepath.Join(dir, ".env")
-	const original = "IMAGE=reg/app:v1\nOTHER=keepme\n"
-	if err := os.WriteFile(envPath, []byte(original), 0o600); err != nil {
-		t.Fatal(err)
+// The env writer refuses a value that would add lines, whatever validated it
+// upstream: the guard holds for every caller, not only today's one boundary.
+func TestPlanVarRefusesAValueThatWouldAddLines(t *testing.T) {
+	p := &writePlan{files: map[string]*fileState{}, vars: map[string]*varEdit{}}
+	for _, v := range []string{"reg/app:v2\nINJECTED=yes", "reg/app:v2\rX=1", "a b", "a#b", `a"b`, "a$b"} {
+		if err := p.planVar("IMAGE", v, "app"); err == nil {
+			t.Errorf("planVar accepted %q", v)
+		}
 	}
-	if err := os.WriteFile(filepath.Join(dir, "compose.yaml"), []byte("services:\n  app:\n    image: ${IMAGE}\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	paths, err := resolveLoadPaths(ProjectEntry{Name: "p", WorkingDir: dir})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := setEnvVar(paths, dir, "IMAGE", "reg/app:v2\nINJECTED=yes"); err == nil {
-		t.Error("a value with a newline must be refused")
-	}
-	got, err := os.ReadFile(envPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != original {
-		t.Errorf("file was modified by a refused write:\n%q", got)
-	}
-	if strings.Contains(string(got), "INJECTED") {
-		t.Error("🔴 the injected line reached the .env")
-	}
-
-	// Positive control: a legitimate value still writes, so the refusal above is
-	// the guard working rather than setEnvVar being broken.
-	if _, err := setEnvVar(paths, dir, "IMAGE", "reg/app:v2"); err != nil {
-		t.Fatalf("a valid value must still be written: %v", err)
-	}
-	after, _ := os.ReadFile(envPath)
-	if !strings.Contains(string(after), "IMAGE=reg/app:v2") || !strings.Contains(string(after), "OTHER=keepme") {
-		t.Errorf("valid write did not land or clobbered a sibling:\n%q", after)
+	if len(p.files) != 0 {
+		t.Error("a refused value was planned into a file")
 	}
 }

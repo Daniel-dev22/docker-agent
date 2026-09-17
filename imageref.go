@@ -1,6 +1,10 @@
 package main
 
-import "strings"
+import (
+	"fmt"
+
+	"github.com/distribution/reference"
+)
 
 // Validation for an operator-supplied image reference.
 //
@@ -33,36 +37,61 @@ func allowedImageRefRune(r rune) bool {
 	return false
 }
 
-// validImageRef reports whether s is safe to pull and safe to write as a single
-// line of a .env or a compose scalar.
+// validImageRef reports whether s is an image reference the agent may pull and
+// write into a compose file or .env as a single token.
 //
-// Deliberately NOT a full reference parser. Docker itself rejects a malformed
-// reference safely, so the job here is to make the value harmless to the FILES it
-// passes through, and to fail early with a clear message instead of late with a
-// pull error. Over-strictness is the real risk: this accepts every one of the 33
-// distinct image references running in the estate, including registry ports, ghcr
-// paths, `@sha256:` digests and a bare digest.
+// Two checks, in order. The charset above refuses what would corrupt a FILE —
+// whitespace, control characters, `$`, quotes, shell metacharacters — by
+// construction, before any grammar is consulted. Then the grammar is docker's own:
+// github.com/distribution/reference, the parser compose and the daemon use. A
+// hand-written approximation of it accepted `traefik:`, `traefik@` and
+// `traefik:v3:x`, each of which the daemon then refuses at pull time — after the
+// value had already been written to the stack's files.
+//
+// An image ID (`sha256:<hex>`, or the bare 64-hex form the daemon also accepts) is
+// refused (isImageID). It names an image in one daemon's local store, not
+// something a registry can resolve: a stack pinned to one cannot be checked,
+// pulled, or deployed on another host, and nothing records which tag it came from.
 func validImageRef(s string) bool {
-	// No TrimSpace comparison: the charset below excludes every whitespace rune, so
-	// a leading or trailing space is already a rejection. A trim check here was dead
-	// code that read as protection. Callers facing a human (control-api) trim BEFORE
-	// validating; this end refuses rather than silently altering what was asked for.
 	if s == "" || len(s) > maxImageRefLen {
 		return false
-	}
-	if r := rune(s[0]); !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9') {
-		return false // a reference starts with a host or a repository component
 	}
 	for _, r := range s {
 		if !allowedImageRefRune(r) {
 			return false
 		}
 	}
-	// Structural sanity that the charset alone cannot express.
-	if strings.Contains(s, "//") || strings.Count(s, "@") > 1 {
+	ref, err := reference.ParseAnyReference(s)
+	if err != nil {
 		return false
 	}
-	return true
+	_, named := ref.(reference.Named)
+	return named
+}
+
+// isImageID reports whether s is an image ID rather than a named reference.
+//
+// The legacy Portainer rollback (Ansible, retired with the Portainer migration)
+// wrote a container's image ID into the stack's CURRENT_<NAME>_IMAGE, and the
+// migration copied that environment into the stack's .env verbatim. esphome on
+// kd-nuc01 and ng-nuc01 still carry it, and every consumer of the value — the
+// image check, the update resolver, the writer — must say so rather than treat
+// `sha256` as a repository name.
+func isImageID(s string) bool {
+	ref, err := reference.ParseAnyReference(s)
+	if err != nil {
+		return false
+	}
+	_, named := ref.(reference.Named)
+	return !named
+}
+
+// imageIDError explains, for one service, why an image ID cannot be checked or
+// updated, and what to do instead.
+func imageIDError(service, image string) error {
+	return fmt.Errorf("%s runs the local image ID %s, not an image reference: it cannot be checked "+
+		"against a registry, pulled, or moved to another host — deploy a tag with override_image "+
+		"(the tag the stack is meant to track)", service, clipTo(image, 19))
 }
 
 // safeEnvLineValue reports whether v can be written as `KEY=v` without creating

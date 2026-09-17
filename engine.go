@@ -77,8 +77,12 @@ type engine struct {
 	// low-power host is not thrashed by a wide fan-out.
 	bulkConcurrency int
 	// composeOpTimeout bounds one compose op so a wedged pull/up can't run
-	// forever; cancellation still works via the job context.
+	// forever; cancellation still works via the job context. A job queued behind
+	// another on its project waits at most this long, then runs with its own.
 	composeOpTimeout time.Duration
+
+	// locks serialises every change to one project (projectlock.go).
+	locks *projectLocks
 }
 
 // setImageChecker wires the image checker into the engine for the update path
@@ -97,6 +101,7 @@ func newEngine(cfg Config, dc *dockerClient, cb *composeBackend, reg *composeReg
 		projects:         reg,
 		bulkConcurrency:  bc,
 		composeOpTimeout: getEnvDuration("DOCKER_COMPOSE_OP_TIMEOUT", 30*time.Minute),
+		locks:            newProjectLocks(),
 	}
 }
 
@@ -129,10 +134,15 @@ func (e *engine) run(ctx context.Context, j *Job, onChange func(JobEvent), fleet
 		e.runContainerOp(ctx, j, strings.TrimPrefix(op, "container."), fleetTrigger)
 	case strings.HasPrefix(op, opContainerBulkPrefix):
 		e.runBulk(ctx, j, strings.TrimPrefix(op, opContainerBulkPrefix), fleetTrigger)
-	case op == opComposeUpdate:
-		e.runUpdate(ctx, j, fleetTrigger)
-	case composeOps[op]:
-		e.runComposeOp(ctx, j, op, fleetTrigger)
+	case op == opComposeUpdate || composeOps[op]:
+		if release, ok := e.lockProject(ctx, j, op); ok {
+			if op == opComposeUpdate {
+				e.runUpdate(ctx, j, fleetTrigger)
+			} else {
+				e.runComposeOp(ctx, j, op, fleetTrigger)
+			}
+			release()
+		}
 	default:
 		j.markFailed("unsupported operation: " + op)
 		slog.Warn("job with unsupported operation", "id", j.snapshot().ID, "operation", op)
@@ -146,6 +156,34 @@ func (e *engine) run(ctx context.Context, j *Job, onChange func(JobEvent), fleet
 	default:
 		onChange(EventFailed)
 	}
+}
+
+// lockProject takes the job's project lock for a project-scoped op, logging what
+// it waits for. The wait honours the job's cancellation and gives up after
+// composeOpTimeout; either way the job is left terminal and ok is false.
+func (e *engine) lockProject(ctx context.Context, j *Job, op string) (release func(), ok bool) {
+	snap := j.snapshot()
+	wctx := ctx
+	if e.composeOpTimeout > 0 {
+		var cancel context.CancelFunc
+		wctx, cancel = context.WithTimeout(ctx, e.composeOpTimeout)
+		defer cancel()
+	}
+	release, err := e.locks.acquire(wctx, snap.Project, fmt.Sprintf("job %s (%s)", snap.ID, op), func(holder string) {
+		j.appendLine(fmt.Sprintf("queued: waiting for %s on project %s", holder, snap.Project))
+	})
+	if err == nil {
+		return release, true
+	}
+	if ctx.Err() != nil {
+		j.appendLine("cancelled while queued")
+		j.markFailed("cancelled while queued")
+		return nil, false
+	}
+	msg := fmt.Sprintf("gave up after %s queued behind another change to project %s", e.composeOpTimeout, snap.Project)
+	j.appendLine("error: " + msg)
+	j.markFailed(msg)
+	return nil, false
 }
 
 // runContainerOp executes a single-container lifecycle verb on j.Target.
