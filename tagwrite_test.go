@@ -940,3 +940,91 @@ func TestImageWriteFollowsTemplateEnvValues(t *testing.T) {
 		}
 	})
 }
+
+// An undeclared tag variable shared by coupled services is declared above its FIRST
+// use in the env files — whichever service is being written. Declared above only
+// the written service's line, writing the later one split the pair with no error
+// (the earlier template had already expanded to its default) and left every later
+// whole-set update refused.
+func TestImageWriteSharedUndeclaredTagVariable(t *testing.T) {
+	compose := "services:\n  a:\n    image: ${A_IMAGE}\n  b:\n    image: ${B_IMAGE}\n  c:\n    image: ${C_IMAGE}\n"
+	for _, tc := range []struct {
+		name string
+		env  string
+	}{
+		{"a's value first", "A_IMAGE=example/a:${VER:-release}\nB_IMAGE=example/b:${VER:-release}\nC_IMAGE=example/c:${VER:-release}\n"},
+		{"b's value first", "B_IMAGE=example/b:${VER:-release}\nA_IMAGE=example/a:${VER:-release}\nC_IMAGE=example/c:${VER:-release}\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, alone := range []string{"a", "b", "c"} {
+				f := newWriteFixture(t, map[string]string{"compose.yaml": compose, ".env": tc.env}, ProjectEntry{})
+				original := f.state(t)
+				_, err := f.write(map[string]string{alone: "example/" + alone + ":v2"})
+				if err == nil || !strings.Contains(err.Error(), "update every service that shares it") {
+					t.Fatalf("writing %s alone must be refused, its siblings would change: %v", alone, err)
+				}
+				sameState(t, "after writing "+alone+" alone", f.state(t), original)
+			}
+			for _, pair := range [][]string{{"a", "b"}, {"b", "c"}} {
+				f := newWriteFixture(t, map[string]string{"compose.yaml": compose, ".env": tc.env}, ProjectEntry{})
+				if _, err := f.write(map[string]string{pair[0]: "example/" + pair[0] + ":v2", pair[1]: "example/" + pair[1] + ":v2"}); err == nil {
+					t.Fatalf("writing %v leaves the third sharer behind and must be refused", pair)
+				}
+			}
+			f := newWriteFixture(t, map[string]string{"compose.yaml": compose, ".env": tc.env}, ProjectEntry{})
+			w, err := f.write(map[string]string{"a": "example/a:v3", "b": "example/b:v3", "c": "example/c:v3"})
+			must(t, err)
+			if got := f.state(t)[".env"]; got != "VER=v3\n"+tc.env {
+				t.Errorf("the whole set: .env = %q, want VER declared above its first use", got)
+			}
+			for _, svc := range []string{"a", "b", "c"} {
+				if got := f.image(t, svc); got != "example/"+svc+":v3" {
+					t.Errorf("%s resolves %q", svc, got)
+				}
+			}
+			must(t, w.revert(context.Background(), nil, f.l.cb.loadProject))
+		})
+	}
+}
+
+// The designed refusals on the fleet's real shapes say why, and what to do instead.
+func TestImageWriteRealShapeRefusalsExplain(t *testing.T) {
+	immichCompose := "services:\n  immich-server:\n    image: ${IMMICH_SERVER_IMAGE}\n  immich-machine-learning:\n    image: ${IMMICH_ML_IMAGE}\n"
+	immichEnv := "IMMICH_SERVER_IMAGE=ghcr.io/immich-app/immich-server:${IMMICH_VERSION:-release}\n" +
+		"IMMICH_ML_IMAGE=ghcr.io/immich-app/immich-machine-learning:${IMMICH_VERSION:-release}\n"
+	cases := []struct {
+		name    string
+		files   map[string]string
+		targets map[string]string
+		reasons []string
+	}{
+		{"immich-server alone: the shared version variable",
+			map[string]string{"compose.yaml": immichCompose, ".env": immichEnv},
+			map[string]string{"immich-server": "ghcr.io/immich-app/immich-server:v2.1.0"},
+			[]string{"immich-machine-learning's image changed", "update every service that shares it in one request"}},
+		{"immich ML with a digest: the tag variable cannot hold one",
+			map[string]string{"compose.yaml": immichCompose, ".env": immichEnv},
+			map[string]string{
+				"immich-server":           "ghcr.io/immich-app/immich-server:v2.1.0",
+				"immich-machine-learning": "ghcr.io/immich-app/immich-machine-learning:v2.1.0@sha256:" + strings.Repeat("a", 64),
+			},
+			[]string{"carries a digest", "deploy the plain tag, or edit the template"}},
+		{"zwave to another repository: the template varies only the tag",
+			map[string]string{"compose.yaml": "services:\n  zwave-js-ui:\n    image: ${ZWAVE_IMAGE}\n", ".env": "IMAGE_NAME=9.9.0\nZWAVE_IMAGE=zwavejs/zwave-js-ui:${IMAGE_NAME}\n"},
+			map[string]string{"zwave-js-ui": "ghcr.io/zwave-js/zwave-js-ui:9.9.1"},
+			[]string{"is not zwavejs/zwave-js-ui with a different tag", "deploy a tag of zwavejs/zwave-js-ui, or edit the template"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newWriteFixture(t, tc.files, ProjectEntry{})
+			original := f.state(t)
+			_, err := f.write(tc.targets)
+			for _, reason := range tc.reasons {
+				if err == nil || !strings.Contains(err.Error(), reason) {
+					t.Errorf("want %q in the refusal, got %v", reason, err)
+				}
+			}
+			sameState(t, "after the refusal", f.state(t), original)
+		})
+	}
+}

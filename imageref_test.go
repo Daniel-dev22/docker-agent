@@ -207,7 +207,7 @@ func TestSafeEnvLineValue(t *testing.T) {
 func TestPlanVarRefusesAValueThatWouldAddLines(t *testing.T) {
 	p := &writePlan{files: map[string]*fileState{}, vars: map[string]*varEdit{}}
 	for _, v := range []string{"reg/app:v2\nINJECTED=yes", "reg/app:v2\rX=1", "a b", "a#b", `a"b`, "a$b"} {
-		if err := p.planVar("IMAGE", v, "app", "", 0, nil); err == nil {
+		if err := p.planVar("IMAGE", v, "app", "", 0); err == nil {
 			t.Errorf("planVar accepted %q", v)
 		}
 	}

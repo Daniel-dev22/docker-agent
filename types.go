@@ -100,6 +100,9 @@ type jobPublic struct {
 	ErrorMsg    string    `json:"error,omitempty"`
 	LineCount   int       `json:"line_count"`
 	TriggerKey  string    `json:"trigger_key,omitempty"`
+	// Services a compose op was narrowed to (also joined into Target, for the
+	// controller's history). Empty: the whole project.
+	Services []string `json:"services,omitempty"`
 }
 
 // Job is one operation tracked through its lifecycle, with a bounded log ring

@@ -304,7 +304,11 @@ func (e *engine) runComposeOp(ctx context.Context, j *Job, op string, fleetTrigg
 		defer cancel()
 	}
 
-	j.appendLine(fmt.Sprintf("compose %s %s (%s)", op, name, entry.WorkingDir))
+	scope := ""
+	if len(j.services) > 0 {
+		scope = " [" + strings.Join(j.services, " ") + "]"
+	}
+	j.appendLine(fmt.Sprintf("compose %s %s%s (%s)", op, name, scope, entry.WorkingDir))
 	if err := e.compose.execute(opCtx, j, op, entry, fleetTrigger); err != nil {
 		if ctx.Err() != nil {
 			// Cancelled (or timed out) — let the cancel path own the terminal state.
@@ -317,7 +321,7 @@ func (e *engine) runComposeOp(ctx context.Context, j *Job, op string, fleetTrigg
 		fleetTrigger()
 		return
 	}
-	j.appendLine(fmt.Sprintf("compose %s %s ok", op, name))
+	j.appendLine(fmt.Sprintf("compose %s %s%s ok", op, name, scope))
 	j.markCompleted()
 	fleetTrigger()
 }

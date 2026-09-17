@@ -4,7 +4,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -139,5 +142,85 @@ func TestProjectsAdvertiseServiceOps(t *testing.T) {
 	must(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	if len(resp.Projects) == 0 || resp.Projects[0]["service_ops"] != true {
 		t.Fatalf("service_ops not advertised: %s", w.Body.String())
+	}
+}
+
+// A project outside the compose root narrows down and restart from its containers'
+// labels, as it runs them whole — no file is read, and nothing answers an uncoded
+// 5xx for a deterministic condition.
+func TestNarrowedOpsWorkFromLabels(t *testing.T) {
+	e := newCapEnv(t, testSelfID, func(root string) []fakeContainer {
+		return append(defaultContainers(root),
+			fakeContainer{id: "cafe" + strings.Repeat("0", 60), name: "dup-web-1", project: "duplicacy", workingDir: "/srv/duplicacy", service: "web"},
+			fakeContainer{id: "cafe" + strings.Repeat("1", 60), name: "dup-cli-1", project: "duplicacy", workingDir: "/srv/duplicacy", service: "cli"},
+		)
+	})
+	cb, err := newComposeBackend(Config{DockerHost: e.eng.host(), ComposeRoot: e.root})
+	must(t, err)
+	e.a.compose = cb
+	must(t, e.a.projects.register(ProjectEntry{Name: "duplicacy", WorkingDir: "/srv/duplicacy"}))
+	must(t, os.MkdirAll(filepath.Join(e.root, "broken"), 0o755))
+	must(t, os.WriteFile(filepath.Join(e.root, "broken", "compose.yaml"), []byte("services: [not, a, map]\n"), 0o644))
+	must(t, e.a.projects.register(ProjectEntry{Name: "broken", WorkingDir: filepath.Join(e.root, "broken")}))
+
+	cases := []struct {
+		name, project string
+		body          map[string]any
+		status        int
+		code          string
+	}{
+		{"narrowed restart outside the root", "duplicacy", map[string]any{"op": "restart", "services": []string{"web"}}, 202, ""},
+		{"narrowed down outside the root", "duplicacy", map[string]any{"op": "down", "services": []string{"cli", "web"}}, 202, ""},
+		{"a service with no containers", "duplicacy", map[string]any{"op": "restart", "services": []string{"nope"}}, 400, "unknown_service"},
+		{"up outside the root is refused by capability first", "duplicacy", map[string]any{"op": "up", "services": []string{"web"}}, 409, "project_not_operable"},
+		{"narrowed up on a project whose files do not load", "broken", map[string]any{"op": "up", "services": []string{"web"}}, 409, "project_load_failed"},
+	}
+	for _, c := range cases {
+		status, body := e.do(t, http.MethodPost, "/v1/projects/"+c.project+"/op", c.body)
+		if status != c.status || (c.code != "" && body["code"] != c.code) {
+			t.Errorf("%s: %d %v", c.name, status, body)
+		}
+		if status >= 500 {
+			t.Errorf("%s: a deterministic condition answered %d without a code: %v", c.name, status, body)
+		}
+		if status == http.StatusAccepted {
+			j, _ := e.a.reg.get(body["job_id"].(string))
+			snap := j.snapshot()
+			want := c.body["services"].([]string)
+			if !slices.Equal(snap.Services, want) || snap.Target != strings.Join(want, ",") {
+				t.Errorf("%s: the job record reads %v / target %q — a narrowed op must be recorded as narrowed", c.name, snap.Services, snap.Target)
+			}
+			raw, _ := json.Marshal(snap)
+			if !strings.Contains(string(raw), `"services":[`) {
+				t.Errorf("%s: the public job JSON omits services: %s", c.name, raw)
+			}
+		}
+	}
+
+	w := httptest.NewRecorder()
+	e.r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/projects", nil))
+	var resp struct {
+		Projects []map[string]any `json:"projects"`
+	}
+	must(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	for _, p := range resp.Projects {
+		ops, _ := p["allowed_ops"].([]any)
+		narrowable := slices.ContainsFunc(ops, func(o any) bool { return o != "update" })
+		if p["service_ops"] != narrowable {
+			t.Errorf("%s: service_ops=%v with allowed_ops %v — the advertisement must match what the ops honour", p["name"], p["service_ops"], ops)
+		}
+	}
+}
+
+// The event the controller stores carries the services, and docker_jobs.target
+// holds them joined, so its history does not read whole-stack.
+func TestNarrowedOpEventCarriesServices(t *testing.T) {
+	j := newJob("j1", JobRequest{Operation: opComposeDown, Project: "p", Services: []string{"a", "b"}, Target: "a,b"}, nil)
+	var got EventPayload
+	payload, err := (&eventBuffer{}).payloadFor(j.snapshot(), EventStarted)
+	must(t, err)
+	must(t, json.Unmarshal(payload, &got))
+	if got.Target != "a,b" || !slices.Equal(got.Services, []string{"a", "b"}) {
+		t.Fatalf("event payload: %s", payload)
 	}
 }

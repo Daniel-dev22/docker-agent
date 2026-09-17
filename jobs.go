@@ -63,7 +63,7 @@ func newJob(id string, req JobRequest, cancel context.CancelFunc) *Job {
 	return &Job{
 		jobPublic: jobPublic{
 			ID: id, Project: req.Project, Operation: req.Operation,
-			Target: req.Target, State: JobPending, TriggerKey: req.TriggerKey,
+			Target: req.Target, State: JobPending, TriggerKey: req.TriggerKey, Services: req.Services,
 		},
 		targets:         req.Targets,
 		targetIDs:       req.TargetIDs,

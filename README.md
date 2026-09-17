@@ -201,7 +201,8 @@ gated, and changes through either name are still serialised (they take one lock)
 
 A job object is `{id, project?, operation, target?, state, started_at, completed_at?, exit_code,
 error?, line_count, trigger_key?}` with `state` one of
-`pending|running|completed|failed|cancelled`.
+`pending|running|completed|failed|cancelled`. A compose op narrowed to services carries
+`services` (and `target` = those services, comma-joined).
 
 **One change per project at a time.** Every project-scoped job (`up`, `down`, `pull`, `restart`,
 `recreate`, `update`) holds its project's lock for its whole run; a second one on the same
@@ -268,16 +269,23 @@ that fails after validation is a `500` (transient).
 **Op** accepts `up | down | pull | restart | recreate | update`.
 
 **`services`** (optional, `up`, `recreate`, `pull`, `restart`, `down`) narrows the op to exactly
-those services; absent or empty is the whole project. Each must be a compose service name and a
-service of the project as it loads now, else `400 unknown_service` naming it. The list is a set:
+those services; absent or empty is the whole project. Each must be a compose service name, else
+`400 unknown_service` naming it. `down` and `restart` act on containers, as they do whole: their
+services are the project's containers' `com.docker.compose.service` labels, and no file is read —
+so a project outside the compose root narrows them too. `up`, `recreate` and `pull` build from the
+model, so theirs are the services of the project as it loads; a project whose files do not load is
+`409 project_load_failed`. The list is a set:
 order and duplicates do not matter, to the op or to the Idempotency-Key fingerprint. A narrowed op
 never touches anything else: `up`/`recreate`/`pull` run with no dependencies (`--no-deps`) and
 remove no orphans, so a dependency an operator stopped stays stopped; `restart` restarts only
 them; `down` stops and removes only their containers — compose's own service-scoped `down` also
 removes the services depending on them and tries to remove the project's networks, so it is not
 used. Volumes, anonymous ones included, are kept. `update` does not take `services`; it targets
-one service with `override_service`. `GET /v1/projects` entries carry `"service_ops": true` on an
-agent that supports this.
+one service with `override_service`. `GET /v1/projects` entries (and fleet snapshot projects)
+carry `service_ops`: true when some op in `allowed_ops` can be narrowed — every allowed op except
+`update` then accepts `services` — and false when none can (the agent's own stack). A narrowed job
+records its `services` on the job object and its events, joins them into `target` (the column the
+controller's `docker_jobs` history already has), and logs `compose <op> <project> [a b]`.
 
 It returns:
 - `400` if `op` is not one of those,
@@ -568,7 +576,8 @@ ID starts with `db`.
 | `override_image` not an image reference by docker's own grammar (`distribution/reference`), or an image ID (`sha256:…`) | 400 | `invalid_override_image` |
 | Register or copy while another change holds the project for longer than 10s | 409 | `project_busy` (`"retryable": true`, `holder`) |
 | Register or copy onto a working directory another registered project already has (symlinks resolved) | 409 | `working_dir_in_use` (`project`, `working_dir`) |
-| Op `services`: not a compose service name, or not a service of the project | 400 | `unknown_service` (`service`) |
+| Op `services`: not a compose service name, or not a service of the project (for `down`/`restart`: no container carries it) | 400 | `unknown_service` (`service`) |
+| Op `services` on `up`/`recreate`/`pull` for a project whose compose files do not load | 409 | `project_load_failed` (`working_dir`) |
 | Bulk `action` not one of start/stop/restart/kill/remove | 400 | `invalid_action` |
 | More than 100 distinct targets | 400 | `too_many_targets` |
 | An ambiguous, malformed, or >255-byte container reference | 400 | `invalid_target` |
@@ -618,9 +627,11 @@ that direction and only in that direction:
 - **`409 working_dir_in_use`** is new and final: two registry names for one directory are
   refused. The project lock is keyed by the resolved directory, so a duplicate that predates the
   rule still cannot interleave with its twin.
-- **`services` on an op** is new; an agent advertises it with `"service_ops": true` on each
+- **`services` on an op** is new; an agent advertises it per project with `service_ops` on each
   `GET /v1/projects` entry. An older agent ignores the field and acts on the WHOLE project, so a
-  consumer must check `service_ops` before sending it — not after.
+  consumer must check `service_ops` before sending it — not after. The job event carries
+  `services`, and `target` holds them comma-joined, which the controller already stores in
+  `docker_jobs.target`; a controller that wants the list as a list reads `services`.
 - **`/bundle` returns file contents verbatim** — every compose file and every project-level env
   file the load reads. Neither may carry a secret inline: a secret reaches a stack through a
   service's `env_file:` rendered from Bitwarden, which compose reads at `up` and `/bundle` never

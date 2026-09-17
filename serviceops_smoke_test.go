@@ -11,6 +11,8 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -141,5 +143,55 @@ func TestServiceOpsSmoke(t *testing.T) {
 	after = state()
 	if after["b"].state != "exited" {
 		t.Errorf("restart/pull [a] started b: %v", after)
+	}
+
+	// The same project seen from an agent whose compose root does NOT contain it:
+	// its files are unreadable to that agent, so narrowed restart and down must work
+	// from the containers' labels alone.
+	outsideRoot := t.TempDir()
+	outCfg := Config{NodeName: "nuc", DockerHost: cfg.DockerHost, ComposeRoot: outsideRoot, ComposeRegistryPath: filepath.Join(outsideRoot, "projects.json")}
+	outCB, err := newComposeBackend(outCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outReg := newComposeRegistry(outCfg.ComposeRegistryPath, outsideRoot)
+	if err := outReg.register(ProjectEntry{Name: name, WorkingDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := outCB.loadProject(context.Background(), ProjectEntry{Name: name, WorkingDir: dir}); err == nil {
+		t.Fatal("fixture: the outside agent can read the project's files, so this proves nothing")
+	}
+	outEng := newEngine(outCfg, dc, outCB, outReg)
+	outOp := func(operation string, services ...string) *Job {
+		t.Helper()
+		j := &Job{jobPublic: jobPublic{ID: "outside-" + operation, Project: name, Operation: operation, State: JobPending, Services: services},
+			services: services, subscribers: map[chan string]struct{}{}}
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer cancel()
+		outEng.run(ctx, j, func(JobEvent) {}, func() {})
+		if st := j.snapshot().State; st != JobCompleted {
+			for _, l := range j.logLines() {
+				t.Logf("  %s", l)
+			}
+			t.Fatalf("outside %s %v: %s %s", operation, services, st, j.snapshot().ErrorMsg)
+		}
+		return j
+	}
+	before := state()
+	rj := outOp(opComposeRestart, "a")
+	if !slices.ContainsFunc(rj.logLines(), func(l string) bool { return strings.HasPrefix(l, "compose restart "+name+" [a]") }) {
+		t.Errorf("the job log does not name the narrowed services: %v", rj.logLines())
+	}
+	after = state()
+	if after["a"].state != "running" || after["a"].id != before["a"].id || after["b"].state != "exited" {
+		t.Errorf("outside restart [a]: %v (before %v)", after, before)
+	}
+	outOp(opComposeDown, "a")
+	after = state()
+	if _, ok := after["a"]; ok {
+		t.Errorf("outside down [a] left a: %v", after)
+	}
+	if after["b"].id != before["b"].id {
+		t.Errorf("outside down [a] removed b: %v", after)
 	}
 }

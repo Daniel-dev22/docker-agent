@@ -111,12 +111,15 @@ func (a *app) handleComposeOp(c *gin.Context) {
 				"whitespace, control characters and shell or interpolation metacharacters are refused", nil)
 		return
 	}
-	services, ok := a.checkOpServices(c, body, entry)
+	services, ok := a.checkOpServices(c, body, entry, summaries)
 	if !ok {
 		return
 	}
 	j := a.reg.start(context.Background(), JobRequest{
-		Services:        services,
+		Services: services,
+		// A narrowed op's services ride in target — the column the controller's
+		// docker_jobs history already has — so the history does not read whole-stack.
+		Target:          strings.Join(services, ","),
 		Operation:       body.Op,
 		Project:         name,
 		Timeout:         body.Timeout,
@@ -131,7 +134,14 @@ func (a *app) handleComposeOp(c *gin.Context) {
 
 // checkOpServices validates a service-narrowed op against the project as it loads
 // now, and returns the list sorted and deduplicated. A false return has answered.
-func (a *app) checkOpServices(c *gin.Context, body composeOpBody, entry ProjectEntry) ([]string, bool) {
+//
+// down and restart act on containers, so their services are the project's
+// containers' compose service labels (summaries, the fresh list the handler already
+// took) — no files are read, and a project outside the compose root narrows them
+// as it runs them whole. up, recreate and pull build from the model, so theirs are
+// the services of the project as it loads; a project that does not load is a
+// deterministic refusal, not a server error.
+func (a *app) checkOpServices(c *gin.Context, body composeOpBody, entry ProjectEntry, summaries []container.Summary) ([]string, bool) {
 	if len(body.Services) == 0 {
 		return nil, true
 	}
@@ -152,17 +162,32 @@ func (a *app) checkOpServices(c *gin.Context, body composeOpBody, entry ProjectE
 			return nil, false
 		}
 	}
-	project, err := a.compose.loadProject(c.Request.Context(), entry)
-	if err != nil {
-		// Not the caller's input: the project's files do not load (the op would fail
-		// the same way). A transient-or-host problem, so a code-less 5xx.
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "load project to check services: " + echo(err.Error())})
-		return nil, false
+	known := map[string]bool{}
+	if needsModel(body.Op) {
+		project, err := a.compose.loadProject(c.Request.Context(), entry)
+		if err != nil {
+			refuse(c, http.StatusConflict, "project_load_failed",
+				"the project's compose files do not load, so its services cannot be checked: "+err.Error(),
+				gin.H{"working_dir": entry.WorkingDir})
+			return nil, false
+		}
+		for s := range project.Services {
+			known[s] = true
+		}
+	} else {
+		for _, ctr := range summaries {
+			if ctr.Labels[labelComposeProject] == entry.Name && ctr.Labels[labelComposeService] != "" {
+				known[ctr.Labels[labelComposeService]] = true
+			}
+		}
 	}
 	for _, s := range services {
-		if _, ok := project.Services[s]; !ok {
-			refuse(c, http.StatusBadRequest, "unknown_service",
-				fmt.Sprintf("%s is not a service of project %s", echo(s), echo(entry.Name)), gin.H{"service": s})
+		if !known[s] {
+			where := "a service of project " + echo(entry.Name)
+			if !needsModel(body.Op) {
+				where = "a service with containers in project " + echo(entry.Name)
+			}
+			refuse(c, http.StatusBadRequest, "unknown_service", fmt.Sprintf("%s is not %s", echo(s), where), gin.H{"service": s})
 			return nil, false
 		}
 	}
@@ -192,7 +217,8 @@ type projectListEntry struct {
 	Operable   bool     `json:"operable"`
 	Managed    bool     `json:"managed"`
 	OpsBlocked string   `json:"ops_blocked,omitempty"`
-	// ServiceOps: "services" narrows POST /v1/projects/:name/op on this agent.
+	// ServiceOps: every op in AllowedOps except update accepts "services" (see
+	// projectCapability.serviceOps).
 	ServiceOps bool `json:"service_ops"`
 }
 
@@ -232,7 +258,7 @@ func (a *app) handleListProjects(c *gin.Context) {
 		capa := a.capabilityOf(e, view)
 		out = append(out, projectListEntry{
 			ProjectEntry: e, AllowedOps: capa.Allowed, Operable: capa.operable(),
-			Managed: capa.Editable, OpsBlocked: capa.Blocked, ServiceOps: true,
+			Managed: capa.Editable, OpsBlocked: capa.Blocked, ServiceOps: capa.serviceOps(),
 		})
 	}
 	c.JSON(http.StatusOK, gin.H{"projects": out})

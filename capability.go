@@ -50,6 +50,19 @@ func (c projectCapability) allows(op string) bool {
 // are allowed.
 func (c projectCapability) operable() bool { return c.allows(opComposeUpdate) }
 
+// serviceOps reports whether the project can take a service-narrowed op: some op
+// in Allowed accepts "services" — and every one except update does, down and
+// restart from container labels, up/recreate/pull from the model they already
+// need. False when nothing narrowable is allowed (the agent's own stack).
+func (c projectCapability) serviceOps() bool {
+	for _, op := range c.Allowed {
+		if op != opComposeUpdate {
+			return true
+		}
+	}
+	return false
+}
+
 // validProjectName reports whether name is one compose uses unchanged: compose-go
 // refuses any other name when a project is loaded, and Down/Restart LOWERCASE it
 // before acting — so "Docker-Agent" would act on the project "docker-agent". A name

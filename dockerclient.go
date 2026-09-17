@@ -119,9 +119,9 @@ type ComposeProject struct {
 	// stack runs the agent's control-path proxy, so no `down`). Empty when every op
 	// is allowed.
 	OpsBlocked string `json:"ops_blocked,omitempty"`
-	// ServiceOps: this agent accepts "services" on POST /v1/projects/:name/op to
-	// narrow up, recreate, pull, restart and down to named services. Always true
-	// here; an agent too old to support it does not send the field.
+	// ServiceOps: every op in AllowedOps except update accepts "services" on POST
+	// /v1/projects/:name/op (projectCapability.serviceOps). An agent too old to
+	// support it does not send the field.
 	ServiceOps bool `json:"service_ops"`
 
 	// Rolled-up image-outdated status, computed from the project's

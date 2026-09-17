@@ -33,6 +33,7 @@ type EventPayload struct {
 	ErrorMsg    string     `json:"error,omitempty"`
 	LineCount   int        `json:"line_count"`
 	TriggerKey  string     `json:"trigger_key,omitempty"`
+	Services    []string   `json:"services,omitempty"`
 	EmittedAt   time.Time  `json:"emitted_at"`
 }
 
@@ -119,7 +120,18 @@ func (e *eventBuffer) close() {
 // (restart-survival) and enqueue for durable delivery to the controller.
 func (e *eventBuffer) handleJobEvent(j *Job, evt JobEvent) {
 	snap := j.snapshot()
-	payload := EventPayload{
+	body, err := e.payloadFor(snap, evt)
+	if err != nil {
+		slog.Error("marshal event payload failed", "error", err, "job", snap.ID)
+		return
+	}
+	e.upsertJob(snap)
+	e.outbox.Enqueue(snap.ID, string(evt), body)
+}
+
+// payloadFor is the event the controller ingests for one job state.
+func (e *eventBuffer) payloadFor(snap jobPublic, evt JobEvent) ([]byte, error) {
+	return json.Marshal(EventPayload{
 		JobID:       snap.ID,
 		Site:        e.cfg.SiteID,
 		Node:        e.cfg.NodeName,
@@ -134,15 +146,9 @@ func (e *eventBuffer) handleJobEvent(j *Job, evt JobEvent) {
 		ErrorMsg:    snap.ErrorMsg,
 		LineCount:   snap.LineCount,
 		TriggerKey:  snap.TriggerKey,
+		Services:    snap.Services,
 		EmittedAt:   time.Now().UTC(),
-	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		slog.Error("marshal event payload failed", "error", err, "job", snap.ID)
-		return
-	}
-	e.upsertJob(snap)
-	e.outbox.Enqueue(snap.ID, string(evt), body)
+	})
 }
 
 func tsToNs(t time.Time) int64 {

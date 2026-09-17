@@ -364,7 +364,7 @@ func (r *composeRegistry) mergeKnown(live []ComposeProject, v *selfView) []Compo
 
 func (p *ComposeProject) stampCapability(c projectCapability) {
 	p.AllowedOps, p.Operable, p.Managed, p.OpsBlocked = c.Allowed, c.operable(), c.Editable, c.Blocked
-	p.ServiceOps = true
+	p.ServiceOps = c.serviceOps()
 }
 
 // projectEntryFromLive builds an entry from a label-derived ComposeProject. The

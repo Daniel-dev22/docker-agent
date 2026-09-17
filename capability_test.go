@@ -98,6 +98,7 @@ func TestParseSelfContainerID(t *testing.T) {
 
 type fakeContainer struct {
 	id, name, project, workingDir, networkMode string
+	service                                    string // compose service label; the container name when empty
 }
 
 type fakeEngine struct {
@@ -189,6 +190,7 @@ func (f *fakeEngine) serve(w http.ResponseWriter, r *http.Request) {
 			if c.project != "" {
 				s.Labels[labelComposeProject] = c.project
 				s.Labels[labelComposeWorkingDir] = c.workingDir
+				s.Labels[labelComposeService] = orDefault(c.service, c.name)
 			}
 			s.HostConfig.NetworkMode = c.networkMode
 			// The real list endpoint returns Aliases/DNSNames null on every network

@@ -189,24 +189,6 @@ type writePlan struct {
 type varEdit struct {
 	value string
 	edit  *textEdit
-	file  *fileState
-	// inserted: the write declares the variable (no statement did); use, when an
-	// env-file template references it, is the earliest such statement — the
-	// declaration must sit above it.
-	inserted bool
-	use      *envUse
-}
-
-// envUse is where an env-file template references a variable: dotenv expands a
-// value when it reads it, so a declaration takes effect only above that point.
-type envUse struct {
-	file   *fileState
-	order  int // the file's position in the project's env files
-	offset int // the start of the referencing statement's line
-}
-
-func (u *envUse) before(o *envUse) bool {
-	return u.order < o.order || (u.order == o.order && u.offset < o.offset)
 }
 
 func (p *writePlan) file(path string) (*fileState, error) {
@@ -265,14 +247,14 @@ func (p *writePlan) planImage(svc, img, current string) error {
 		return p.planLiteral(loc, svc, img)
 	}
 	if name, ok := wholeVarRef(raw); ok {
-		return p.planVar(name, img, svc, current, 0, nil)
+		return p.planVar(name, img, svc, current, 0)
 	}
 	if name, ok := trailingTagVar(raw); ok {
 		tag, err := tagChange(current, img)
 		if err != nil {
 			return fmt.Errorf("image %q varies only its tag (${%s}): %w", raw, name, err)
 		}
-		return p.planVar(name, tag, svc, "", 0, nil)
+		return p.planVar(name, tag, svc, "", 0)
 	}
 	return fmt.Errorf("image %q in %s interpolates more than a whole-value variable or a single trailing tag "+
 		"variable; the agent will not guess which variable to change", raw, loc.file.path)
@@ -422,10 +404,15 @@ func tagChange(current, img string) (string, error) {
 	}
 	tag, ok := strings.CutPrefix(img, prefix+":")
 	if !ok {
-		return "", fmt.Errorf("%q is not %s with a different tag", img, prefix)
+		return "", fmt.Errorf("%q is not %s with a different tag: the template varies only the tag — deploy a tag of %s, "+
+			"or edit the template to change the repository", img, prefix, prefix)
 	}
-	if _, err := reference.WithTag(reference.TrimNamed(named), tag); err != nil || strings.ContainsAny(tag, ":@/") {
-		return "", fmt.Errorf("%q is not %s with a different tag", img, prefix)
+	if strings.Contains(tag, "@") {
+		return "", fmt.Errorf("%q carries a digest, which the template's tag variable cannot hold — deploy the plain tag, "+
+			"or edit the template to take a digest", img)
+	}
+	if _, err := reference.WithTag(reference.TrimNamed(named), tag); err != nil || strings.ContainsAny(tag, ":/") {
+		return "", fmt.Errorf("%q is not %s with a different tag — deploy a tag of %s, or edit the template", img, prefix, prefix)
 	}
 	return tag, nil
 }
@@ -446,10 +433,13 @@ const maxTemplateDepth = 8
 // a service that would diverge fails the reload verification; anything else is
 // refused. A single-quoted value is literal to dotenv and is not a template.
 //
-// A variable no env file declares, reached through such a template, is declared
-// just above the first statement that uses it — appended at the end it would come
-// after dotenv had already expanded the template with the default.
-func (p *writePlan) planVar(name, value, svc, current string, depth int, use *envUse) error {
+// A variable no env file declares is declared just above the FIRST statement, in
+// the project's env files in load order, whose value uses it (firstUse) — found
+// from the files, not from the services being written. Appended at the end, or
+// above the use of only the service being written, it would come after dotenv had
+// already expanded an earlier template with its default: writing one of two
+// coupled services would silently split them, and the reload could not see it.
+func (p *writePlan) planVar(name, value, svc, current string, depth int) error {
 	if !safeEnvLineValue(value) || strings.ContainsAny(value, "#'\"\\$ ") {
 		return fmt.Errorf("refusing to write %q to %s", echo(value), name)
 	}
@@ -459,9 +449,6 @@ func (p *writePlan) planVar(name, value, svc, current string, depth int, use *en
 				svc, name, value, strings.Join(v.edit.owners, ", "), v.value)
 		}
 		v.edit.owners = append(v.edit.owners, svc)
-		if v.inserted && use != nil && (v.use == nil || use.before(v.use)) {
-			return p.moveDeclaration(name, v, use)
-		}
 		return nil
 	}
 	if _, ok := os.LookupEnv(name); ok {
@@ -476,57 +463,69 @@ func (p *writePlan) planVar(name, value, svc, current string, depth int, use *en
 			if depth >= maxTemplateDepth {
 				return fmt.Errorf("%s is one of more than %d variables naming each other; not followed further", name, maxTemplateDepth)
 			}
-			here := p.useOf(f, stmt)
 			if inner, ok := wholeVarRef(raw); ok {
-				return p.planVar(inner, value, svc, current, depth+1, here)
+				return p.planVar(inner, value, svc, current, depth+1)
 			}
 			if inner, ok := trailingTagVar(raw); ok && current != "" {
 				tag, err := tagChange(current, value)
 				if err != nil {
 					return fmt.Errorf("%s in %s is %q, which varies only its tag (${%s}): %w", name, f.path, raw, inner, err)
 				}
-				return p.planVar(inner, tag, svc, "", depth+1, here)
+				return p.planVar(inner, tag, svc, "", depth+1)
 			}
 			return fmt.Errorf("%s in %s is itself a template (%q) beyond a whole-value or single trailing tag variable; "+
 				"it is not flattened into a literal", name, f.path, raw)
 		}
 	}
 	edit := &textEdit{owners: []string{svc}}
-	v := &varEdit{value: value, edit: edit, file: f}
-	switch {
-	case stmt != nil:
+	if stmt != nil {
 		edit.start, edit.end, edit.text = stmt.valueStart, stmt.valueEnd, value
-	case use != nil:
-		f, v.file, v.use, v.inserted = use.file, use.file, use, true
-		edit.start, edit.end, edit.text = use.offset, use.offset, name+"="+value+lineEnding(f.original)
-	default:
-		v.inserted = true
-		edit.start, edit.end = len(f.original), len(f.original)
-		edit.text = p.appendText(f, name+"="+value)
+	} else {
+		useFile, at, err := p.firstUse(name)
+		switch {
+		case err != nil:
+			return err
+		case useFile != nil:
+			f = useFile
+			edit.start, edit.end, edit.text = at, at, name+"="+value+lineEnding(f.original)
+		default:
+			edit.start, edit.end = len(f.original), len(f.original)
+			edit.text = p.appendText(f, name+"="+value)
+		}
 	}
 	if err := p.addEdit(f, edit); err != nil {
 		return err
 	}
-	p.vars[name] = v
+	p.vars[name] = &varEdit{value: value, edit: edit}
 	return nil
 }
 
-// useOf is the position of stmt's line in f, as an envUse.
-func (p *writePlan) useOf(f *fileState, stmt *envStatement) *envUse {
-	lineStart := bytes.LastIndexByte(f.original[:stmt.valueStart], '\n') + 1
-	if lineStart == 0 && bytes.HasPrefix(f.original, envUTF8BOM) {
-		lineStart = len(envUTF8BOM) // the byte order mark stays first
+// firstUse returns the file and line start of the first statement, across the
+// project's env files in load order, whose value references name — or a nil file
+// when no env file uses it. A single-quoted value is literal and uses nothing.
+func (p *writePlan) firstUse(name string) (*fileState, int, error) {
+	ref := regexp.MustCompile(`\$(?:\{` + regexp.QuoteMeta(name) + `[}:?+-]|` + regexp.QuoteMeta(name) + `(?:[^A-Za-z0-9_]|$))`)
+	for _, path := range p.paths.env {
+		f, err := p.file(path)
+		if err != nil {
+			return nil, 0, err
+		}
+		stmts, err := scanEnvStatements(f.original)
+		if err != nil {
+			return nil, 0, fmt.Errorf("parse %s: %w", path, err)
+		}
+		for _, st := range stmts {
+			if st.inherited || st.quote == '\'' || !ref.Match(f.original[st.valueStart:st.valueEnd]) {
+				continue
+			}
+			lineStart := bytes.LastIndexByte(f.original[:st.valueStart], '\n') + 1
+			if lineStart == 0 && bytes.HasPrefix(f.original, envUTF8BOM) {
+				lineStart = len(envUTF8BOM) // the byte order mark stays first
+			}
+			return f, lineStart, nil
+		}
 	}
-	return &envUse{file: f, order: slices.Index(p.paths.env, f.path), offset: lineStart}
-}
-
-// moveDeclaration moves an inserted declaration of name up to an earlier use.
-func (p *writePlan) moveDeclaration(name string, v *varEdit, use *envUse) error {
-	v.file.edits = slices.DeleteFunc(v.file.edits, func(e *textEdit) bool { return e == v.edit })
-	v.edit.start, v.edit.end = use.offset, use.offset
-	v.edit.text = name + "=" + v.value + lineEnding(use.file.original)
-	v.file, v.use = use.file, use
-	return p.addEdit(use.file, v.edit)
+	return nil, 0, nil
 }
 
 func lineEnding(data []byte) string {
@@ -728,7 +727,9 @@ func verifyImages(before, after *types.Project, targets map[string]string) error
 			if targeted {
 				problems = append(problems, fmt.Sprintf("%s resolves to %q, not %q: something compose reads after the written value overrides it", name, a.Image, want))
 			} else {
-				problems = append(problems, fmt.Sprintf("%s's image changed from %q to %q", name, b.Image, a.Image))
+				problems = append(problems, fmt.Sprintf("%s's image changed from %q to %q: it takes its image from what "+
+					"this write changed (a shared variable or template) — update every service that shares it in one "+
+					"request, or give %s a variable of its own", name, b.Image, a.Image, name))
 			}
 		}
 		a.Image = b.Image

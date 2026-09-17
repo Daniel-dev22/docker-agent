@@ -90,9 +90,10 @@ func (b *composeBackend) execute(ctx context.Context, j *Job, op string, e Proje
 		return fmt.Errorf("compose service: %w", err)
 	}
 	var project *types.Project
-	// A whole-project down or restart acts on the running containers by project
-	// name and needs no files — it still works when the compose files are gone.
-	if !(len(j.services) == 0 && (op == opComposeDown || op == opComposeRestart)) {
+	// down and restart — whole or narrowed — act on the project's containers by
+	// their labels and need no files: they work when the files are gone, or outside
+	// the compose root where the agent may not read them.
+	if needsModel(op) {
 		if project, err = b.loadProject(ctx, e); err != nil {
 			return fmt.Errorf("load project: %w", err)
 		}
@@ -146,11 +147,18 @@ type composeCall struct {
 //   - up, recreate and pull run on the project narrowed to them with
 //     IgnoreDependencies (`--no-deps`), so a dependency an operator stopped is not
 //     started, and without removing orphans — a narrowed op touches nothing else.
-//   - restart restarts exactly them (NoDeps).
-//   - down is stop + remove of their containers. compose's own Down with Services
+//   - restart restarts exactly them (NoDeps), from the containers' labels.
+//   - down is stop + remove of their containers, from the labels. compose's own Down with Services
 //     also removes the services that depend on them and tries to remove the
 //     project's networks, which a service-scoped down must never do. Volumes are
 //     kept, anonymous ones included, as a whole-project down keeps them.
+//
+// needsModel reports whether op needs the project's compose files: up, recreate
+// and pull do; down and restart work from the containers' labels.
+func needsModel(op string) bool {
+	return op == opComposeUp || op == opComposeRecreate || op == opComposePull
+}
+
 func planComposeCall(op, name string, project *types.Project, services []string, timeout *time.Duration) (composeCall, error) {
 	if len(services) == 0 {
 		switch op {
@@ -177,6 +185,16 @@ func planComposeCall(op, name string, project *types.Project, services []string,
 		return composeCall{}, fmt.Errorf("unknown compose op %q", op)
 	}
 
+	switch op {
+	case opComposeRestart:
+		return composeCall{kind: callRestart, restart: api.RestartOptions{
+			Services: services, NoDeps: true, Timeout: timeout,
+		}}, nil
+	case opComposeDown:
+		return composeCall{kind: callRemove, remove: api.RemoveOptions{
+			Services: services, Stop: true, Force: true,
+		}}, nil
+	}
 	selected, err := project.WithSelectedServices(services, types.IgnoreDependencies)
 	if err != nil {
 		return composeCall{}, fmt.Errorf("select services: %w", err)
@@ -193,14 +211,6 @@ func planComposeCall(op, name string, project *types.Project, services []string,
 		}}, nil
 	case opComposePull:
 		return composeCall{kind: callPull, project: selected}, nil
-	case opComposeRestart:
-		return composeCall{kind: callRestart, restart: api.RestartOptions{
-			Project: project, Services: services, NoDeps: true, Timeout: timeout,
-		}}, nil
-	case opComposeDown:
-		return composeCall{kind: callRemove, remove: api.RemoveOptions{
-			Project: project, Services: services, Stop: true, Force: true,
-		}}, nil
 	}
 	return composeCall{}, fmt.Errorf("services cannot narrow compose op %q", op)
 }
