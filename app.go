@@ -29,6 +29,9 @@ type app struct {
 	fleet     *fleetHub
 	images    *imageChecker
 	discovery *discoveryPusher
+	// idem records the answers to job-starting requests carrying an
+	// Idempotency-Key (idempotency.go).
+	idem *idempotencyStore
 	// self is this agent's own containers + compose projects, which no endpoint
 	// may act on, and its control-path container (selfid.go).
 	self *selfIdentity
@@ -63,11 +66,16 @@ func newApp(ctx context.Context, cfg Config) (*app, error) {
 		cb = nil
 	}
 
+	idem, err := newIdempotencyStore(events.DB())
+	if err != nil {
+		return nil, err
+	}
+
 	eng := newEngine(cfg, dc, cb, projects)
 	reg := newJobRegistry(cfg, eng, events)
 	reg.setHook(events.handleJobEvent)
 
-	a := &app{cfg: cfg, cc: cc, docker: dc, compose: cb, projects: projects, events: events, reg: reg, self: self}
+	a := &app{cfg: cfg, cc: cc, docker: dc, compose: cb, projects: projects, events: events, reg: reg, self: self, idem: idem}
 	a.images = newImageChecker(cfg, dc, cc)
 	eng.setImageChecker(a.images)               // the update engine reuses strategy + clients
 	a.images.setProjectPlanner(eng.planProject) // coupled-project status = the update's dry-run (DRY)

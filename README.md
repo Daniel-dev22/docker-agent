@@ -140,6 +140,35 @@ observe the result on `/ws/jobs/:id/logs`, `GET /v1/jobs/:id`, or the next `/ws/
 Jobs run on a detached context, so the operation is not cancelled when the HTTP response is
 written.
 
+### Idempotency-Key
+
+Every request that can start a job — `POST /v1/projects/:name/op`, `POST /v1/projects`,
+`POST /v1/projects/:name/copy`, `POST /v1/containers/:id/{start,stop,restart}`,
+`DELETE /v1/containers/:id` and `POST /v1/containers/bulk` — accepts an optional
+**`Idempotency-Key`** header, so a caller that lost a response (the agent restarted mid-request, a
+timeout, a dropped connection) can resend without running the operation twice.
+
+- The key is 1–128 printable ASCII characters, one header line. Anything else is
+  `400 {"code":"invalid_idempotency_key"}` and nothing runs.
+- Scope is method + path + key. The agent records the answer it gave — status and JSON body —
+  in `events.sqlite` under `CONFIG_DIR`, so it survives an agent restart.
+- A resend with the same key and the same body returns the **original status and body verbatim**
+  (a `202 {"job_id":…}` or the original refusal) and runs nothing. Replayed responses carry
+  `Idempotency-Replayed: true`. "Same body" is compared on canonical JSON, so key order and
+  whitespace do not matter.
+- The same key with a different body: `422 {"code":"idempotency_key_reused"}`.
+- The same key while the first request is still being handled: `409
+  {"code":"idempotency_key_in_flight"}` — the claim is atomic and taken before anything runs, so
+  the duplicate never executes. Retry for the answer.
+- Only deterministic answers are recorded (2xx and 4xx). A 5xx — notably `503
+  self_identity_unavailable` — releases the key, so a retry can succeed once the daemon answers.
+- A claim still in flight when the agent died is released at boot: any job it had started was
+  interrupted and failed by the orphan sweep, so a retry correctly runs again.
+- Keys are honoured for 24 hours and the table is capped at 5,000 recorded answers (~815 bytes
+  each, measured), oldest first. Choose a new key per logical operation, not per retry.
+
+Without the header, every endpoint behaves exactly as described below.
+
 ### Health (2)
 
 | Method | Path | Response |

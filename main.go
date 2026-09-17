@@ -37,6 +37,7 @@ func main() {
 
 	// Recover jobs stuck running/pending from a prior exit BEFORE serving.
 	sweepOrphanJobs(ctx, cfg, app.events)
+	app.sweepIdempotency(ctx)
 
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
@@ -78,12 +79,14 @@ func registerRoutes(r *gin.Engine, app *app) {
 	r.GET("/v1/jobs/:id/log", app.handleGetJobLog)
 	r.POST("/v1/jobs/:id/cancel", app.handleCancelJob)
 
-	// Container lifecycle mutations — short async jobs (202 + job id).
-	r.POST("/v1/containers/:id/start", app.handleContainerStart)
-	r.POST("/v1/containers/:id/stop", app.handleContainerStop)
-	r.POST("/v1/containers/:id/restart", app.handleContainerRestart)
-	r.DELETE("/v1/containers/:id", app.handleContainerRemove)
-	r.POST("/v1/containers/bulk", app.handleContainerBulk)
+	// Container lifecycle mutations — short async jobs (202 + job id). Every route
+	// that can start a job honours an Idempotency-Key header (idempotency.go).
+	idem := app.idempotent()
+	r.POST("/v1/containers/:id/start", idem, app.handleContainerStart)
+	r.POST("/v1/containers/:id/stop", idem, app.handleContainerStop)
+	r.POST("/v1/containers/:id/restart", idem, app.handleContainerRestart)
+	r.DELETE("/v1/containers/:id", idem, app.handleContainerRemove)
+	r.POST("/v1/containers/bulk", idem, app.handleContainerBulk)
 	// Historical (non-follow) log window — the viewer's back-paging walks
 	// backwards via ?until=<oldest-ts>; the live tail is the WS route below.
 	r.GET("/v1/containers/:id/logs", app.handleContainerLogsHistory)
@@ -91,11 +94,11 @@ func registerRoutes(r *gin.Engine, app *app) {
 	// Compose project ops + registry — ops are long async jobs (202 + job id);
 	// CRUD/copy/bundle are synchronous. Project name is the path param.
 	r.GET("/v1/projects", app.handleListProjects)
-	r.POST("/v1/projects", app.handleRegisterProject)
+	r.POST("/v1/projects", idem, app.handleRegisterProject)
 	r.DELETE("/v1/projects/:name", app.handleDeregisterProject)
-	r.POST("/v1/projects/:name/op", app.handleComposeOp)
+	r.POST("/v1/projects/:name/op", idem, app.handleComposeOp)
 	r.GET("/v1/projects/:name/bundle", app.handleProjectBundle)
-	r.POST("/v1/projects/:name/copy", app.handleCopyProject)
+	r.POST("/v1/projects/:name/copy", idem, app.handleCopyProject)
 
 	// Image-outdated detection — raw cache + manual refresh; the live status
 	// normally rides the /ws/fleet snapshot.
