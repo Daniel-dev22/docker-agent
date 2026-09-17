@@ -19,7 +19,10 @@ func (a *app) handleLiveness(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"stat
 // other op down with it. It reads the last published view and never waits on the
 // Docker daemon.
 func (a *app) handleReadiness(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{"status": "ready", "self": a.self.status()})
+	c.JSON(http.StatusOK, gin.H{"status": "ready", "self": a.self.status(),
+		// Registry entries that share a working directory (predating the rule that
+		// refuses them): reported, not gated — the agent still serves both.
+		"projects": gin.H{"shared_working_dirs": a.projects.sharedWorkingDirs()}})
 }
 
 // ---------------------------------------------------------------------------

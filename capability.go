@@ -208,6 +208,15 @@ func refuseProjectExists(c *gin.Context, name, existingDir string) {
 		gin.H{"working_dir": existingDir})
 }
 
+// refuseWorkingDirInUse answers a register or copy whose working directory is
+// already another registered project's: two entries for one directory would let
+// a change through one name bypass the other's lock and overwrite its files.
+func refuseWorkingDirInUse(c *gin.Context, dir, owner string) {
+	refuse(c, http.StatusConflict, "working_dir_in_use",
+		fmt.Sprintf("%s is already the working directory of project %s; deregister it first", echo(dir), echo(owner)),
+		gin.H{"working_dir": dir, "project": owner})
+}
+
 // refuseProjectBusy answers a request that could not take the project's lock
 // within requestLockWait (projectlock.go).
 func refuseProjectBusy(c *gin.Context, name, holder string) {

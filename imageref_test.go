@@ -1,9 +1,12 @@
 package main
 
 import (
+	"github.com/distribution/reference"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"math/rand/v2"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -204,11 +207,76 @@ func TestSafeEnvLineValue(t *testing.T) {
 func TestPlanVarRefusesAValueThatWouldAddLines(t *testing.T) {
 	p := &writePlan{files: map[string]*fileState{}, vars: map[string]*varEdit{}}
 	for _, v := range []string{"reg/app:v2\nINJECTED=yes", "reg/app:v2\rX=1", "a b", "a#b", `a"b`, "a$b"} {
-		if err := p.planVar("IMAGE", v, "app"); err == nil {
+		if err := p.planVar("IMAGE", v, "app", "", 0, nil); err == nil {
 			t.Errorf("planVar accepted %q", v)
 		}
 	}
 	if len(p.files) != 0 {
 		t.Error("a refused value was planned into a file")
+	}
+}
+
+// validImageRef agrees with docker's grammar on every input, except where one of
+// its three documented extra rules says otherwise: an image ID, the length cap,
+// or a rune outside the grammar's alphabet (which the grammar never accepts).
+func TestValidImageRefAgreesWithTheGrammar(t *testing.T) {
+	rng := rand.New(rand.NewPCG(20260917, 1))
+	alphabet := []rune("abcxyz09AZ._-/:@+[]$ \"'\\#\n\t%!=")
+	hosts := []string{"", "reg.example/", "reg.example:5000/", "localhost:5000/", "[::1]:5000/", "[fe80::1]/", "[::1]/", "10.0.0.1:443/", "[zz]/"}
+	names := []string{"a", "a-b", "a__b", "library/nginx", "Up", "x.y_z", "a/b/c", ""}
+	tags := []string{"", ":v1", ":V1.2-rc", ":", ":v3:x", ":" + strings.Repeat("t", 129)}
+	digests := []string{"", "@sha256:" + strings.Repeat("a", 64), "@sha256:abc", "@", "@sha512:" + strings.Repeat("0", 128)}
+	gen := func() string {
+		s := hosts[rng.IntN(len(hosts))] + names[rng.IntN(len(names))] + tags[rng.IntN(len(tags))] + digests[rng.IntN(len(digests))]
+		for range rng.IntN(3) {
+			rs := []rune(s)
+			i := rng.IntN(len(rs) + 1)
+			switch rng.IntN(3) {
+			case 0:
+				rs = slices.Insert(rs, i, alphabet[rng.IntN(len(alphabet))])
+			case 1:
+				if i < len(rs) {
+					rs = slices.Delete(rs, i, i+1)
+				}
+			default:
+				if i < len(rs) {
+					rs[i] = alphabet[rng.IntN(len(alphabet))]
+				}
+			}
+			s = string(rs)
+		}
+		return s
+	}
+	extra := func(s string) bool { return isImageID(s) || len(s) > maxImageRefLen }
+	inputs := append([]string{"[::1]:5000/a-b", "[fe80::1%eth0]:5000/a", "sha256:" + strings.Repeat("f", 64)}, realFleetImages...)
+	for range 200_000 {
+		inputs = append(inputs, gen())
+	}
+	disagree, accepted, ipv6 := 0, 0, 0
+	for _, s := range inputs {
+		_, err := reference.ParseNormalizedNamed(s)
+		grammar := err == nil
+		want := grammar && !extra(s)
+		got := validImageRef(s)
+		if got {
+			accepted++
+			if strings.HasPrefix(s, "[") {
+				ipv6++
+			}
+		}
+		if got != want {
+			if disagree++; disagree <= 10 {
+				t.Errorf("%q: validImageRef=%v, grammar=%v, extra rule=%v", s, got, grammar, extra(s))
+			}
+		}
+		if grammar && !extra(s) && strings.IndexFunc(s, func(r rune) bool { return !fileSafeImageRune(r) }) >= 0 {
+			t.Errorf("%q: the grammar accepts a rune outside fileSafeImageRune — the file-safety rule would disagree", s)
+		}
+	}
+	if disagree > 0 {
+		t.Fatalf("%d of %d inputs disagree with the grammar", disagree, len(inputs))
+	}
+	if accepted < 1000 || ipv6 == 0 {
+		t.Fatalf("the corpus barely reaches the valid space (%d accepted, %d IPv6): it proves little", accepted, ipv6)
 	}
 }

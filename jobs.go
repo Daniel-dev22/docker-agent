@@ -73,6 +73,7 @@ func newJob(id string, req JobRequest, cancel context.CancelFunc) *Job {
 		overrideService: req.OverrideService,
 		healthTimeoutS:  req.HealthTimeoutS,
 		swapTimeoutS:    req.SwapTimeoutS,
+		services:        req.Services,
 		cancel:          cancel,
 		subscribers:     map[chan string]struct{}{},
 	}

@@ -77,12 +77,16 @@ type fileState struct {
 	path     string
 	original []byte // exact bytes before the write (nil when !existed)
 	existed  bool
-	mode     os.FileMode // for a file the write creates
-	edits    []*textEdit
-	written  []byte       // what the write made of it
-	docs     []*yaml.Node // parsed documents, compose files only
-	// present, current: what the file should hold now — after the write, then
-	// after each revert — so a later revert can tell a hand edit from its own.
+	// mode applies only if the write creates the file; an existing file keeps
+	// its own (writeFileAtomic).
+	mode    os.FileMode
+	edits   []*textEdit  // every edit the write made, whichever services later revert
+	written []byte       // the bytes the write put there: original with every edit
+	docs    []*yaml.Node // parsed documents, compose files only
+	// present and current are what the agent last left in the file: the write's
+	// bytes, then each revert's. A revert compares the disk against them to tell a
+	// hand edit from its own work — never against written, which a first partial
+	// revert has already replaced.
 	present bool
 	current []byte
 }
@@ -94,6 +98,10 @@ type imageWrite struct {
 	baseline *types.Project    // the project before the write
 	project  *types.Project    // the project as loaded after the write
 	files    []*fileState      // the files written, in write order
+	// reverted accumulates across partial reverts: a later revert rebuilds each
+	// file with only the edits of services no revert has named yet, so reverting
+	// [app] and then [net] ends where reverting both at once does — the original.
+	reverted map[string]bool
 }
 
 // writeServiceImages points each service in targets at its image on disk, verifies
@@ -116,7 +124,7 @@ func writeServiceImages(ctx context.Context, entry ProjectEntry, targets map[str
 	if err != nil {
 		return nil, err
 	}
-	w := &imageWrite{entry: entry, targets: map[string]string{}, baseline: baseline, project: baseline}
+	w := &imageWrite{entry: entry, targets: map[string]string{}, baseline: baseline, project: baseline, reverted: map[string]bool{}}
 	plan := &writePlan{entry: entry, paths: paths, files: map[string]*fileState{}, vars: map[string]*varEdit{}}
 	for _, svc := range slices.Sorted(maps.Keys(targets)) {
 		img := targets[svc]
@@ -181,6 +189,24 @@ type writePlan struct {
 type varEdit struct {
 	value string
 	edit  *textEdit
+	file  *fileState
+	// inserted: the write declares the variable (no statement did); use, when an
+	// env-file template references it, is the earliest such statement — the
+	// declaration must sit above it.
+	inserted bool
+	use      *envUse
+}
+
+// envUse is where an env-file template references a variable: dotenv expands a
+// value when it reads it, so a declaration takes effect only above that point.
+type envUse struct {
+	file   *fileState
+	order  int // the file's position in the project's env files
+	offset int // the start of the referencing statement's line
+}
+
+func (u *envUse) before(o *envUse) bool {
+	return u.order < o.order || (u.order == o.order && u.offset < o.offset)
 }
 
 func (p *writePlan) file(path string) (*fileState, error) {
@@ -239,14 +265,14 @@ func (p *writePlan) planImage(svc, img, current string) error {
 		return p.planLiteral(loc, svc, img)
 	}
 	if name, ok := wholeVarRef(raw); ok {
-		return p.planVar(name, img, svc)
+		return p.planVar(name, img, svc, current, 0, nil)
 	}
 	if name, ok := trailingTagVar(raw); ok {
 		tag, err := tagChange(current, img)
 		if err != nil {
 			return fmt.Errorf("image %q varies only its tag (${%s}): %w", raw, name, err)
 		}
-		return p.planVar(name, tag, svc)
+		return p.planVar(name, tag, svc, "", 0, nil)
 	}
 	return fmt.Errorf("image %q in %s interpolates more than a whole-value variable or a single trailing tag "+
 		"variable; the agent will not guess which variable to change", raw, loc.file.path)
@@ -404,8 +430,26 @@ func tagChange(current, img string) (string, error) {
 	return tag, nil
 }
 
-// planVar sets name to value in the env file compose takes name from.
-func (p *writePlan) planVar(name, value, svc string) error {
+// maxTemplateDepth bounds a chain of env values that are themselves variables.
+const maxTemplateDepth = 8
+
+// planVar sets name to value in the env file compose takes name from. current is
+// the image the variable resolves to today when it holds a whole image, "" when
+// it holds a tag.
+//
+// An assignment whose value is itself a template is not flattened into a literal:
+// `IMMICH_SERVER_IMAGE=…immich-server:${IMMICH_VERSION:-release}` couples the
+// server to the machine-learning image through IMMICH_VERSION, and writing a
+// literal there would silently decouple them. The same rule as a compose-level
+// template applies: a whole-value variable passes the value on; a single trailing
+// tag variable takes the new tag — once, so services sharing it move together, and
+// a service that would diverge fails the reload verification; anything else is
+// refused. A single-quoted value is literal to dotenv and is not a template.
+//
+// A variable no env file declares, reached through such a template, is declared
+// just above the first statement that uses it — appended at the end it would come
+// after dotenv had already expanded the template with the default.
+func (p *writePlan) planVar(name, value, svc, current string, depth int, use *envUse) error {
 	if !safeEnvLineValue(value) || strings.ContainsAny(value, "#'\"\\$ ") {
 		return fmt.Errorf("refusing to write %q to %s", echo(value), name)
 	}
@@ -415,6 +459,9 @@ func (p *writePlan) planVar(name, value, svc string) error {
 				svc, name, value, strings.Join(v.edit.owners, ", "), v.value)
 		}
 		v.edit.owners = append(v.edit.owners, svc)
+		if v.inserted && use != nil && (v.use == nil || use.before(v.use)) {
+			return p.moveDeclaration(name, v, use)
+		}
 		return nil
 	}
 	if _, ok := os.LookupEnv(name); ok {
@@ -424,18 +471,69 @@ func (p *writePlan) planVar(name, value, svc string) error {
 	if err != nil {
 		return err
 	}
+	if stmt != nil && stmt.quote != '\'' {
+		if raw := string(f.original[stmt.valueStart:stmt.valueEnd]); strings.Contains(raw, "$") {
+			if depth >= maxTemplateDepth {
+				return fmt.Errorf("%s is one of more than %d variables naming each other; not followed further", name, maxTemplateDepth)
+			}
+			here := p.useOf(f, stmt)
+			if inner, ok := wholeVarRef(raw); ok {
+				return p.planVar(inner, value, svc, current, depth+1, here)
+			}
+			if inner, ok := trailingTagVar(raw); ok && current != "" {
+				tag, err := tagChange(current, value)
+				if err != nil {
+					return fmt.Errorf("%s in %s is %q, which varies only its tag (${%s}): %w", name, f.path, raw, inner, err)
+				}
+				return p.planVar(inner, tag, svc, "", depth+1, here)
+			}
+			return fmt.Errorf("%s in %s is itself a template (%q) beyond a whole-value or single trailing tag variable; "+
+				"it is not flattened into a literal", name, f.path, raw)
+		}
+	}
 	edit := &textEdit{owners: []string{svc}}
-	if stmt != nil {
+	v := &varEdit{value: value, edit: edit, file: f}
+	switch {
+	case stmt != nil:
 		edit.start, edit.end, edit.text = stmt.valueStart, stmt.valueEnd, value
-	} else {
+	case use != nil:
+		f, v.file, v.use, v.inserted = use.file, use.file, use, true
+		edit.start, edit.end, edit.text = use.offset, use.offset, name+"="+value+lineEnding(f.original)
+	default:
+		v.inserted = true
 		edit.start, edit.end = len(f.original), len(f.original)
 		edit.text = p.appendText(f, name+"="+value)
 	}
 	if err := p.addEdit(f, edit); err != nil {
 		return err
 	}
-	p.vars[name] = &varEdit{value: value, edit: edit}
+	p.vars[name] = v
 	return nil
+}
+
+// useOf is the position of stmt's line in f, as an envUse.
+func (p *writePlan) useOf(f *fileState, stmt *envStatement) *envUse {
+	lineStart := bytes.LastIndexByte(f.original[:stmt.valueStart], '\n') + 1
+	if lineStart == 0 && bytes.HasPrefix(f.original, envUTF8BOM) {
+		lineStart = len(envUTF8BOM) // the byte order mark stays first
+	}
+	return &envUse{file: f, order: slices.Index(p.paths.env, f.path), offset: lineStart}
+}
+
+// moveDeclaration moves an inserted declaration of name up to an earlier use.
+func (p *writePlan) moveDeclaration(name string, v *varEdit, use *envUse) error {
+	v.file.edits = slices.DeleteFunc(v.file.edits, func(e *textEdit) bool { return e == v.edit })
+	v.edit.start, v.edit.end = use.offset, use.offset
+	v.edit.text = name + "=" + v.value + lineEnding(use.file.original)
+	v.file, v.use = use.file, use
+	return p.addEdit(use.file, v.edit)
+}
+
+func lineEnding(data []byte) string {
+	if bytes.Contains(data, []byte("\r\n")) {
+		return "\r\n"
+	}
+	return "\n"
 }
 
 // assignmentFor returns the env file and statement compose takes name from — the
@@ -494,10 +592,7 @@ func (p *writePlan) assignmentFor(name string) (*fileState, *envStatement, error
 // appendText is line as a new last line of f: preceded by a line break when the
 // file does not end with one, in the file's own line ending.
 func (p *writePlan) appendText(f *fileState, line string) string {
-	eol := "\n"
-	if bytes.Contains(f.original, []byte("\r\n")) {
-		eol = "\r\n"
-	}
+	eol := lineEnding(f.original)
 	appending := false
 	for _, e := range f.edits {
 		if e.start == len(f.original) {
@@ -746,9 +841,10 @@ func (w *imageWrite) revert(ctx context.Context, services []string, load project
 	if w == nil || len(w.files) == 0 {
 		return nil
 	}
+	named := func(svc string) bool { return services == nil || slices.Contains(services, svc) }
 	reverting := map[string]bool{}
 	for svc := range w.targets {
-		reverting[svc] = services == nil || slices.Contains(services, svc)
+		reverting[svc] = w.reverted[svc] || named(svc)
 	}
 	kept := map[string]string{}
 	var problems []string
@@ -758,7 +854,7 @@ func (w *imageWrite) revert(ctx context.Context, services []string, load project
 			if slices.ContainsFunc(e.owners, func(o string) bool { return !reverting[o] }) {
 				keep = append(keep, e)
 				for _, o := range e.owners {
-					if reverting[o] {
+					if reverting[o] && named(o) {
 						problems = append(problems, fmt.Sprintf("%s keeps its new image: it shares an edit in %s with %s, which keeps its own",
 							o, f.path, strings.Join(e.owners, ", ")))
 					}
@@ -779,6 +875,11 @@ func (w *imageWrite) revert(ctx context.Context, services []string, load project
 			continue
 		}
 		f.present, f.current = present, content
+	}
+	for svc, r := range reverting {
+		if r {
+			w.reverted[svc] = true
+		}
 	}
 	after, err := load(ctx, w.entry)
 	if err == nil {

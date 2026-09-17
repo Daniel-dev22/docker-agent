@@ -169,8 +169,12 @@ func (e *engine) lockProject(ctx context.Context, j *Job, op string) (release fu
 		wctx, cancel = context.WithTimeout(ctx, e.composeOpTimeout)
 		defer cancel()
 	}
-	release, err := e.locks.acquire(wctx, snap.Project, fmt.Sprintf("job %s (%s)", snap.ID, op), func(holder string) {
-		j.appendLine(fmt.Sprintf("queued: waiting for %s on project %s", holder, snap.Project))
+	key := projectLockKey(ProjectEntry{Name: snap.Project})
+	if entry, ok := e.resolveEntry(wctx, snap.Project); ok {
+		key = projectLockKey(entry)
+	}
+	release, err := e.locks.acquire(wctx, key, fmt.Sprintf("job %s (%s of %s)", snap.ID, op, snap.Project), func(holder string) {
+		j.appendLine(fmt.Sprintf("queued: waiting for %s, which is changing the same project directory", holder))
 	})
 	if err == nil {
 		return release, true

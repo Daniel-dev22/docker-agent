@@ -17,11 +17,15 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -69,6 +73,12 @@ type composeRegistry struct {
 	byName map[string]*ProjectEntry
 
 	persistMu sync.Mutex // serializes the write-tmp/rename pair
+
+	// shared holds the working directories more than one entry names
+	// (canonical dir → names), recomputed on every change to the index. The
+	// register handler refuses to create one, and auto-adoption skips one; what
+	// remains predates that rule and is reported in readiness.
+	shared atomic.Pointer[map[string][]string]
 }
 
 func newComposeRegistry(path, composeRoot string) *composeRegistry {
@@ -111,7 +121,6 @@ func (r *composeRegistry) load() error {
 		return fmt.Errorf("parse %s: %w", r.path, err)
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.byName = make(map[string]*ProjectEntry, len(entries))
 	for _, e := range entries {
 		if e.Name == "" {
@@ -119,8 +128,79 @@ func (r *composeRegistry) load() error {
 		}
 		r.byName[e.Name] = e
 	}
-	slog.Info("compose registry loaded", "count", len(r.byName), "path", r.path)
+	count := len(r.byName)
+	r.mu.Unlock()
+	slog.Info("compose registry loaded", "count", count, "path", r.path)
+	r.refreshShared() // before the listener binds, so readiness never reports "none" for "not yet checked"
 	return nil
+}
+
+// canonicalDir is dir with symlinks resolved as far as the path exists, so two
+// spellings of one directory — or a link to it — compare equal. The part that
+// does not exist yet (a project directory about to be created) stays lexical.
+func canonicalDir(dir string) string {
+	if dir == "" {
+		return ""
+	}
+	p, rest := filepath.Clean(dir), ""
+	for {
+		if real, err := filepath.EvalSymlinks(p); err == nil {
+			return filepath.Join(real, rest)
+		}
+		parent := filepath.Dir(p)
+		if parent == p {
+			return filepath.Join(p, rest)
+		}
+		rest = filepath.Join(filepath.Base(p), rest)
+		p = parent
+	}
+}
+
+// workingDirOwner returns the registered project, other than name, whose working
+// directory is dir.
+func (r *composeRegistry) workingDirOwner(dir, name string) (string, bool) {
+	want := canonicalDir(dir)
+	for _, e := range r.list() {
+		if e.Name != name && e.WorkingDir != "" && canonicalDir(e.WorkingDir) == want {
+			return e.Name, true
+		}
+	}
+	return "", false
+}
+
+// sharedWorkingDirs returns the working directories more than one entry names.
+func (r *composeRegistry) sharedWorkingDirs() map[string][]string {
+	if r == nil {
+		return map[string][]string{} // readiness must answer even before a registry exists
+	}
+	if p := r.shared.Load(); p != nil {
+		return *p
+	}
+	return map[string][]string{}
+}
+
+func (r *composeRegistry) refreshShared() {
+	byDir := map[string][]string{}
+	for _, e := range r.list() {
+		if e.WorkingDir != "" {
+			d := canonicalDir(e.WorkingDir)
+			byDir[d] = append(byDir[d], e.Name)
+		}
+	}
+	shared := map[string][]string{}
+	for d, names := range byDir {
+		if len(names) > 1 {
+			shared[d] = names
+		}
+	}
+	if prev := r.shared.Swap(&shared); (prev == nil && len(shared) > 0) || (prev != nil && !reflect.DeepEqual(*prev, shared)) {
+		if len(shared) > 0 {
+			slog.Warn("compose registry: projects share a working directory — changes to one are serialised with the other, "+
+				"but deregister all but one", "shared", shared)
+		} else {
+			slog.Info("compose registry: no projects share a working directory")
+		}
+	}
 }
 
 // register adds or replaces a durable project entry and rewrites projects.json.
@@ -136,6 +216,7 @@ func (r *composeRegistry) register(e ProjectEntry) error {
 	ec := e
 	r.byName[e.Name] = &ec
 	r.mu.Unlock()
+	defer r.refreshShared()
 	return r.persist()
 }
 
@@ -149,6 +230,7 @@ func (r *composeRegistry) deregister(name string) error {
 	if !ok {
 		return nil
 	}
+	defer r.refreshShared()
 	return r.persist()
 }
 
@@ -196,13 +278,39 @@ func (r *composeRegistry) resolve(name string, live []ComposeProject) (ProjectEn
 // curated paths win); a new running project is persisted so it survives being
 // stopped later. Projects with no working_dir label are skipped (nothing to run
 // an op against).
+//
+// A running project whose working directory is already registered under another
+// name is not adopted: two entries for one directory would let a change through
+// one name bypass a change through the other.
 func (r *composeRegistry) enrichFromLive(live []ComposeProject) {
-	var added int
-	r.mu.Lock()
+	owners := map[string]string{} // canonical dir → registered name
+	for _, e := range r.list() {
+		if e.WorkingDir != "" {
+			owners[canonicalDir(e.WorkingDir)] = e.Name
+		}
+	}
+	candidates := map[string]ComposeProject{}
 	for _, p := range live {
 		if p.Name == "" || p.WorkingDir == "" {
 			continue
 		}
+		dir := canonicalDir(p.WorkingDir)
+		if owner, ok := owners[dir]; ok && owner != p.Name {
+			slog.Warn("not adopting a running compose project: its working directory is registered as another project",
+				"project", p.Name, "working_dir", p.WorkingDir, "registered_as", owner)
+			continue
+		}
+		if _, ok := candidates[dir]; ok {
+			slog.Warn("not adopting a running compose project: another running project uses its working directory",
+				"project", p.Name, "working_dir", p.WorkingDir)
+			continue
+		}
+		candidates[dir] = p
+	}
+	var added int
+	r.mu.Lock()
+	for _, dir := range slices.Sorted(maps.Keys(candidates)) {
+		p := candidates[dir]
 		if _, ok := r.byName[p.Name]; ok {
 			continue
 		}
@@ -214,6 +322,7 @@ func (r *composeRegistry) enrichFromLive(live []ComposeProject) {
 	}
 	r.mu.Unlock()
 	if added > 0 {
+		defer r.refreshShared()
 		if err := r.persist(); err != nil {
 			slog.Warn("persist auto-adopted projects failed", "error", err)
 		} else {
@@ -255,6 +364,7 @@ func (r *composeRegistry) mergeKnown(live []ComposeProject, v *selfView) []Compo
 
 func (p *ComposeProject) stampCapability(c projectCapability) {
 	p.AllowedOps, p.Operable, p.Managed, p.OpsBlocked = c.Allowed, c.operable(), c.Editable, c.Blocked
+	p.ServiceOps = true
 }
 
 // projectEntryFromLive builds an entry from a label-derived ComposeProject. The

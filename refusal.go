@@ -38,6 +38,10 @@ const (
 	maxPathLen = 4096
 )
 
+// retryableAnswerKey marks, on the gin context, an answer refuse() sent with
+// "retryable": true.
+const retryableAnswerKey = "docker-agent.retryable-answer"
+
 // retryableCodes are the only codes a 4xx may mark "retryable": true.
 var retryableCodes = map[string]bool{
 	// The same key is still being handled; a retry gets its recorded answer.
@@ -67,8 +71,14 @@ func refuse(c *gin.Context, status int, code, msg string, fields gin.H) {
 		// A programming error, and the one kind of refusal that must not ship.
 		panic("refuse: empty code for " + http.StatusText(status))
 	}
-	if fields["retryable"] == true && !retryableCodes[code] {
-		panic("refuse: " + code + " is not a retryable code")
+	if fields["retryable"] == true {
+		if !retryableCodes[code] {
+			panic("refuse: " + code + " is not a retryable code")
+		}
+		// A retryable answer is not the request's final answer, so it must not become
+		// the Idempotency-Key's recorded one: a same-key retry would replay the
+		// refusal for the key's whole lifetime and never get through.
+		c.Set(retryableAnswerKey, true)
 	}
 	body := gin.H{"error": clipTo(msg, refusalMessageMax), "code": code}
 	for k, v := range fields {

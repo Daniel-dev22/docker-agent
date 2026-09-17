@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -88,36 +89,120 @@ func (b *composeBackend) execute(ctx context.Context, j *Job, op string, e Proje
 	if err != nil {
 		return fmt.Errorf("compose service: %w", err)
 	}
-
-	switch op {
-	case opComposeDown:
-		// Safe default: stop + remove containers/networks, but NEVER volumes.
-		return svc.Down(ctx, e.Name, api.DownOptions{RemoveOrphans: true})
-	case opComposeRestart:
-		return svc.Restart(ctx, e.Name, api.RestartOptions{Timeout: jobTimeoutDur(j)})
+	var project *types.Project
+	// A whole-project down or restart acts on the running containers by project
+	// name and needs no files — it still works when the compose files are gone.
+	if !(len(j.services) == 0 && (op == opComposeDown || op == opComposeRestart)) {
+		if project, err = b.loadProject(ctx, e); err != nil {
+			return fmt.Errorf("load project: %w", err)
+		}
 	}
-
-	project, err := b.loadProject(ctx, e)
+	call, err := planComposeCall(op, e.Name, project, j.services, jobTimeoutDur(j))
 	if err != nil {
-		return fmt.Errorf("load project: %w", err)
+		return err
 	}
-	switch op {
-	case opComposeUp:
-		// Detached `up` (create + start, return after start) — the deploy
-		// posture. Health-wait + rollback is the `update` op (stackengine.go).
-		return svc.Up(ctx, project, api.UpOptions{
-			Create: api.CreateOptions{RemoveOrphans: true},
-			Start:  api.StartOptions{Project: project},
-		})
-	case opComposeRecreate:
-		return svc.Up(ctx, project, api.UpOptions{
-			Create: api.CreateOptions{Recreate: api.RecreateForce, RemoveOrphans: true},
-			Start:  api.StartOptions{Project: project},
-		})
-	case opComposePull:
-		return svc.Pull(ctx, project, api.PullOptions{})
+	switch call.kind {
+	case callUp:
+		return svc.Up(ctx, call.project, call.up)
+	case callPull:
+		return svc.Pull(ctx, call.project, api.PullOptions{})
+	case callRestart:
+		return svc.Restart(ctx, e.Name, call.restart)
+	case callDown:
+		return svc.Down(ctx, e.Name, call.down)
+	case callRemove:
+		err := svc.Remove(ctx, e.Name, call.remove)
+		if errors.Is(err, api.ErrNoResources) {
+			return nil // nothing of those services exists: already down
+		}
+		return err
 	}
 	return fmt.Errorf("unknown compose op %q", op)
+}
+
+type composeCallKind int
+
+const (
+	callUp composeCallKind = iota + 1
+	callPull
+	callRestart
+	callDown
+	callRemove
+)
+
+// composeCall is the compose API call an op makes, decided without a daemon.
+type composeCall struct {
+	kind    composeCallKind
+	project *types.Project
+	up      api.UpOptions
+	restart api.RestartOptions
+	down    api.DownOptions
+	remove  api.RemoveOptions
+}
+
+// planComposeCall decides the compose call for op. With no services it is the
+// whole-project call as before. With services it acts on exactly those services:
+//
+//   - up, recreate and pull run on the project narrowed to them with
+//     IgnoreDependencies (`--no-deps`), so a dependency an operator stopped is not
+//     started, and without removing orphans — a narrowed op touches nothing else.
+//   - restart restarts exactly them (NoDeps).
+//   - down is stop + remove of their containers. compose's own Down with Services
+//     also removes the services that depend on them and tries to remove the
+//     project's networks, which a service-scoped down must never do. Volumes are
+//     kept, anonymous ones included, as a whole-project down keeps them.
+func planComposeCall(op, name string, project *types.Project, services []string, timeout *time.Duration) (composeCall, error) {
+	if len(services) == 0 {
+		switch op {
+		case opComposeDown:
+			// Safe default: stop + remove containers/networks, but NEVER volumes.
+			return composeCall{kind: callDown, down: api.DownOptions{RemoveOrphans: true}}, nil
+		case opComposeRestart:
+			return composeCall{kind: callRestart, restart: api.RestartOptions{Timeout: timeout}}, nil
+		case opComposeUp:
+			// Detached `up` (create + start, return after start) — the deploy
+			// posture. Health-wait + rollback is the `update` op (stackengine.go).
+			return composeCall{kind: callUp, project: project, up: api.UpOptions{
+				Create: api.CreateOptions{RemoveOrphans: true},
+				Start:  api.StartOptions{Project: project},
+			}}, nil
+		case opComposeRecreate:
+			return composeCall{kind: callUp, project: project, up: api.UpOptions{
+				Create: api.CreateOptions{Recreate: api.RecreateForce, RemoveOrphans: true},
+				Start:  api.StartOptions{Project: project},
+			}}, nil
+		case opComposePull:
+			return composeCall{kind: callPull, project: project}, nil
+		}
+		return composeCall{}, fmt.Errorf("unknown compose op %q", op)
+	}
+
+	selected, err := project.WithSelectedServices(services, types.IgnoreDependencies)
+	if err != nil {
+		return composeCall{}, fmt.Errorf("select services: %w", err)
+	}
+	switch op {
+	case opComposeUp, opComposeRecreate:
+		create := api.CreateOptions{Services: services}
+		if op == opComposeRecreate {
+			create.Recreate = api.RecreateForce
+		}
+		return composeCall{kind: callUp, project: selected, up: api.UpOptions{
+			Create: create,
+			Start:  api.StartOptions{Project: selected, Services: services},
+		}}, nil
+	case opComposePull:
+		return composeCall{kind: callPull, project: selected}, nil
+	case opComposeRestart:
+		return composeCall{kind: callRestart, restart: api.RestartOptions{
+			Project: project, Services: services, NoDeps: true, Timeout: timeout,
+		}}, nil
+	case opComposeDown:
+		return composeCall{kind: callRemove, remove: api.RemoveOptions{
+			Project: project, Services: services, Stop: true, Force: true,
+		}}, nil
+	}
+	return composeCall{}, fmt.Errorf("services cannot narrow compose op %q", op)
 }
 
 // pullProject pulls the images for an ALREADY-LOADED (and possibly image-mutated)

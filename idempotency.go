@@ -16,8 +16,9 @@ package main
 //     handler runs, so a concurrent duplicate gets 409 idempotency_key_in_flight
 //     and never executes.
 //   - Deterministic answers (2xx, and 4xx refusals) are recorded. A 5xx — above all
-//     503 self_identity_unavailable — is transient: the claim is released so a
-//     retry can succeed later.
+//     503 self_identity_unavailable — is transient, and so is a refusal that says
+//     "retryable": true (409 project_busy): the claim is released so a retry can
+//     succeed later.
 //   - An answer to a request that ACTED but could not be stored is kept in memory
 //     and served to retries while a background writer keeps trying to store it;
 //     close() makes one last attempt at every such answer on shutdown. Every
@@ -49,6 +50,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -512,6 +514,7 @@ func bodyFingerprint(raw []byte) string {
 		dec.UseNumber()
 		var v any
 		if err := dec.Decode(&v); err == nil && !dec.More() {
+			normalizeServiceSet(v)
 			if b, err := json.Marshal(v); err == nil {
 				canon = b
 			}
@@ -519,6 +522,35 @@ func bodyFingerprint(raw []byte) string {
 	}
 	sum := sha256.Sum256(canon)
 	return hex.EncodeToString(sum[:])
+}
+
+// normalizeServiceSet sorts and deduplicates a top-level "services" list of
+// strings in place. The op handler treats that list as a set (checkOpServices), so
+// [b, a, a] and [a, b] are one request and must be one fingerprint — otherwise a
+// retry that reorders the list would be refused as a different body.
+func normalizeServiceSet(v any) {
+	obj, ok := v.(map[string]any)
+	if !ok {
+		return
+	}
+	list, ok := obj["services"].([]any)
+	if !ok {
+		return
+	}
+	names := make([]string, 0, len(list))
+	for _, x := range list {
+		s, ok := x.(string)
+		if !ok {
+			return // not a list of names: hashed as sent, and the handler refuses it
+		}
+		names = append(names, s)
+	}
+	names = slices.Compact(slices.Sorted(slices.Values(names)))
+	set := make([]any, len(names))
+	for i, s := range names {
+		set[i] = s
+	}
+	obj["services"] = set
 }
 
 // jsonKeysCollide reports whether any object in raw repeats a key under the
@@ -694,8 +726,10 @@ func (a *app) idempotent() gin.HandlerFunc {
 		}()
 		c.Next()
 		status := cw.Status()
-		if status >= http.StatusInternalServerError {
-			return // transient: the deferred release lets a retry run
+		if status >= http.StatusInternalServerError || c.GetBool(retryableAnswerKey) {
+			// Transient — a 5xx, or a refusal that says "retryable" — so not the
+			// request's answer: the deferred release lets a retry run.
+			return
 		}
 		answer := pendingAnswer{method: method, pathSHA: scope, key: k, fp: fp, status: status, body: bytes.Clone(cw.buf.Bytes())}
 		if err := a.idem.record(settleCtx, answer); err != nil {

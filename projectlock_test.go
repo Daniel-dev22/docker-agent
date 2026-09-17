@@ -48,12 +48,14 @@ func TestProjectJobsQueueBehindTheProjectLock(t *testing.T) {
 
 	for _, op := range []string{opComposeUp, opComposeDown, opComposePull, opComposeRestart, opComposeRecreate, opComposeUpdate} {
 		t.Run(op, func(t *testing.T) {
-			release, err := locks.acquire(ctx, "stack", "the test's holder", nil)
+			// "stack" is neither registered nor running: it has no directory, so it is
+			// locked by name.
+			release, err := locks.acquire(ctx, "name:stack", "the test's holder", nil)
 			must(t, err)
 			t.Cleanup(release) // a failure below must not leave the next case waiting forever
 			j := e.a.reg.start(ctx, JobRequest{Operation: op, Project: "stack"})
 			waitFor(t, "the queued line", func() bool {
-				return slices.Contains(jobLog(j), "queued: waiting for the test's holder on project stack")
+				return slices.Contains(jobLog(j), "queued: waiting for the test's holder, which is changing the same project directory")
 			})
 			time.Sleep(50 * time.Millisecond)
 			if terminal(j) {
@@ -72,7 +74,7 @@ func TestProjectJobsQueueBehindTheProjectLock(t *testing.T) {
 	}
 
 	t.Run("cancelled-while-queued", func(t *testing.T) {
-		release, err := locks.acquire(ctx, "stack", "the test's holder", nil)
+		release, err := locks.acquire(ctx, "name:stack", "the test's holder", nil)
 		must(t, err)
 		defer release()
 		j := e.a.reg.start(ctx, JobRequest{Operation: opComposeUpdate, Project: "stack"})
@@ -89,7 +91,7 @@ func TestProjectJobsQueueBehindTheProjectLock(t *testing.T) {
 	})
 
 	t.Run("gives-up-after-the-op-timeout", func(t *testing.T) {
-		release, err := locks.acquire(ctx, "stack", "the test's holder", nil)
+		release, err := locks.acquire(ctx, "name:stack", "the test's holder", nil)
 		must(t, err)
 		defer release()
 		e.a.reg.eng.composeOpTimeout = 100 * time.Millisecond
@@ -116,7 +118,7 @@ func TestRequestsAnswerBusyWhileTheProjectIsLocked(t *testing.T) {
 		t.Fatalf("fixture register: %d %v", status, body)
 	}
 
-	release, err := e.a.reg.eng.locks.acquire(ctx, "busyproj", "job 42 (update)", nil)
+	release, err := e.a.reg.eng.locks.acquire(ctx, projectLockKey(ProjectEntry{Name: "busyproj", WorkingDir: filepath.Join(e.root, "busyproj")}), "job 42 (update)", nil)
 	must(t, err)
 	status, body := e.do(t, http.MethodPost, "/v1/projects", map[string]any{
 		"name": "busyproj", "replace": true, "files": map[string]string{"compose.yaml": "services: {}\n"},
@@ -129,7 +131,8 @@ func TestRequestsAnswerBusyWhileTheProjectIsLocked(t *testing.T) {
 		t.Fatalf("a busy register wrote its files (%v)", err)
 	}
 
-	release, err = e.a.reg.eng.locks.acquire(ctx, "srcproj", "job 43 (update)", nil)
+	src, _ := e.a.projects.get("srcproj")
+	release, err = e.a.reg.eng.locks.acquire(ctx, projectLockKey(src), "job 43 (update)", nil)
 	must(t, err)
 	status, body = e.do(t, http.MethodPost, "/v1/projects/srcproj/copy", map[string]any{"new_name": "dstproj"})
 	release()

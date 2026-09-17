@@ -80,6 +80,10 @@ type JobRequest struct {
 	// the same amount, for a delay that happens once.
 	HealthTimeoutS int `json:"health_timeout_s,omitempty"`
 	SwapTimeoutS   int `json:"swap_timeout_s,omitempty"`
+	// Services narrows a compose op (up, recreate, pull, restart, down) to exactly
+	// these services — sorted, deduplicated, each a service of the project. Empty
+	// is the whole project. Not for update, which targets with OverrideService.
+	Services []string `json:"services,omitempty"`
 }
 
 // jobPublic carries the JSON-serializable fields of a Job, split out so
@@ -116,6 +120,7 @@ type Job struct {
 	overrideService string
 	healthTimeoutS  int
 	swapTimeoutS    int
+	services        []string // compose ops: exactly these services; empty = all
 
 	mu          sync.Mutex
 	cancel      context.CancelFunc

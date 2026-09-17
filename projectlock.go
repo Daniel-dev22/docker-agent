@@ -16,6 +16,16 @@ import (
 	"sync"
 )
 
+// projectLockKey is what a change to e touches: its working directory, resolved,
+// so two registry names for one directory — or a symlink to it — take one lock.
+// Only a project with no directory is locked by name.
+func projectLockKey(e ProjectEntry) string {
+	if e.WorkingDir == "" {
+		return "name:" + e.Name
+	}
+	return "dir:" + canonicalDir(e.WorkingDir)
+}
+
 type projectLocks struct {
 	mu    sync.Mutex
 	locks map[string]*projectLock
@@ -31,7 +41,7 @@ func newProjectLocks() *projectLocks {
 	return &projectLocks{locks: map[string]*projectLock{}}
 }
 
-// acquire takes project's lock for who, waiting until ctx ends. When the lock is
+// acquire takes the lock for key (projectLockKey) for who, waiting until ctx ends. When the lock is
 // held, waiting (if non-nil) is told by whom before the wait begins. The returned
 // release is idempotent.
 func (l *projectLocks) acquire(ctx context.Context, project, who string, waiting func(holder string)) (func(), error) {

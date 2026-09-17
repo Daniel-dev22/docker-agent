@@ -180,12 +180,15 @@ Without the header, every endpoint behaves exactly as described below.
 | Method | Path | Response |
 |---|---|---|
 | `GET` | `/health/live` | `200 {"status":"ok"}` |
-| `GET` | `/health/ready` | `200 {"status":"ready", "self":{…}}` |
+| `GET` | `/health/ready` | `200 {"status":"ready", "self":{…}, "projects":{"shared_working_dirs":{…}}}` |
 
 Neither touches the Docker daemon: readiness reports the last published self identity
 (`container_id`, `name`, `projects`, `ambiguous`, `control_path` / `control_path_error`,
 `observed_at`, `last_list_error`, or `error`) and never gates on it. The image's `HEALTHCHECK`
-curls `/health/ready`.
+curls `/health/ready`. `projects.shared_working_dirs` maps a working directory (symlinks
+resolved) to the registry entries that share it — `{}` when none do. A register refuses to
+create one, but a `projects.json` from an earlier release can hold one; it is reported, not
+gated, and changes through either name are still serialised (they take one lock).
 
 ### Jobs (4)
 
@@ -240,7 +243,7 @@ front never relays a scary error and a viewer simply stops paging.
 | `GET` | `/v1/projects` | — | `200 {"projects":[…]}` — the durable registry, sorted by name, each entry with `allowed_ops`, `operable`, `managed`, `ops_blocked`. |
 | `POST` | `/v1/projects` | see below | `200 {"registered":name, "job_id"?:…}` |
 | `DELETE` | `/v1/projects/:name` | — | `200 {"deregistered":name}` |
-| `POST` | `/v1/projects/:name/op` | `{op, timeout?, override_image?, override_service?, trigger_key?}` | `202 {"job_id":…, "state":…}` |
+| `POST` | `/v1/projects/:name/op` | `{op, services?, timeout?, override_image?, override_service?, trigger_key?}` | `202 {"job_id":…, "state":…}` |
 | `GET` | `/v1/projects/:name/bundle` | — | `200 {name, working_dir, compose_files:[{name,content}], env_files:[…]}` |
 | `POST` | `/v1/projects/:name/copy` | `{new_name, deploy?}` | `200 {"copied":…, "working_dir":…, "job_id"?:…}` |
 
@@ -262,7 +265,21 @@ deploy still goes through the capability gate for the new entry. Ansible and the
 Every refusal happens before any file is written; the codes are in the table under Mounts. A write
 that fails after validation is a `500` (transient).
 
-**Op** accepts `up | down | pull | restart | recreate | update`. It returns:
+**Op** accepts `up | down | pull | restart | recreate | update`.
+
+**`services`** (optional, `up`, `recreate`, `pull`, `restart`, `down`) narrows the op to exactly
+those services; absent or empty is the whole project. Each must be a compose service name and a
+service of the project as it loads now, else `400 unknown_service` naming it. The list is a set:
+order and duplicates do not matter, to the op or to the Idempotency-Key fingerprint. A narrowed op
+never touches anything else: `up`/`recreate`/`pull` run with no dependencies (`--no-deps`) and
+remove no orphans, so a dependency an operator stopped stays stopped; `restart` restarts only
+them; `down` stops and removes only their containers — compose's own service-scoped `down` also
+removes the services depending on them and tries to remove the project's networks, so it is not
+used. Volumes, anonymous ones included, are kept. `update` does not take `services`; it targets
+one service with `override_service`. `GET /v1/projects` entries carry `"service_ops": true` on an
+agent that supports this.
+
+It returns:
 - `400` if `op` is not one of those,
 - `503 {"error":"compose backend unavailable on this host"}` if the compose backend failed to
   initialise at startup (the agent deliberately keeps running in that case — the read-only fleet
@@ -550,6 +567,8 @@ ID starts with `db`.
 | `health_timeout_s` / `swap_timeout_s` out of range | 400 | `invalid_budget` |
 | `override_image` not an image reference by docker's own grammar (`distribution/reference`), or an image ID (`sha256:…`) | 400 | `invalid_override_image` |
 | Register or copy while another change holds the project for longer than 10s | 409 | `project_busy` (`"retryable": true`, `holder`) |
+| Register or copy onto a working directory another registered project already has (symlinks resolved) | 409 | `working_dir_in_use` (`project`, `working_dir`) |
+| Op `services`: not a compose service name, or not a service of the project | 400 | `unknown_service` (`service`) |
 | Bulk `action` not one of start/stop/restart/kill/remove | 400 | `invalid_action` |
 | More than 100 distinct targets | 400 | `too_many_targets` |
 | An ambiguous, malformed, or >255-byte container reference | 400 | `invalid_target` |
@@ -594,7 +613,18 @@ that direction and only in that direction:
   gets replay protection only once the agent is upgraded, and must not depend on it before then.
 - **`409 project_busy`** is new and retryable: a register or copy onto a project a job is
   changing. A consumer should retry after the named holder finishes; one that does not yet know
-  the code surfaces it as an error, which is safe — nothing was written.
+  the code surfaces it as an error, which is safe — nothing was written. It is never recorded
+  under an Idempotency-Key: the same key goes through once the project is free.
+- **`409 working_dir_in_use`** is new and final: two registry names for one directory are
+  refused. The project lock is keyed by the resolved directory, so a duplicate that predates the
+  rule still cannot interleave with its twin.
+- **`services` on an op** is new; an agent advertises it with `"service_ops": true` on each
+  `GET /v1/projects` entry. An older agent ignores the field and acts on the WHOLE project, so a
+  consumer must check `service_ops` before sending it — not after.
+- **`/bundle` returns file contents verbatim** — every compose file and every project-level env
+  file the load reads. Neither may carry a secret inline: a secret reaches a stack through a
+  service's `env_file:` rendered from Bitwarden, which compose reads at `up` and `/bundle` never
+  returns. A secret in a compose file or the project `.env` is sent to whoever reads the bundle.
 - **`override_image` validation is stricter**: docker's reference grammar, and no image IDs. A
   value control-api accepted and the old agent took (`traefik:`, `sha256:…`) is now `400
   invalid_override_image`.

@@ -782,3 +782,146 @@ func TestImageWriteFailingPartwayRestoresWhatItWrote(t *testing.T) {
 	}
 	sameState(t, "after a failed write", f.state(t), original)
 }
+
+// Partial reverts compose: reverting [app] and then [net] ends byte-identical to
+// the original, and neither call undoes the other. The second call used to rebuild
+// each file with every edit not in ITS scope — re-applying app's.
+func TestImageWriteSuccessivePartialRevertsCompose(t *testing.T) {
+	for _, order := range [][]string{{"app", "net"}, {"net", "app"}} {
+		t.Run(order[0]+"-then-"+order[1], func(t *testing.T) {
+			f := newWriteFixture(t, map[string]string{
+				"compose.yaml": "services:\n  app:\n    image: reg.example/app:v1\n  net:\n    image: ${TW_NET}\n  side:\n    image: reg.example/side:v1\n",
+				".env":         "TW_NET=reg.example/net:v1\n",
+			}, ProjectEntry{})
+			original := f.state(t)
+			w, err := f.write(map[string]string{"app": "reg.example/app:v2", "net": "reg.example/net:v2", "side": "reg.example/side:v2"})
+			must(t, err)
+			old := map[string]string{"app": "reg.example/app:v1", "net": "reg.example/net:v1", "side": "reg.example/side:v1"}
+			updated := map[string]string{"app": "reg.example/app:v2", "net": "reg.example/net:v2", "side": "reg.example/side:v2"}
+
+			must(t, w.revert(context.Background(), []string{order[0]}, f.l.cb.loadProject))
+			for svc := range old {
+				want := updated[svc]
+				if svc == order[0] {
+					want = old[svc]
+				}
+				if got := f.image(t, svc); got != want {
+					t.Errorf("after reverting %s: %s = %q, want %q", order[0], svc, got, want)
+				}
+			}
+			if err := w.revert(context.Background(), []string{order[1]}, f.l.cb.loadProject); err != nil {
+				t.Fatalf("the second partial revert: %v", err)
+			}
+			for svc := range old {
+				want := updated[svc]
+				if svc == order[0] || svc == order[1] {
+					want = old[svc]
+				}
+				if got := f.image(t, svc); got != want {
+					t.Errorf("after reverting %s then %s: %s = %q, want %q", order[0], order[1], svc, got, want)
+				}
+			}
+			must(t, w.revert(context.Background(), []string{"side"}, f.l.cb.loadProject))
+			sameState(t, "after reverting every service one call at a time", f.state(t), original)
+			// And one more revert of everything is a no-op, not a re-write.
+			must(t, w.revert(context.Background(), nil, f.l.cb.loadProject))
+			sameState(t, "after a final revert of all", f.state(t), original)
+		})
+	}
+}
+
+// An env value that is itself a template is followed, never flattened into a
+// literal: coupled services keep their shared tag variable.
+func TestImageWriteFollowsTemplateEnvValues(t *testing.T) {
+	const immichCompose = "services:\n" +
+		"  immich-server:\n    image: ${IMMICH_SERVER_IMAGE}\n" +
+		"  immich-machine-learning:\n    image: ${IMMICH_ML_IMAGE}\n"
+	const immichEnv = "IMMICH_VERSION=v1.9.0\n" +
+		"IMMICH_SERVER_IMAGE=ghcr.io/immich-app/immich-server:${IMMICH_VERSION:-release}\n" +
+		"IMMICH_ML_IMAGE=ghcr.io/immich-app/immich-machine-learning:${IMMICH_VERSION:-release}\n"
+
+	t.Run("immich: both coupled services move through their one tag variable", func(t *testing.T) {
+		f := newWriteFixture(t, map[string]string{"compose.yaml": immichCompose, ".env": immichEnv}, ProjectEntry{})
+		original := f.state(t)
+		w, err := f.write(map[string]string{
+			"immich-server":           "ghcr.io/immich-app/immich-server:v2.1.0",
+			"immich-machine-learning": "ghcr.io/immich-app/immich-machine-learning:v2.1.0",
+		})
+		must(t, err)
+		want := strings.Replace(immichEnv, "IMMICH_VERSION=v1.9.0", "IMMICH_VERSION=v2.1.0", 1)
+		if got := f.state(t)[".env"]; got != want {
+			t.Errorf(".env = %q, want only the tag variable changed: %q", got, want)
+		}
+		must(t, w.revert(context.Background(), nil, f.l.cb.loadProject))
+		sameState(t, "after the revert", f.state(t), original)
+	})
+
+	t.Run("immich: one coupled service alone would diverge from the other — refused", func(t *testing.T) {
+		f := newWriteFixture(t, map[string]string{"compose.yaml": immichCompose, ".env": immichEnv}, ProjectEntry{})
+		original := f.state(t)
+		_, err := f.write(map[string]string{"immich-server": "ghcr.io/immich-app/immich-server:v2.1.0"})
+		if err == nil || !strings.Contains(err.Error(), "immich-machine-learning's image changed") {
+			t.Fatalf("want the diverging sibling named, got %v", err)
+		}
+		sameState(t, "after the refusal", f.state(t), original)
+	})
+
+	t.Run("immich: an undeclared tag variable is declared once, above its first use", func(t *testing.T) {
+		// The shape in the fleet: no IMMICH_VERSION, so both images track the
+		// template's default. Appended at the end, a declaration would come after
+		// dotenv had expanded both values with that default.
+		env := strings.Replace(immichEnv, "IMMICH_VERSION=v1.9.0\n", "", 1)
+		f := newWriteFixture(t, map[string]string{"compose.yaml": immichCompose, ".env": env}, ProjectEntry{})
+		original := f.state(t)
+		w, err := f.write(map[string]string{
+			"immich-server":           "ghcr.io/immich-app/immich-server:v2.1.0",
+			"immich-machine-learning": "ghcr.io/immich-app/immich-machine-learning:v2.1.0",
+		})
+		must(t, err)
+		if got := f.state(t)[".env"]; got != "IMMICH_VERSION=v2.1.0\n"+env {
+			t.Errorf(".env = %q", got)
+		}
+		must(t, w.revert(context.Background(), nil, f.l.cb.loadProject))
+		sameState(t, "after the revert", f.state(t), original)
+	})
+
+	t.Run("zwave: an image variable holding a trailing tag variable", func(t *testing.T) {
+		f := newWriteFixture(t, map[string]string{
+			"compose.yaml": "services:\n  zwave-js-ui:\n    image: ${ZWAVE_IMAGE}\n",
+			".env":         "IMAGE_NAME=9.9.0\nZWAVE_IMAGE=zwavejs/zwave-js-ui:${IMAGE_NAME}\n",
+		}, ProjectEntry{})
+		_, err := f.write(map[string]string{"zwave-js-ui": "zwavejs/zwave-js-ui:9.9.1"})
+		must(t, err)
+		if got := f.state(t)[".env"]; got != "IMAGE_NAME=9.9.1\nZWAVE_IMAGE=zwavejs/zwave-js-ui:${IMAGE_NAME}\n" {
+			t.Errorf(".env = %q", got)
+		}
+		if got := f.image(t, "zwave-js-ui"); got != "zwavejs/zwave-js-ui:9.9.1" {
+			t.Errorf("resolves %q", got)
+		}
+	})
+
+	t.Run("a value template beyond a trailing tag is refused, not flattened", func(t *testing.T) {
+		f := newWriteFixture(t, map[string]string{
+			"compose.yaml": "services:\n  app:\n    image: ${APP_IMAGE}\n",
+			".env":         "REG=reg.example\nAPP_IMAGE=${REG}/app-v1:stable\n",
+		}, ProjectEntry{})
+		original := f.state(t)
+		_, err := f.write(map[string]string{"app": "reg.example/app-v1:beta"})
+		if err == nil || !strings.Contains(err.Error(), "not flattened into a literal") {
+			t.Fatalf("want a refusal, got %v", err)
+		}
+		sameState(t, "after the refusal", f.state(t), original)
+	})
+
+	t.Run("a single-quoted value is literal to dotenv and is rewritten", func(t *testing.T) {
+		f := newWriteFixture(t, map[string]string{
+			"compose.yaml": "services:\n  app:\n    image: ${APP_IMAGE:-reg.example/app:v1}\n",
+			".env":         "APP_IMAGE='reg.example/app:v1'\n",
+		}, ProjectEntry{})
+		_, err := f.write(map[string]string{"app": "reg.example/app:v2"})
+		must(t, err)
+		if got := f.state(t)[".env"]; got != "APP_IMAGE='reg.example/app:v2'\n" {
+			t.Errorf(".env = %q", got)
+		}
+	})
+}

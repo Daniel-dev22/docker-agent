@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -34,7 +36,17 @@ type composeOpBody struct {
 	// One-shot health/swap budget in seconds for this job only (see JobRequest).
 	HealthTimeoutS int `json:"health_timeout_s,omitempty"`
 	SwapTimeoutS   int `json:"swap_timeout_s,omitempty"`
+	// Services narrows up, recreate, pull, restart and down to exactly these
+	// services (planComposeCall). Absent or empty: the whole project.
+	Services []string `json:"services,omitempty"`
 }
+
+// maxOpServices bounds a service list: far above any real project, far below a
+// request that would make the validation below the expensive part.
+const maxOpServices = 100
+
+// composeServiceName is compose's own rule for a service name (compose-spec.json).
+var composeServiceName = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
 
 func (a *app) handleComposeOp(c *gin.Context) {
 	name := c.Param("name")
@@ -99,7 +111,12 @@ func (a *app) handleComposeOp(c *gin.Context) {
 				"whitespace, control characters and shell or interpolation metacharacters are refused", nil)
 		return
 	}
+	services, ok := a.checkOpServices(c, body, entry)
+	if !ok {
+		return
+	}
 	j := a.reg.start(context.Background(), JobRequest{
+		Services:        services,
 		Operation:       body.Op,
 		Project:         name,
 		Timeout:         body.Timeout,
@@ -110,6 +127,46 @@ func (a *app) handleComposeOp(c *gin.Context) {
 		TriggerKey:      orDefault(body.TriggerKey, "ui"),
 	})
 	c.JSON(http.StatusAccepted, gin.H{"job_id": j.ID, "state": j.snapshot().State})
+}
+
+// checkOpServices validates a service-narrowed op against the project as it loads
+// now, and returns the list sorted and deduplicated. A false return has answered.
+func (a *app) checkOpServices(c *gin.Context, body composeOpBody, entry ProjectEntry) ([]string, bool) {
+	if len(body.Services) == 0 {
+		return nil, true
+	}
+	if body.Op == opComposeUpdate {
+		refuse(c, http.StatusBadRequest, "invalid_body",
+			"services does not apply to update, which targets one service with override_service", nil)
+		return nil, false
+	}
+	services := slices.Compact(slices.Sorted(slices.Values(body.Services)))
+	if len(services) > maxOpServices {
+		refuse(c, http.StatusBadRequest, "invalid_body", fmt.Sprintf("at most %d services", maxOpServices), nil)
+		return nil, false
+	}
+	for _, s := range services {
+		if !composeServiceName.MatchString(s) {
+			refuse(c, http.StatusBadRequest, "unknown_service",
+				fmt.Sprintf("%s is not a valid compose service name", echo(s)), gin.H{"service": s})
+			return nil, false
+		}
+	}
+	project, err := a.compose.loadProject(c.Request.Context(), entry)
+	if err != nil {
+		// Not the caller's input: the project's files do not load (the op would fail
+		// the same way). A transient-or-host problem, so a code-less 5xx.
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "load project to check services: " + echo(err.Error())})
+		return nil, false
+	}
+	for _, s := range services {
+		if _, ok := project.Services[s]; !ok {
+			refuse(c, http.StatusBadRequest, "unknown_service",
+				fmt.Sprintf("%s is not a service of project %s", echo(s), echo(entry.Name)), gin.H{"service": s})
+			return nil, false
+		}
+	}
+	return services, true
 }
 
 // validBudgetSeconds reports whether a request-supplied budget is one the agent
@@ -135,6 +192,8 @@ type projectListEntry struct {
 	Operable   bool     `json:"operable"`
 	Managed    bool     `json:"managed"`
 	OpsBlocked string   `json:"ops_blocked,omitempty"`
+	// ServiceOps: "services" narrows POST /v1/projects/:name/op on this agent.
+	ServiceOps bool `json:"service_ops"`
 }
 
 // viewForRead is the self view a READ reports capability from. It takes a fresh
@@ -173,7 +232,7 @@ func (a *app) handleListProjects(c *gin.Context) {
 		capa := a.capabilityOf(e, view)
 		out = append(out, projectListEntry{
 			ProjectEntry: e, AllowedOps: capa.Allowed, Operable: capa.operable(),
-			Managed: capa.Editable, OpsBlocked: capa.Blocked,
+			Managed: capa.Editable, OpsBlocked: capa.Blocked, ServiceOps: true,
 		})
 	}
 	c.JSON(http.StatusOK, gin.H{"projects": out})
@@ -270,11 +329,17 @@ func (a *app) handleRegisterProject(c *gin.Context) {
 	if body.Deploy && refuseProjectOp(c, entry, a.cfg.ComposeRoot, capa, opComposeUp) {
 		return
 	}
-	release, locked := a.lockForRequest(c, entry.Name, "a register request")
+	release, locked := a.lockForRequest(c, projectLockKey(entry), "a register request for "+entry.Name)
 	if !locked {
 		return
 	}
 	defer release()
+	// Under the directory's lock, so two registers naming one directory cannot
+	// both pass this check.
+	if owner, taken := a.projects.workingDirOwner(entry.WorkingDir, entry.Name); taken {
+		refuseWorkingDirInUse(c, entry.WorkingDir, owner)
+		return
+	}
 	if len(body.Files) > 0 {
 		dir, written, err := writeProjectFiles(a.cfg.ComposeRoot, body.Name, body.Files)
 		if err != nil {
@@ -426,7 +491,7 @@ func (a *app) handleCopyProject(c *gin.Context) {
 	}
 	// The source is read under its lock, so the copy never takes a compose file
 	// from before a running update's write and an env file from after it.
-	releaseSrc, locked := a.lockForRequest(c, src.Name, "a copy request")
+	releaseSrc, locked := a.lockForRequest(c, projectLockKey(src), "a copy request from "+src.Name)
 	if !locked {
 		return
 	}
@@ -436,11 +501,15 @@ func (a *app) handleCopyProject(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	release, locked := a.lockForRequest(c, body.NewName, "a copy request")
+	release, locked := a.lockForRequest(c, projectLockKey(dst), "a copy request to "+dst.Name)
 	if !locked {
 		return
 	}
 	defer release()
+	if owner, taken := a.projects.workingDirOwner(dst.WorkingDir, dst.Name); taken {
+		refuseWorkingDirInUse(c, dst.WorkingDir, owner)
+		return
+	}
 	files := map[string]string{}
 	for _, f := range bundle.ComposeFiles {
 		files[f.Name] = f.Content
@@ -522,13 +591,13 @@ var requestLockWait = 10 * time.Second
 // lockForRequest takes project's lock for a synchronous request. When it cannot
 // within requestLockWait (or the caller goes away), the request has been answered
 // and locked is false.
-func (a *app) lockForRequest(c *gin.Context, project, who string) (release func(), locked bool) {
+func (a *app) lockForRequest(c *gin.Context, key, who string) (release func(), locked bool) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), requestLockWait)
 	defer cancel()
 	holder := "another change"
-	release, err := a.reg.eng.locks.acquire(ctx, project, who, func(h string) { holder = h })
+	release, err := a.reg.eng.locks.acquire(ctx, key, who, func(h string) { holder = h })
 	if err != nil {
-		refuseProjectBusy(c, project, holder)
+		refuseProjectBusy(c, strings.TrimPrefix(strings.TrimPrefix(key, "dir:"), "name:"), holder)
 		return nil, false
 	}
 	return release, true
