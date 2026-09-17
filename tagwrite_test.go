@@ -221,9 +221,12 @@ func TestLiteralImageRewriteTouchesOnlyItsToken(t *testing.T) {
 		{"single-quoted",
 			"services:\n  app:\n    image: 'reg/app:v1'\n",
 			"services:\n  app:\n    image: '" + newImage + "'\n", ""},
+		// Irregular spacing so a re-encode — which would re-space the flow mapping —
+		// cannot reproduce these bytes; the multibyte key before the token on its
+		// line makes a byte-counted column land short of it.
 		{"double-quoted in a flow mapping after a multibyte key",
-			"services: {app: {labels: {é: x}, image: \"reg/app:v1\"}}\n",
-			"services: {app: {labels: {é: x}, image: \"" + newImage + "\"}}\n", ""},
+			"services:\n  app:  {labels: {é:  x},  image:  \"reg/app:v1\"}\n",
+			"services:\n  app:  {labels: {é:  x},  image:  \"" + newImage + "\"}\n", ""},
 		{"CRLF line endings",
 			"services:\r\n  app:\r\n    image: reg/app:v1\r\n",
 			"services:\r\n  app:\r\n    image: " + newImage + "\r\n", ""},
