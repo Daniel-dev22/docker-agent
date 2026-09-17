@@ -238,13 +238,13 @@ func TestImageWriteRefusesWithNothingChanged(t *testing.T) {
 			map[string]string{"app": "sha256:15dc409d48a2a475ef6e54b26e211a13a97f5ea5d0b7f20bf2ee22c37ea33237"}, nil, "local image ID"},
 		{"H5 / S5: an anchored image other services alias",
 			map[string]string{"compose.yaml": "services:\n  app:\n    image: &img " + oldImg + "\n  worker:\n    image: *img\n"}, ProjectEntry{},
-			map[string]string{"app": newImg}, nil, "anchored"},
+			map[string]string{"app": newImg}, nil, "the image is anchored (&img)"},
 		{"H5: an aliased image",
 			map[string]string{"compose.yaml": "x-img: &img " + oldImg + "\nservices:\n  app:\n    image: *img\n"}, ProjectEntry{},
-			map[string]string{"app": newImg}, nil, "alias"},
+			map[string]string{"app": newImg}, nil, "the image is a YAML alias (*img)"},
 		{"a merge key",
 			map[string]string{"compose.yaml": "x-base: &base\n  image: " + oldImg + "\nservices:\n  app:\n    <<: *base\n"}, ProjectEntry{},
-			map[string]string{"app": newImg}, nil, "merge key"},
+			map[string]string{"app": newImg}, nil, "takes its keys from a YAML merge key"},
 		{"a tagged scalar",
 			map[string]string{"compose.yaml": "services:\n  app:\n    image: !!str " + oldImg + "\n"}, ProjectEntry{},
 			map[string]string{"app": newImg}, nil, "tagged, block or flow"},
@@ -300,7 +300,10 @@ func TestImageWriteRefusesWithNothingChanged(t *testing.T) {
 			f := newWriteFixture(t, tc.files, tc.entry)
 			original := f.state(t)
 			_, err := f.write(tc.targets)
-			if err == nil || !strings.Contains(err.Error(), tc.reason) {
+			// The fixture's directory is named after the test case, so the reason is
+			// matched with paths removed — otherwise a case named "anchored" passes on
+			// any refusal that quotes a file.
+			if err == nil || !strings.Contains(strings.ReplaceAll(err.Error(), f.l.root, "<root>"), tc.reason) {
 				t.Fatalf("want a refusal mentioning %q, got %v", tc.reason, err)
 			}
 			sameState(t, "after the refusal", f.state(t), original)
@@ -465,6 +468,22 @@ func TestImageWritePartialRevert(t *testing.T) {
 	}
 
 	// A file someone changed after the write is not clobbered by the revert.
+	// (Checked on a fresh write below; first, the shared-edit rule.)
+	shared := newWriteFixture(t, map[string]string{
+		"compose.yaml": "services:\n  server:\n    image: ${TW_REL:-reg.example/app:v1}\n  worker:\n    image: ${TW_REL:-reg.example/app:v1}\n",
+	}, ProjectEntry{})
+	sw, err := shared.write(map[string]string{"server": "reg.example/app:v2", "worker": "reg.example/app:v2"})
+	must(t, err)
+	written := shared.state(t)
+	err = sw.revert(context.Background(), []string{"server"}, shared.l.cb.loadProject)
+	if err == nil || !strings.Contains(err.Error(), "server keeps its new image: it shares an edit") {
+		t.Fatalf("reverting one of two services sharing an edit must keep it and say so, got %v", err)
+	}
+	sameState(t, "after reverting one sharer", shared.state(t), written)
+	if got := shared.image(t, "worker"); got != "reg.example/app:v2" {
+		t.Errorf("the service that keeps its image lost it: %q", got)
+	}
+
 	must(t, os.WriteFile(filepath.Join(f.dir, ".env"), []byte("TW_B=reg.example/b:hand-edited\n"), 0o600))
 	err = w.revert(context.Background(), []string{"b"}, f.l.cb.loadProject)
 	if err == nil || !strings.Contains(err.Error(), "changed after the update wrote it") {

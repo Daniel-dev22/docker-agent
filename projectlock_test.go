@@ -50,6 +50,7 @@ func TestProjectJobsQueueBehindTheProjectLock(t *testing.T) {
 		t.Run(op, func(t *testing.T) {
 			release, err := locks.acquire(ctx, "stack", "the test's holder", nil)
 			must(t, err)
+			t.Cleanup(release) // a failure below must not leave the next case waiting forever
 			j := e.a.reg.start(ctx, JobRequest{Operation: op, Project: "stack"})
 			waitFor(t, "the queued line", func() bool {
 				return slices.Contains(jobLog(j), "queued: waiting for the test's holder on project stack")
