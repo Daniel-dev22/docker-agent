@@ -508,8 +508,21 @@ func TestIdempotencyShutdownIsBoundedWithAWriterMidAttempt(t *testing.T) {
 	must(t, err)
 	defer tx.Rollback()
 	// The writer retried every few tens of milliseconds while the trigger failed
-	// it; its next attempt waits on the holder's lock before the trigger can run.
-	time.Sleep(300 * time.Millisecond)
+	// it; its next attempt waits on the holder's lock before the trigger can run,
+	// holding a connection for as long as it waits. Nothing else here uses one.
+	db := e.a.events.DB()
+	var held time.Time
+	for wait := time.Now(); time.Since(held) < 100*time.Millisecond || held.IsZero(); time.Sleep(5 * time.Millisecond) {
+		switch {
+		case db.Stats().InUse == 0:
+			held = time.Time{}
+		case held.IsZero():
+			held = time.Now()
+		}
+		if time.Since(wait) > 5*time.Second {
+			t.Fatal("precondition: the writer never waited on the lock")
+		}
+	}
 	store.mu.Lock()
 	pending := len(store.pending)
 	store.mu.Unlock()
@@ -522,6 +535,32 @@ func TestIdempotencyShutdownIsBoundedWithAWriterMidAttempt(t *testing.T) {
 	e.a.events.close()
 	if elapsed := time.Since(start); elapsed > idempotencyCloseBudget+time.Second {
 		t.Fatalf("shutdown took %v with a writer waiting on a locked database; budget %v", elapsed, idempotencyCloseBudget)
+	}
+}
+
+// A connection whose lock wait was lowered for a bounded write goes back to the
+// pool with the database's own wait: a later statement must not give up early.
+func TestBoundedConnRestoresTheLockWait(t *testing.T) {
+	e := newCapEnv(t, testSelfID, defaultContainers)
+	withIdempotency(t, e, t.TempDir())
+	db := e.a.events.DB()
+	db.SetMaxOpenConns(1)
+	defer db.SetMaxOpenConns(0)
+	err := e.a.idem.onBoundedConn(context.Background(), func(conn *sql.Conn, waitAtMost func(time.Duration) error) error {
+		if err := waitAtMost(50 * time.Millisecond); err != nil {
+			return err
+		}
+		var ms int64
+		if err := conn.QueryRowContext(context.Background(), `PRAGMA busy_timeout`).Scan(&ms); err != nil || ms != 50 {
+			return fmt.Errorf("lowered wait = %d (%v)", ms, err)
+		}
+		return nil
+	})
+	must(t, err)
+	var ms int64
+	must(t, db.QueryRow(`PRAGMA busy_timeout`).Scan(&ms))
+	if ms != sqliteBusyTimeout.Milliseconds() {
+		t.Fatalf("the pooled connection kept a %dms lock wait, want %v", ms, sqliteBusyTimeout)
 	}
 }
 

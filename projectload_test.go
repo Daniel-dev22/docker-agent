@@ -404,8 +404,8 @@ func TestProjectLoadIsConfined(t *testing.T) {
 		}()
 		select {
 		case err := <-done:
-			if err == nil {
-				t.Fatal("an extends cycle loaded")
+			if err == nil || !strings.Contains(err.Error(), "extends cycle") {
+				t.Fatalf("an extends cycle must be refused as one, got %v", err)
 			}
 		case <-time.After(10 * time.Second):
 			t.Fatal("an extends cycle hung the load")

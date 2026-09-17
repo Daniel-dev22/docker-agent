@@ -213,22 +213,26 @@ func TestLiteralImageRewriteTouchesOnlyItsToken(t *testing.T) {
 	const newImage = "reg/app:v2@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	cases := []struct {
 		name, before, after string // after "" = re-encoded; only the value is checked
+		image               string // the value written; newImage when ""
 	}{
 		{"plain, comment and blank lines",
 			"services:\n\n  app:   # the app\n     image: reg/app:v1   # pinned\n\n  db:\n     image: pg:16\n",
-			"services:\n\n  app:   # the app\n     image: " + newImage + "   # pinned\n\n  db:\n     image: pg:16\n"},
+			"services:\n\n  app:   # the app\n     image: " + newImage + "   # pinned\n\n  db:\n     image: pg:16\n", ""},
 		{"single-quoted",
 			"services:\n  app:\n    image: 'reg/app:v1'\n",
-			"services:\n  app:\n    image: '" + newImage + "'\n"},
+			"services:\n  app:\n    image: '" + newImage + "'\n", ""},
 		{"double-quoted in a flow mapping after a multibyte key",
 			"services: {app: {labels: {é: x}, image: \"reg/app:v1\"}}\n",
-			"services: {app: {labels: {é: x}, image: \"" + newImage + "\"}}\n"},
+			"services: {app: {labels: {é: x}, image: \"" + newImage + "\"}}\n", ""},
 		{"CRLF line endings",
 			"services:\r\n  app:\r\n    image: reg/app:v1\r\n",
-			"services:\r\n  app:\r\n    image: " + newImage + "\r\n"},
-		{"a tagged scalar is re-encoded", "services:\n  app:\n    image: !!str reg/app:v1\n", ""},
-		{"a block scalar is re-encoded", "services:\n  app:\n    image: >-\n      reg/app:v1\n", ""},
-		{"an escaped double-quoted scalar is re-encoded", "services:\n  app:\n    image: \"reg/app:\\x761\"\n", ""},
+			"services:\r\n  app:\r\n    image: " + newImage + "\r\n", ""},
+		{"a tagged scalar is re-encoded", "services:\n  app:\n    image: !!str reg/app:v1\n", "", ""},
+		{"a block scalar is re-encoded", "services:\n  app:\n    image: >-\n      reg/app:v1\n", "", ""},
+		{"an escaped double-quoted scalar is re-encoded", "services:\n  app:\n    image: \"reg/app:\\x761\"\n", "", ""},
+		// Spelled in place as a plain scalar this would be a mapping indicator, not
+		// the value: the result is re-parsed, and re-encoded when it does not read v.
+		{"a value that changes meaning in place is re-encoded", "services:\n  app:\n    image: reg/app:v1\n", "", "reg/app:"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -240,15 +244,19 @@ func TestLiteralImageRewriteTouchesOnlyItsToken(t *testing.T) {
 			if err != nil || !found || raw != "reg/app:v1" {
 				t.Fatalf("fixture: raw=%q found=%v err=%v", raw, found, err)
 			}
-			if err := setScalar(newImage); err != nil {
+			image := newImage
+			if tc.image != "" {
+				image = tc.image
+			}
+			if err := setScalar(image); err != nil {
 				t.Fatal(err)
 			}
 			got, _ := os.ReadFile(path)
 			if tc.after != "" && string(got) != tc.after {
 				t.Errorf("rewrite changed more than the token:\n got %q\nwant %q", got, tc.after)
 			}
-			if v, found, _, _, err := imageIn(got, "app"); err != nil || !found || v != newImage {
-				t.Errorf("rewritten file reads image %q (found=%v err=%v), want %q", v, found, err, newImage)
+			if v, found, _, _, err := imageIn(got, "app"); err != nil || !found || v != image {
+				t.Errorf("rewritten file reads image %q (found=%v err=%v), want %q", v, found, err, image)
 			}
 		})
 	}
@@ -263,6 +271,25 @@ func TestWriteFileAtomicChangesOnlyContent(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.Chmod(shared, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	// A group other than the one a new file gets, so a write that does not carry
+	// the owner over shows. A non-root user can hand a file only to its own groups.
+	groups, err := os.Getgroups()
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherGroup := -1
+	for _, g := range groups {
+		if g != os.Getgid() {
+			otherGroup = g
+			break
+		}
+	}
+	if otherGroup < 0 {
+		t.Skip("needs a user in a second group to observe the owner being kept")
+	}
+	if err := os.Lchown(shared, os.Getuid(), otherGroup); err != nil {
 		t.Fatal(err)
 	}
 	link := filepath.Join(dir, ".env")
