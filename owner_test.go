@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // An externally-rendered stack: Ansible writes the files under the compose root,
@@ -324,4 +326,84 @@ func TestOwnerOnTheFleetSnapshotWire(t *testing.T) {
 			t.Errorf("an unowned stack must omit owner: %s", raw)
 		}
 	}
+}
+
+// TestAConvergeLandingDuringAnEditorSaveStillRefusesIt. The owner the write is
+// checked against MUST be re-read under the project's lock.
+//
+// The handler snapshots the entry, then does a Docker list, then waits up to
+// requestLockWait for the lock — a wide window. A converge that registers the
+// stack inside it leaves a concurrent editor save holding a snapshot that says
+// "unowned", so the save writes over the owner's compose AND, because an absent
+// owner means "keep what is recorded" and the record it kept was the stale one,
+// clears the owner. Both invariants gone in one request.
+//
+// The race is made deterministic by holding the very lock the handler waits on.
+func TestAConvergeLandingDuringAnEditorSaveStillRefusesIt(t *testing.T) {
+	e := newCapEnv(t, testSelfID, defaultContainers)
+	dir := e.writeCompose(t, "gdrive-agent", composeA)
+	// Registered, and NOT yet owned: this is what the editor's request will see
+	// when it takes its pre-lock snapshot.
+	must(t, e.a.projects.register(ProjectEntry{
+		Name: "gdrive-agent", WorkingDir: dir, ComposeFiles: []string{"docker-compose.yml"},
+	}))
+	original, err := os.ReadFile(filepath.Join(dir, "docker-compose.yml"))
+	must(t, err)
+
+	key := projectLockKey(ProjectEntry{Name: "gdrive-agent", WorkingDir: dir})
+	release, err := e.a.reg.eng.locks.acquire(context.Background(), key, "the test, standing in for a converge", nil)
+	must(t, err)
+
+	type answer struct {
+		status int
+		body   map[string]any
+	}
+	done := make(chan answer, 1)
+	go func() {
+		status, body := e.do(t, http.MethodPost, "/v1/projects", map[string]any{
+			"name": "gdrive-agent", "replace": true,
+			"files": map[string]string{"docker-compose.yml": "services:\n  app:\n    image: editor:latest\n"},
+		})
+		done <- answer{status, body}
+	}()
+
+	// The save is now past its snapshot (unowned) and blocked on the lock. The
+	// converge completes its registry write while it waits.
+	// >1: the test's own hold is one ref. Waiting for merely >0 would return
+	// immediately, the converge would register BEFORE the save took its snapshot,
+	// and the save would be refused by the cheap pre-lock check — which is a
+	// different code path and leaves this test passing with the fix removed. It did.
+	waitForLockWaiter(t, e, key, 1)
+	must(t, e.a.projects.register(ProjectEntry{
+		Name: "gdrive-agent", WorkingDir: dir, ComposeFiles: []string{"docker-compose.yml"}, Owner: "ansible",
+	}))
+	release()
+
+	got := <-done
+	if got.status != http.StatusConflict || got.body["code"] != "project_owned" {
+		t.Fatalf("a save that raced the converge: %d %v", got.status, got.body)
+	}
+	after, err := os.ReadFile(filepath.Join(dir, "docker-compose.yml"))
+	must(t, err)
+	if string(after) != string(original) {
+		t.Error("the racing save overwrote the owner's compose file")
+	}
+	if entry, _ := e.a.projects.get("gdrive-agent"); entry.Owner != "ansible" {
+		t.Errorf("the racing save cleared the owner: %+v", entry)
+	}
+}
+
+// waitForLockWaiter blocks until MORE than beyond references are on key, so the
+// race is sequenced rather than slept on. beyond is what the caller already holds.
+func waitForLockWaiter(t *testing.T, e *capEnv, key string, beyond int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if e.a.reg.eng.locks.waiters(key) > beyond {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("no request ever waited on the project lock beyond the test's own %d — "+
+		"the handler stopped taking it, and this test is no longer racing anything", beyond)
 }
