@@ -39,6 +39,15 @@ type ProjectEntry struct {
 	Profiles     []string  `json:"profiles,omitempty"`
 	EnvFiles     []string  `json:"env_files,omitempty"`
 	RegisteredAt time.Time `json:"registered_at,omitempty"`
+	// Owner names the tool that RENDERS this stack's files, when it is not the
+	// agent. Empty means the agent wrote them (register-with-files) or nobody
+	// claimed them, and they are editable here. Non-empty ("ansible") means the
+	// files are generated somewhere else and will be overwritten by their owner:
+	// the agent still OPERATES the stack — up/pull/recreate/update, including the
+	// image-tag write into its .env — but never rewrites the files wholesale and
+	// never serves them as a copy source. Declared on register; see
+	// registerProjectBody.Owner for why an absent owner preserves it.
+	Owner string `json:"owner,omitempty"`
 	// Adopted is true when the entry was derived from live container labels and
 	// is not (yet) persisted to projects.json. Not serialized.
 	Adopted bool `json:"-"`
@@ -345,17 +354,22 @@ func (r *composeRegistry) mergeKnown(live []ComposeProject, v *selfView) []Compo
 		seen[p.Name] = i
 	}
 	for i := range live {
+		// A registered entry decides: its working dir is what an op loads, and its
+		// owner is who renders the files there. An unregistered running project has
+		// neither — the label's dir, and no owner.
+		row := ProjectEntry{Name: live[i].Name, WorkingDir: live[i].WorkingDir}
 		if e, ok := r.byName[live[i].Name]; ok {
+			row = *e
 			live[i].WorkingDir = e.WorkingDir
 		}
-		live[i].stampCapability(projectCapabilities(live[i].Name, live[i].WorkingDir, r.composeRoot, v))
+		live[i].stampCapability(projectCapabilities(row, r.composeRoot, v))
 	}
 	for name, e := range r.byName {
 		if _, ok := seen[name]; ok {
 			continue
 		}
 		p := ComposeProject{Name: name, WorkingDir: e.WorkingDir}
-		p.stampCapability(projectCapabilities(name, e.WorkingDir, r.composeRoot, v))
+		p.stampCapability(projectCapabilities(*e, r.composeRoot, v))
 		live = append(live, p)
 	}
 	sort.Slice(live, func(i, j int) bool { return live[i].Name < live[j].Name })
@@ -365,6 +379,7 @@ func (r *composeRegistry) mergeKnown(live []ComposeProject, v *selfView) []Compo
 func (p *ComposeProject) stampCapability(c projectCapability) {
 	p.AllowedOps, p.Operable, p.Managed, p.OpsBlocked = c.Allowed, c.operable(), c.Editable, c.Blocked
 	p.ServiceOps = c.serviceOps()
+	p.Owner = c.Owner
 }
 
 // projectEntryFromLive builds an entry from a label-derived ComposeProject. The

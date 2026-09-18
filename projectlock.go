@@ -41,6 +41,17 @@ func newProjectLocks() *projectLocks {
 	return &projectLocks{locks: map[string]*projectLock{}}
 }
 
+// waiters reports how many holders and waiters the lock for key has. Only a test
+// uses it, to sequence a race on the lock instead of sleeping through it.
+func (l *projectLocks) waiters(key string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if pl := l.locks[key]; pl != nil {
+		return pl.refs
+	}
+	return 0
+}
+
 // acquire takes the lock for key (projectLockKey) for who, waiting until ctx ends. When the lock is
 // held, waiting (if non-nil) is told by whom before the wait begins. The returned
 // release is idempotent.

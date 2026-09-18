@@ -211,7 +211,7 @@ func validBudgetSeconds(v int) bool {
 
 // capabilityOf is projectCapabilities for an entry the handlers resolved.
 func (a *app) capabilityOf(e ProjectEntry, v *selfView) projectCapability {
-	return projectCapabilities(e.Name, e.WorkingDir, a.cfg.ComposeRoot, v)
+	return projectCapabilities(e, a.cfg.ComposeRoot, v)
 }
 
 // --- project registry CRUD ---
@@ -225,6 +225,8 @@ type projectListEntry struct {
 	Operable   bool     `json:"operable"`
 	Managed    bool     `json:"managed"`
 	OpsBlocked string   `json:"ops_blocked,omitempty"`
+	// Owner rides the embedded ProjectEntry (`owner`), so it is already on this
+	// row — it is the reason Managed is false while AllowedOps is full.
 	// ServiceOps: every op in AllowedOps except update accepts "services" (see
 	// projectCapability.serviceOps).
 	ServiceOps bool `json:"service_ops"`
@@ -289,6 +291,30 @@ type registerProjectBody struct {
 	// refuseProjectExists). The Ansible module and the editor send it; a cross-host
 	// copy onto an existing name does not.
 	Replace bool `json:"replace,omitempty"`
+	// Owner declares who renders this stack's files (ProjectEntry.Owner). A
+	// POINTER because absent and empty mean different things on a replace: absent
+	// KEEPS the existing owner — a re-register by anything that does not know
+	// about ownership (a remediation, a copy) must not silently unclaim an
+	// Ansible-rendered stack — and an explicit "" clears it, which is how a stack
+	// stops being externally rendered.
+	Owner *string `json:"owner,omitempty"`
+}
+
+// maxOwnerLen bounds ProjectEntry.Owner: it is a tool name that lands in refusal
+// text and in projects.json, not free-form content.
+const maxOwnerLen = 32
+
+// validOwner reports whether owner is a name the agent will record. Same alphabet
+// as a project name (lowercase, digits, '-', '_'), so it is readable in a message
+// and safe in JSON; empty is valid and means "the agent owns it".
+func validOwner(owner string) bool {
+	if owner == "" {
+		return true
+	}
+	if len(owner) > maxOwnerLen {
+		return false
+	}
+	return validProjectName(owner)
 }
 
 func (a *app) handleRegisterProject(c *gin.Context) {
@@ -310,12 +336,30 @@ func (a *app) handleRegisterProject(c *gin.Context) {
 		refuse(c, http.StatusBadRequest, "invalid_body", "working_dir or files is required", nil)
 		return
 	}
+	if body.Owner != nil && !validOwner(*body.Owner) {
+		refuse(c, http.StatusBadRequest, "invalid_owner",
+			fmt.Sprintf("%q is not a valid owner: use lowercase letters, digits, '-' and '_', at most %d bytes "+
+				"(or \"\" to clear it)", echo(*body.Owner), maxOwnerLen), nil)
+		return
+	}
 	entry := ProjectEntry{
 		Name:         body.Name,
 		WorkingDir:   body.WorkingDir,
 		ComposeFiles: body.ComposeFiles,
 		Profiles:     body.Profiles,
 		EnvFiles:     body.EnvFiles,
+	}
+	// An absent owner keeps what is recorded; the durable entry is the only
+	// source (a live container label never carries one). prevOwner is who the
+	// files belong to RIGHT NOW, which is what a write has to be checked against
+	// — entry.Owner is already whoever this request says they will belong to.
+	var prevOwner string
+	if prev, ok := a.projects.get(body.Name); ok {
+		prevOwner = prev.Owner
+		entry.Owner = prev.Owner
+	}
+	if body.Owner != nil {
+		entry.Owner = *body.Owner
 	}
 	if len(body.Files) > 0 {
 		// Inline files always land under ComposeRoot; decide on that directory.
@@ -352,9 +396,22 @@ func (a *app) handleRegisterProject(c *gin.Context) {
 		refuseProjectExists(c, entry.Name, existingDir)
 		return
 	}
-	if len(body.Files) == 0 && capa.Editable {
-		// A path-only register under ComposeRoot claims managed:true. Make that claim
-		// true now, not an empty bundle discovered later.
+	// Writing files into an owned stack requires SAYING who you are. The owner
+	// pushing its own rendered files is the one legitimate case (Ansible sends
+	// "owner": "ansible" with them); the editor, which sends no owner at all,
+	// would otherwise overwrite files the next converge reverts. Taking the files
+	// back is a path-only re-register with "owner": "" first, then the write.
+	//
+	// This is the cheap early answer, refusing before the lock wait. It is NOT the
+	// decision — see the re-read under the lock below.
+	if refuseOwnedWrite(c, body, entry, prevOwner, capa) {
+		return
+	}
+	if len(body.Files) == 0 && capa.operable() {
+		// A path-only register under ComposeRoot claims the file ops will run. Make
+		// that claim true now, not an empty bundle discovered later. (Gated on
+		// operable, not Editable: an externally-owned stack is not editable and its
+		// files must still be there.)
 		if err := composeFilesPresent(entry); err != nil {
 			refuse(c, http.StatusBadRequest, "compose_files_missing", err.Error(), gin.H{"working_dir": entry.WorkingDir})
 			return
@@ -372,6 +429,22 @@ func (a *app) handleRegisterProject(c *gin.Context) {
 	// both pass this check.
 	if owner, taken := a.projects.workingDirOwner(entry.WorkingDir, entry.Name); taken {
 		refuseWorkingDirInUse(c, entry.WorkingDir, owner)
+		return
+	}
+	// The owner is re-read HERE, under the lock, because the pre-lock snapshot is
+	// stale by construction: the handler does a Docker list and can wait up to
+	// requestLockWait for the lock, and a converge registering the stack in that
+	// window would leave a concurrent editor save holding prevOwner == "" — writing
+	// over the owner's files AND clearing the owner, the two things this rule
+	// exists to stop, in one request.
+	prevOwner = ""
+	if prev, ok := a.projects.get(body.Name); ok {
+		prevOwner = prev.Owner
+		if body.Owner == nil {
+			entry.Owner = prev.Owner // absent still means "keep what is recorded"
+		}
+	}
+	if refuseOwnedWrite(c, body, entry, prevOwner, capa) {
 		return
 	}
 	if len(body.Files) > 0 {
@@ -461,7 +534,7 @@ func (a *app) handleProjectBundle(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if !a.capabilityOf(entry, view).Editable {
+	if !a.capabilityOf(entry, view).Readable {
 		c.JSON(http.StatusOK, projectBundle{Name: entry.Name, WorkingDir: entry.WorkingDir,
 			ComposeFiles: []bundleFile{}, EnvFiles: []bundleFile{}})
 		return
@@ -508,10 +581,12 @@ func (a *app) handleCopyProject(c *gin.Context) {
 	if !proceed {
 		return
 	}
-	// A copy reads the source's files, so the source must be editable; and the copy
-	// must not take one of the agent's own project names, whose `up` would recreate
-	// — or remove as an orphan — the agent itself. Both refusals precede any write.
-	if refuseProjectEdit(c, src, a.cfg.ComposeRoot, a.capabilityOf(src, view)) {
+	// A copy READS the source's files, so the source must be readable — an
+	// externally-owned source is fine, the copy lands as a new project this agent
+	// owns. The copy must not take one of the agent's own project names, whose `up`
+	// would recreate — or remove as an orphan — the agent itself. Both refusals
+	// precede any write.
+	if refuseProjectRead(c, src, a.cfg.ComposeRoot, a.capabilityOf(src, view)) {
 		return
 	}
 	dst := ProjectEntry{Name: body.NewName, WorkingDir: filepath.Join(a.cfg.ComposeRoot, body.NewName)}
