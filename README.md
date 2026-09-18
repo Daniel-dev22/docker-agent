@@ -560,6 +560,9 @@ The rules, per op rather than per stack:
   ops is blocked, so `ops_blocked` stays empty; `owner` is the field that explains the lock.
   An absent `owner` on a re-register PRESERVES the recorded one (a remediation must not unclaim a
   stack it knows nothing about); an explicit `"owner": ""` clears it and reopens the editor.
+  Registering with inline `files` onto an owned stack requires DECLARING that same owner — which is
+  how the owner converges its own stack (`ups/deploy_nut_stack.yaml` renders and pushes) while the
+  editor, which sends no owner, is refused.
 
 Self identity comes from `/proc/self/mountinfo` (the container ID) plus the container **list**
 (the compose project, and every container sharing the agent's network namespace, which is treated
@@ -578,7 +581,7 @@ ID starts with `db`.
 | Op not in `allowed_ops` (non-self reason) | 409 | `project_not_operable` |
 | Any op, register, copy source/target on the agent's own project | 409 | `self_project` |
 | Copy of a project whose files are not visible | 409 | `project_not_editable` |
-| Copy source, or register-with-`files`, on a stack another tool renders | 409 | `project_owned` (`owner`, `working_dir`) |
+| Copy source, or register-with-`files` without declaring the same `owner`, on a stack another tool renders | 409 | `project_owned` (`owner`, `working_dir`) |
 | Container verb on the agent's own container | 409 | `self_container` |
 | `stop`/`kill`/`remove` on the control-path container | 409 | `control_path_container` |
 | Register/copy with a name compose would normalise, or longer than 255 bytes | 400 | `invalid_project_name` |

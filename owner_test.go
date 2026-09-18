@@ -108,6 +108,31 @@ func TestOwnedStackRefusesEveryFileWrite(t *testing.T) {
 		}
 	})
 
+	t.Run("the-owner-may-push-its-own-files", func(t *testing.T) {
+		// Ansible's own render-and-push path (ups/deploy_nut_stack.yaml) says who it
+		// is. Saying so is the difference between the owner converging its stack and
+		// the editor overwriting it.
+		status, body := e.do(t, http.MethodPost, "/v1/projects", map[string]any{
+			"name": "gdrive-agent", "replace": true, "owner": "ansible",
+			"files": map[string]string{"docker-compose.yml": composeA},
+		})
+		if status != http.StatusOK {
+			t.Fatalf("owner pushing its own files: %d %v", status, body)
+		}
+		if entry, _ := e.a.projects.get("gdrive-agent"); entry.Owner != "ansible" {
+			t.Fatalf("the owner was lost by its own push: %+v", entry)
+		}
+		// A DIFFERENT owner is still refused: two renderers on one stack is the
+		// conflict the flag exists to name.
+		status, body = e.do(t, http.MethodPost, "/v1/projects", map[string]any{
+			"name": "gdrive-agent", "replace": true, "owner": "terraform",
+			"files": map[string]string{"docker-compose.yml": composeA},
+		})
+		if status != http.StatusConflict || body["code"] != "project_owned" {
+			t.Fatalf("a different owner pushing files: %d %v", status, body)
+		}
+	})
+
 	t.Run("copy-source-is-refused", func(t *testing.T) {
 		status, body := e.do(t, http.MethodPost, "/v1/projects/gdrive-agent/copy", map[string]any{"new_name": "gdrive-copy"})
 		if status != http.StatusConflict || body["code"] != "project_owned" {

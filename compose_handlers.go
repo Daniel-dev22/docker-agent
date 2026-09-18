@@ -350,8 +350,12 @@ func (a *app) handleRegisterProject(c *gin.Context) {
 		EnvFiles:     body.EnvFiles,
 	}
 	// An absent owner keeps what is recorded; the durable entry is the only
-	// source (a live container label never carries one).
+	// source (a live container label never carries one). prevOwner is who the
+	// files belong to RIGHT NOW, which is what a write has to be checked against
+	// — entry.Owner is already whoever this request says they will belong to.
+	var prevOwner string
 	if prev, ok := a.projects.get(body.Name); ok {
+		prevOwner = prev.Owner
 		entry.Owner = prev.Owner
 	}
 	if body.Owner != nil {
@@ -392,11 +396,13 @@ func (a *app) handleRegisterProject(c *gin.Context) {
 		refuseProjectExists(c, entry.Name, existingDir)
 		return
 	}
-	// The agent never writes files into a stack it does not own: they would be
-	// overwritten by the owner's next run, so the write is a lie either way. Clear
-	// the owner first ("owner": "") to take the files back.
-	if len(body.Files) > 0 && entry.Owner != "" {
-		refuseProjectOwned(c, entry, entry.Owner)
+	// Writing files into an owned stack requires SAYING who you are. The owner
+	// pushing its own rendered files is the one legitimate case (Ansible sends
+	// "owner": "ansible" with them); the editor, which sends no owner at all,
+	// would otherwise overwrite files the next converge reverts. An explicit
+	// "owner": "" clears ownership and takes the files back, deliberately.
+	if len(body.Files) > 0 && prevOwner != "" && (body.Owner == nil || *body.Owner != prevOwner) {
+		refuseProjectOwned(c, entry, prevOwner)
 		return
 	}
 	if len(body.Files) == 0 && capa.operable() {
