@@ -151,6 +151,8 @@ relabel, and a Docker Jobs `update` against a relocated stack, are reasoned-abou
 | `rewrite_stack_container_dns.yaml` silently no-ops on an owned stack | Its `dns_pinning_stacks` is `[traefik, homeassistant]`, neither owned | becomes real the day traefik is declared owned — which this phase's reasoning invites |
 | system-monitor CI job failures; two router tests red on main | pre-existing, unrelated | fail identically on origin/main |
 | `test_docker_redeploy_network_stacks.py::test_read_engine…` fails only in a full-suite run | pre-existing — **verified failing identically on `main`** | passes when run alone |
+| `test_bond_migration_playbook.py::test_every_jinja_filter_the_playbook_uses_actually_exists` fails only in the full CI invocation | pre-existing — **verified failing identically at the previous release tag `51.107.7`** | passes alone (114/114) and with the filter tests (491/491); cross-test pollution in the full run |
+| Two test directories' `conftest.py` collide when collected together (`plugins/modules/tests` + `plugins/module_utils/tests`) → 11 collection errors | pre-existing; CI passes an explicit file list, which is why it never sees this | `ImportError: cannot import name 'load_module' from 'conftest'` |
 
 ## Next phase — first concrete step
 
