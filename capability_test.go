@@ -848,7 +848,7 @@ func TestRegisterAndCopy(t *testing.T) {
 		{"copy-onto-self-name", "/v1/projects/owned/copy", map[string]any{"new_name": "docker-agent"}, http.StatusConflict, "self_project"},
 		{"copy-onto-self-name-deploy", "/v1/projects/owned/copy", map[string]any{"new_name": "docker-agent", "deploy": true}, http.StatusConflict, "self_project"},
 		{"register-self-name-inline-no-deploy", "/v1/projects", map[string]any{"name": "docker-agent", "files": map[string]string{"docker-compose.yml": "EVIL\n"}, "deploy": false}, http.StatusConflict, "self_project"},
-		{"copy-non-editable-source", "/v1/projects/gdrive-agent/copy", map[string]any{"new_name": "gdrive-copy"}, http.StatusConflict, "project_not_editable"},
+		{"copy-unreadable-source", "/v1/projects/gdrive-agent/copy", map[string]any{"new_name": "gdrive-copy"}, http.StatusConflict, "project_not_readable"},
 		{"register-outside-root-with-deploy", "/v1/projects", map[string]any{"name": "ext", "working_dir": "/elsewhere/ext", "deploy": true}, http.StatusConflict, "project_not_operable"},
 		{"register-under-root-missing-compose", "/v1/projects", map[string]any{"name": "ghost", "working_dir": filepath.Join(e.root, "ghost")}, http.StatusBadRequest, ""},
 	}

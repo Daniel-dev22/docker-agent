@@ -169,7 +169,7 @@ cert-manager wrong-image bug), node page and Update Stack driven by `allowed_ops
 | Dead `duplicacy` project registered on 6 hosts | cleanup, needs user OK | 0 containers |
 | `homeassistant` registry entries on kd-nuc02 / kd-pi01 / kd-vm01 point at a leftover traefik compose; kd-nuc01 `myapp` has a 1-byte compose | registry junk from migration; deregister needs user OK | 0 homeassistant containers on those hosts |
 | Inline credentials in the traefik compose files (served verbatim by `/bundle`) | belongs to the traefik role; move to env from Bitwarden; user decision | kd-nuc01 traefik compose carries a Cloudflare token + AWS keys |
-| esphome image-ID pin on kd-nuc01 / ng-nuc01 | recovery op needs user OK | see Surprises |
+| ~~esphome image-ID pin on kd-nuc01 / ng-nuc01~~ | CLOSED — the user repaired both hosts themselves, 2026-09-18 | see Surprises |
 
 ## Next phase — first concrete step
 
@@ -221,6 +221,6 @@ Live checks after step 3 (through the router proxy):
 - Discovery rows: 38 operable · 10 operable with `control_path` (no `down`) · 20 `outside_compose_root`
   · 10 `self`. No new failed jobs.
 
-Not done, pending the user's decision: the esphome image-ID repair op on kd-nuc01 and ng-nuc01; the
-registry junk (`homeassistant` on kd-nuc02/kd-pi01/kd-vm01, `myapp`, dead `duplicacy`); rotating the
+Decided since (2026-09-18): the esphome image-ID pin was repaired by the user on both hosts; the
+registry junk was approved for clearing and is cleared in Phase 2. Still open: rotating the
 credentials that sit inline in the traefik compose files.

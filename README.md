@@ -312,7 +312,7 @@ the running containers.
 
 **Copy** duplicates a project on the *same* host under a new name, returning `409` if that name
 already exists, `404` if the source is unknown, `400 invalid_project_name`, and `409
-project_not_editable` / `self_project` when the source cannot be read or either name is the
+project_not_readable` / `self_project` when the source cannot be read or either name is the
 agent's own.
 
 Bundle reads are deliberately forgiving: a compose file the agent cannot read (an
@@ -554,15 +554,23 @@ The rules, per op rather than per stack:
   an `owner` — the tool that writes its compose files, `"ansible"` for the agent stacks Ansible
   renders under `$COMPOSE_ROOT`. The agent operates such a stack normally (including `update`,
   which rewrites the image value in its `.env`, the one file Ansible deliberately does not
-  re-render), but `managed` is false: the editor, the copy source and `/bundle` refuse it with
-  `409 project_owned`, and `/bundle` answers the same empty-bundle shape it uses for a stack
-  outside the root — so an owner's secrets beside its compose are never served. Nothing about its
-  ops is blocked, so `ops_blocked` stays empty; `owner` is the field that explains the lock.
+  re-render), but `managed` is false: the editor refuses it with `409 project_owned`. Nothing about
+  its ops is blocked, so `ops_blocked` stays empty; `owner` is the field that explains the lock.
+
+  **Ownership governs WRITES; the compose root governs READS.** An owned stack is still readable —
+  `/bundle` serves its files and it may be a copy source (the copy lands as a new, unowned project).
+  That is not a nicety: an owner's own converge reads its stack back to preserve the `.env` before
+  re-rendering, and answering it with the empty bundle used for an out-of-root stack told it the
+  files were gone, so it re-pushed its defaults and rolled the image pin back on every run. A read
+  refusal is `409 project_not_readable`, and it means the files are outside the mount.
+
   An absent `owner` on a re-register PRESERVES the recorded one (a remediation must not unclaim a
-  stack it knows nothing about); an explicit `"owner": ""` clears it and reopens the editor.
-  Registering with inline `files` onto an owned stack requires DECLARING that same owner — which is
+  stack it knows nothing about); an explicit `"owner": ""` clears it and reopens the editor — as a
+  path-only register, since a register carrying `files` is refused while another owner is recorded.
+  Registering with inline `files` onto an owned stack requires DECLARING that same owner, which is
   how the owner converges its own stack (`ups/deploy_nut_stack.yaml` renders and pushes) while the
-  editor, which sends no owner, is refused.
+  editor, which sends no owner, is refused. The owner is re-read under the project's lock, so a
+  converge landing during an editor save cannot leave the save holding a stale "unowned".
 
 Self identity comes from `/proc/self/mountinfo` (the container ID) plus the container **list**
 (the compose project, and every container sharing the agent's network namespace, which is treated
@@ -580,8 +588,8 @@ ID starts with `db`.
 |---|---|---|
 | Op not in `allowed_ops` (non-self reason) | 409 | `project_not_operable` |
 | Any op, register, copy source/target on the agent's own project | 409 | `self_project` |
-| Copy of a project whose files are not visible | 409 | `project_not_editable` |
-| Copy source, or register-with-`files` without declaring the same `owner`, on a stack another tool renders | 409 | `project_owned` (`owner`, `working_dir`) |
+| Copy of a project whose files are not visible (outside the root) | 409 | `project_not_readable` |
+| Register-with-`files` without declaring the same `owner`, on a stack another tool renders | 409 | `project_owned` (`owner`, `working_dir`) |
 | Container verb on the agent's own container | 409 | `self_container` |
 | `stop`/`kill`/`remove` on the control-path container | 409 | `control_path_container` |
 | Register/copy with a name compose would normalise, or longer than 255 bytes | 400 | `invalid_project_name` |

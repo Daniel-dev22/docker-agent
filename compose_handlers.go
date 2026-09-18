@@ -399,10 +399,12 @@ func (a *app) handleRegisterProject(c *gin.Context) {
 	// Writing files into an owned stack requires SAYING who you are. The owner
 	// pushing its own rendered files is the one legitimate case (Ansible sends
 	// "owner": "ansible" with them); the editor, which sends no owner at all,
-	// would otherwise overwrite files the next converge reverts. An explicit
-	// "owner": "" clears ownership and takes the files back, deliberately.
-	if len(body.Files) > 0 && prevOwner != "" && (body.Owner == nil || *body.Owner != prevOwner) {
-		refuseProjectOwned(c, entry, prevOwner)
+	// would otherwise overwrite files the next converge reverts. Taking the files
+	// back is a path-only re-register with "owner": "" first, then the write.
+	//
+	// This is the cheap early answer, refusing before the lock wait. It is NOT the
+	// decision — see the re-read under the lock below.
+	if refuseOwnedWrite(c, body, entry, prevOwner, capa) {
 		return
 	}
 	if len(body.Files) == 0 && capa.operable() {
@@ -427,6 +429,22 @@ func (a *app) handleRegisterProject(c *gin.Context) {
 	// both pass this check.
 	if owner, taken := a.projects.workingDirOwner(entry.WorkingDir, entry.Name); taken {
 		refuseWorkingDirInUse(c, entry.WorkingDir, owner)
+		return
+	}
+	// The owner is re-read HERE, under the lock, because the pre-lock snapshot is
+	// stale by construction: the handler does a Docker list and can wait up to
+	// requestLockWait for the lock, and a converge registering the stack in that
+	// window would leave a concurrent editor save holding prevOwner == "" — writing
+	// over the owner's files AND clearing the owner, the two things this rule
+	// exists to stop, in one request.
+	prevOwner = ""
+	if prev, ok := a.projects.get(body.Name); ok {
+		prevOwner = prev.Owner
+		if body.Owner == nil {
+			entry.Owner = prev.Owner // absent still means "keep what is recorded"
+		}
+	}
+	if refuseOwnedWrite(c, body, entry, prevOwner, capa) {
 		return
 	}
 	if len(body.Files) > 0 {
@@ -516,7 +534,7 @@ func (a *app) handleProjectBundle(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if !a.capabilityOf(entry, view).Editable {
+	if !a.capabilityOf(entry, view).Readable {
 		c.JSON(http.StatusOK, projectBundle{Name: entry.Name, WorkingDir: entry.WorkingDir,
 			ComposeFiles: []bundleFile{}, EnvFiles: []bundleFile{}})
 		return
@@ -563,10 +581,12 @@ func (a *app) handleCopyProject(c *gin.Context) {
 	if !proceed {
 		return
 	}
-	// A copy reads the source's files, so the source must be editable; and the copy
-	// must not take one of the agent's own project names, whose `up` would recreate
-	// — or remove as an orphan — the agent itself. Both refusals precede any write.
-	if refuseProjectEdit(c, src, a.cfg.ComposeRoot, a.capabilityOf(src, view)) {
+	// A copy READS the source's files, so the source must be readable — an
+	// externally-owned source is fine, the copy lands as a new project this agent
+	// owns. The copy must not take one of the agent's own project names, whose `up`
+	// would recreate — or remove as an orphan — the agent itself. Both refusals
+	// precede any write.
+	if refuseProjectRead(c, src, a.cfg.ComposeRoot, a.capabilityOf(src, view)) {
 		return
 	}
 	dst := ProjectEntry{Name: body.NewName, WorkingDir: filepath.Join(a.cfg.ComposeRoot, body.NewName)}

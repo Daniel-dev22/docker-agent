@@ -90,21 +90,27 @@ func TestOwnedStackRefusesEveryFileWrite(t *testing.T) {
 		}
 	})
 
-	t.Run("bundle-is-empty-so-no-secret-is-served", func(t *testing.T) {
-		// The four agent stacks keep bearer tokens beside their compose. Under the
-		// root, only the editable flag keeps /bundle from serving them.
-		must(t, os.WriteFile(filepath.Join(dir, ".env"), []byte("TOKEN=secret-value\n"), 0o600))
+	t.Run("the-owner-can-still-READ-its-own-files", func(t *testing.T) {
+		// THE REGRESSION THIS TEST EXISTS FOR. An owner's converge reads its stack
+		// back to preserve the .env before re-rendering the compose
+		// (ups/include_tasks/deploy_nut_stack.yaml). Gating /bundle on "editable"
+		// answered 200 with an EMPTY bundle, which that loop cannot tell from "no
+		// files" — so it re-pushed its defaults, rolling the image pin back on every
+		// run, and its change-detection saw a difference forever. Ownership governs
+		// WRITES; the compose root governs reads.
+		must(t, os.WriteFile(filepath.Join(dir, ".env"), []byte("CURRENT_GDRIVE_AGENT_IMAGE=reg/x:9\n"), 0o644))
 		status, body := e.do(t, http.MethodGet, "/v1/projects/gdrive-agent/bundle", nil)
 		if status != http.StatusOK {
 			t.Fatalf("bundle: %d %v", status, body)
 		}
+		files, _ := body["compose_files"].([]any)
+		if len(files) == 0 {
+			t.Fatal("an owned stack's bundle came back empty: its own renderer reads this to preserve .env")
+		}
 		raw, err := json.Marshal(body)
 		must(t, err)
-		if len(raw) > 0 && containsStr(string(raw), "secret-value") {
-			t.Fatalf("an owned stack's bundle served its env file: %s", raw)
-		}
-		if files, _ := body["compose_files"].([]any); len(files) != 0 {
-			t.Errorf("compose_files = %v, want empty", files)
+		if !containsStr(string(raw), "CURRENT_GDRIVE_AGENT_IMAGE=reg/x:9") {
+			t.Errorf("the env file the owner must preserve is missing: %s", raw)
 		}
 	})
 
@@ -133,10 +139,37 @@ func TestOwnedStackRefusesEveryFileWrite(t *testing.T) {
 		}
 	})
 
-	t.Run("copy-source-is-refused", func(t *testing.T) {
-		status, body := e.do(t, http.MethodPost, "/v1/projects/gdrive-agent/copy", map[string]any{"new_name": "gdrive-copy"})
-		if status != http.StatusConflict || body["code"] != "project_owned" {
+	t.Run("copy-reads-the-source-and-lands-an-UNOWNED-copy", func(t *testing.T) {
+		// A copy reads the source and writes a NEW project. Reading is governed by
+		// the compose root, and the copy is the agent's own — so forking an
+		// Ansible-rendered stack into one you can edit is allowed, and the fork does
+		// not inherit the owner.
+		status, body := e.do(t, http.MethodPost, "/v1/projects/gdrive-agent/copy", map[string]any{"new_name": "gdrive-fork"})
+		if status != http.StatusOK {
 			t.Fatalf("copy from an owned stack: %d %v", status, body)
+		}
+		fork, ok := e.a.projects.get("gdrive-fork")
+		if !ok {
+			t.Fatal("the copy was not registered")
+		}
+		if fork.Owner != "" {
+			t.Fatalf("a copy must not inherit the owner: %+v", fork)
+		}
+		if !e.a.capabilityOf(fork, e.a.self.current()).Editable {
+			t.Error("the copy is the agent's own, so it is editable")
+		}
+	})
+
+	t.Run("a-stack-outside-the-root-is-still-unreadable", func(t *testing.T) {
+		// The read boundary did not move: it is the compose root, and always was.
+		outside := ProjectEntry{Name: "vendor-stack", WorkingDir: "/srv/elsewhere/vendor-stack"}
+		must(t, e.a.projects.register(outside))
+		status, body := e.do(t, http.MethodGet, "/v1/projects/vendor-stack/bundle", nil)
+		if status != http.StatusOK {
+			t.Fatalf("bundle: %d %v", status, body)
+		}
+		if files, _ := body["compose_files"].([]any); len(files) != 0 {
+			t.Errorf("compose_files = %v, want empty for a stack outside the root", files)
 		}
 	})
 }

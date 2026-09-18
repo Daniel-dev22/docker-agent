@@ -29,9 +29,22 @@ var (
 
 // projectCapability is what the agent can honestly do with a compose project.
 type projectCapability struct {
-	Allowed  []string // sorted subset of projectOps; never nil
-	Editable bool     // read/rewrite its files (edit, copy source)
-	Blocked  string   // the highest-priority reason Allowed is not every op; "" when it is
+	Allowed []string // sorted subset of projectOps; never nil
+	// Readable: the agent can READ this project's files — they are inside its
+	// mount. The COMPOSE ROOT decides this, and nothing else does.
+	//
+	// Readable and Editable are two questions, and conflating them was a real bug:
+	// an owner's own converge reads its stack back through /bundle to preserve the
+	// .env before re-rendering, so answering "not editable" with an empty bundle
+	// told it the files were gone. It then re-pushed its defaults — rolling back
+	// the image pin on every run, which is the exact thing ownership exists to
+	// prevent.
+	Readable bool
+	// Editable: the agent may REWRITE the files wholesale (the editor). Ownership
+	// decides this: an externally-rendered stack would have the rewrite reverted by
+	// its owner's next converge.
+	Editable bool
+	Blocked  string // the highest-priority reason Allowed is not every op; "" when it is
 	// Owner is the registry entry's Owner: the tool that renders these files when
 	// it is not the agent. It removes Editable and nothing else — an externally
 	// owned stack under the compose root is fully operable. Empty when the agent
@@ -108,9 +121,10 @@ func validProjectName(name string) bool {
 //   - The project running the agent's control-path container loses `down`: nothing
 //     could bring it back, and the agent would be unreachable until it was.
 //   - An entry with an Owner (Ansible renders its files) keeps every op — it is
-//     under the root, so the agent can load it and write its image tag — but is not
-//     editable: a wholesale rewrite here would be reverted by the next role run,
-//     and the copy source would serve files the agent did not author.
+//     under the root, so the agent can load it and write its image tag — and stays
+//     READABLE, because the compose root is what decides whether the agent can see
+//     a file. It is not EDITABLE: a wholesale rewrite here would be reverted by the
+//     next role run.
 func projectCapabilities(e ProjectEntry, composeRoot string, v *selfView) projectCapability {
 	name := e.Name
 	// Owner is reported whatever the verdict: it is a fact about the registry
@@ -126,6 +140,7 @@ func projectCapabilities(e ProjectEntry, composeRoot string, v *selfView) projec
 	allowed := append([]string{}, labelOps...)
 	if underComposeRoot(e.WorkingDir, composeRoot) {
 		allowed = append(allowed, fileOps...)
+		c.Readable = true
 		c.Editable = e.Owner == ""
 	} else {
 		c.Blocked = blockedOutsideComposeRoot
@@ -175,20 +190,16 @@ func refuseProjectOp(c *gin.Context, e ProjectEntry, composeRoot string, capa pr
 	return true
 }
 
-// refuseProjectEdit writes the 409 when the project's files cannot be read or
-// rewritten here (edit, copy source).
-func refuseProjectEdit(c *gin.Context, e ProjectEntry, composeRoot string, capa projectCapability) bool {
-	if capa.Editable {
+// refuseProjectRead writes the 409 when the project's files cannot be READ here —
+// they are outside the agent's mount, or the project is one no op may touch. An
+// externally-owned stack is readable: ownership governs writes, and its own
+// renderer reads its files back through this path to preserve them.
+func refuseProjectRead(c *gin.Context, e ProjectEntry, composeRoot string, capa projectCapability) bool {
+	if capa.Readable {
 		return false
 	}
 	if capa.Blocked == blockedSelf {
 		refuseSelfProject(c, e)
-		return true
-	}
-	// The owner check comes first: an owned stack IS inside the compose root, so
-	// the outside-the-root sentence below would name a cause that is not true.
-	if capa.Owner != "" {
-		refuseProjectOwned(c, e, capa.Owner)
 		return true
 	}
 	msg := fmt.Sprintf("compose files for %s are at %s, outside docker-agent's compose root (%s), "+
@@ -196,18 +207,18 @@ func refuseProjectEdit(c *gin.Context, e ProjectEntry, composeRoot string, capa 
 	if capa.Blocked == blockedInvalidName {
 		msg = fmt.Sprintf("%q is not a valid compose project name", echo(e.Name))
 	}
-	refuse(c, http.StatusConflict, "project_not_editable", msg, gin.H{"working_dir": e.WorkingDir})
+	refuse(c, http.StatusConflict, "project_not_readable", msg, gin.H{"working_dir": e.WorkingDir})
 	return true
 }
 
 // refuseProjectOwned answers a request to read or rewrite the files of a stack
 // another tool renders. Every compose OP stays allowed — this refuses the editor,
 // the copy source, and a register that would overwrite the owner's files.
-func refuseProjectOwned(c *gin.Context, e ProjectEntry, owner string) {
+func refuseProjectOwned(c *gin.Context, e ProjectEntry, owner string, capa projectCapability) {
 	refuse(c, http.StatusConflict, "project_owned",
-		fmt.Sprintf("%s is rendered by %s, which overwrites its files on every run: they cannot be edited "+
-			"or copied here. Change the stack where %s defines it. Compose ops (up, pull, recreate, update, "+
-			"restart, down) still run here.", echo(e.Name), echo(owner), echo(owner)),
+		fmt.Sprintf("%s is rendered by %s, which overwrites its files on every run, so they cannot be "+
+			"rewritten here. Change the stack where %s defines it, or re-register it with \"owner\": \"\" "+
+			"to take the files back. %s", echo(e.Name), echo(owner), echo(owner), allowedSentence(capa.Allowed)),
 		gin.H{"working_dir": e.WorkingDir, "owner": owner})
 }
 
@@ -276,4 +287,19 @@ func refuseSelfUnavailable(c *gin.Context, err error, targets []string) {
 	refuse(c, http.StatusServiceUnavailable, "self_identity_unavailable",
 		"cannot confirm this request does not target docker-agent itself or its control-path proxy: "+
 			echo(err.Error())+". Retry once the Docker daemon answers.", fields)
+}
+
+// refuseOwnedWrite answers a register that would write files into a stack another
+// tool renders without declaring that tool. One predicate for both the pre-lock
+// early answer and the decision under the lock, so the two can never disagree
+// about what "the owner is writing its own files" means.
+func refuseOwnedWrite(c *gin.Context, body registerProjectBody, entry ProjectEntry, prevOwner string, capa projectCapability) bool {
+	if len(body.Files) == 0 || prevOwner == "" {
+		return false
+	}
+	if body.Owner != nil && *body.Owner == prevOwner {
+		return false
+	}
+	refuseProjectOwned(c, entry, prevOwner, capa)
+	return true
 }
