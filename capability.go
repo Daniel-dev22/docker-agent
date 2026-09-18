@@ -32,6 +32,11 @@ type projectCapability struct {
 	Allowed  []string // sorted subset of projectOps; never nil
 	Editable bool     // read/rewrite its files (edit, copy source)
 	Blocked  string   // the highest-priority reason Allowed is not every op; "" when it is
+	// Owner is the registry entry's Owner: the tool that renders these files when
+	// it is not the agent. It removes Editable and nothing else — an externally
+	// owned stack under the compose root is fully operable. Empty when the agent
+	// owns the files.
+	Owner string
 	// controlPath: this project runs the agent's control-path container, which is
 	// why `down` is missing even when Blocked names a higher-priority reason.
 	controlPath bool
@@ -102,18 +107,26 @@ func validProjectName(name string) bool {
 //     loads.
 //   - The project running the agent's control-path container loses `down`: nothing
 //     could bring it back, and the agent would be unreachable until it was.
-func projectCapabilities(name, workingDir, composeRoot string, v *selfView) projectCapability {
+//   - An entry with an Owner (Ansible renders its files) keeps every op — it is
+//     under the root, so the agent can load it and write its image tag — but is not
+//     editable: a wholesale rewrite here would be reverted by the next role run,
+//     and the copy source would serve files the agent did not author.
+func projectCapabilities(e ProjectEntry, composeRoot string, v *selfView) projectCapability {
+	name := e.Name
+	// Owner is reported whatever the verdict: it is a fact about the registry
+	// entry, not a reason ops are blocked, and a consumer reads it to explain a
+	// row it can see.
 	if v.isSelfProject(name) {
-		return projectCapability{Allowed: []string{}, Blocked: blockedSelf}
+		return projectCapability{Allowed: []string{}, Blocked: blockedSelf, Owner: e.Owner}
 	}
 	if !validProjectName(name) {
-		return projectCapability{Allowed: []string{}, Blocked: blockedInvalidName}
+		return projectCapability{Allowed: []string{}, Blocked: blockedInvalidName, Owner: e.Owner}
 	}
-	c := projectCapability{}
+	c := projectCapability{Owner: e.Owner}
 	allowed := append([]string{}, labelOps...)
-	if underComposeRoot(workingDir, composeRoot) {
+	if underComposeRoot(e.WorkingDir, composeRoot) {
 		allowed = append(allowed, fileOps...)
-		c.Editable = true
+		c.Editable = e.Owner == ""
 	} else {
 		c.Blocked = blockedOutsideComposeRoot
 	}
@@ -172,6 +185,12 @@ func refuseProjectEdit(c *gin.Context, e ProjectEntry, composeRoot string, capa 
 		refuseSelfProject(c, e)
 		return true
 	}
+	// The owner check comes first: an owned stack IS inside the compose root, so
+	// the outside-the-root sentence below would name a cause that is not true.
+	if capa.Owner != "" {
+		refuseProjectOwned(c, e, capa.Owner)
+		return true
+	}
 	msg := fmt.Sprintf("compose files for %s are at %s, outside docker-agent's compose root (%s), "+
 		"so they cannot be read or rewritten here", echo(e.Name), echo(e.WorkingDir), composeRoot)
 	if capa.Blocked == blockedInvalidName {
@@ -179,6 +198,17 @@ func refuseProjectEdit(c *gin.Context, e ProjectEntry, composeRoot string, capa 
 	}
 	refuse(c, http.StatusConflict, "project_not_editable", msg, gin.H{"working_dir": e.WorkingDir})
 	return true
+}
+
+// refuseProjectOwned answers a request to read or rewrite the files of a stack
+// another tool renders. Every compose OP stays allowed — this refuses the editor,
+// the copy source, and a register that would overwrite the owner's files.
+func refuseProjectOwned(c *gin.Context, e ProjectEntry, owner string) {
+	refuse(c, http.StatusConflict, "project_owned",
+		fmt.Sprintf("%s is rendered by %s, which overwrites its files on every run: they cannot be edited "+
+			"or copied here. Change the stack where %s defines it. Compose ops (up, pull, recreate, update, "+
+			"restart, down) still run here.", echo(e.Name), echo(owner), echo(owner)),
+		gin.H{"working_dir": e.WorkingDir, "owner": owner})
 }
 
 // allowedSentence states what IS allowed, from the same list the endpoint enforces,

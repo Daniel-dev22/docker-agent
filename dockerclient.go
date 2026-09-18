@@ -123,6 +123,11 @@ type ComposeProject struct {
 	// /v1/projects/:name/op (projectCapability.serviceOps). An agent too old to
 	// support it does not send the field.
 	ServiceOps bool `json:"service_ops"`
+	// Owner names the tool that renders this stack's files when it is not the
+	// agent ("ansible"). It is exactly why Managed is false while every op is
+	// allowed, so a UI that reads it can say so instead of guessing at the compose
+	// root. Empty/absent: the agent owns the files, or the entry predates this.
+	Owner string `json:"owner,omitempty"`
 
 	// Rolled-up image-outdated status, computed from the project's
 	// containers during the fleet merge: outdated if ANY service is outdated.

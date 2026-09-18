@@ -533,34 +533,48 @@ func TestProjectCapabilities(t *testing.T) {
 	full := []string{"down", "pull", "recreate", "restart", "up", "update"}
 	cases := []struct {
 		name, project, dir string
+		owner              string
 		view               *selfView
 		allowed            []string
 		editable           bool
 		blocked            string
 	}{
-		{"under-root", "frigate", root + "/frigate", v, full, true, ""},
-		{"outside-root-keeps-label-ops", "gdrive-agent", "/srv/containers/gdrive-agent", v, []string{"down", "restart"}, false, blockedOutsideComposeRoot},
-		{"no-working-dir", "adhoc", "", v, []string{"down", "restart"}, false, blockedOutsideComposeRoot},
-		{"self-outside-root", "docker-agent", "/srv/containers/docker-agent", v, []string{}, false, blockedSelf},
+		{"under-root", "frigate", root + "/frigate", "", v, full, true, ""},
+		{"outside-root-keeps-label-ops", "gdrive-agent", "/srv/containers/gdrive-agent", "", v, []string{"down", "restart"}, false, blockedOutsideComposeRoot},
+		{"no-working-dir", "adhoc", "", "", v, []string{"down", "restart"}, false, blockedOutsideComposeRoot},
+		{"self-outside-root", "docker-agent", "/srv/containers/docker-agent", "", v, []string{}, false, blockedSelf},
 		// The guard must not depend on where the agent's compose file lives.
-		{"self-INSIDE-root", "docker-agent", root + "/docker-agent", v, []string{}, false, blockedSelf},
+		{"self-INSIDE-root", "docker-agent", root + "/docker-agent", "", v, []string{}, false, blockedSelf},
 		// compose lowercases before Down/Restart: "Docker-Agent" would act on the agent.
-		{"case-alias-of-self", "Docker-Agent", root + "/Docker-Agent", v, []string{}, false, blockedInvalidName},
-		{"dotted-name", "my.stack", root + "/my.stack", v, []string{}, false, blockedInvalidName},
-		{"control-path-under-root", "traefik", root + "/traefik", v, []string{"pull", "recreate", "restart", "up", "update"}, true, blockedControlPath},
-		{"control-path-outside-root", "traefik", "/srv/containers/traefik", v, []string{"restart"}, false, blockedOutsideComposeRoot},
+		{"case-alias-of-self", "Docker-Agent", root + "/Docker-Agent", "", v, []string{}, false, blockedInvalidName},
+		{"dotted-name", "my.stack", root + "/my.stack", "", v, []string{}, false, blockedInvalidName},
+		{"control-path-under-root", "traefik", root + "/traefik", "", v, []string{"pull", "recreate", "restart", "up", "update"}, true, blockedControlPath},
+		{"control-path-outside-root", "traefik", "/srv/containers/traefik", "", v, []string{"restart"}, false, blockedOutsideComposeRoot},
 		// The agent's own stack also runs the control-path proxy: self still wins.
-		{"self-that-is-also-control-path", "docker-agent", root + "/docker-agent", observed(t, testSelfID, []fakeContainer{
+		{"self-that-is-also-control-path", "docker-agent", root + "/docker-agent", "", observed(t, testSelfID, []fakeContainer{
 			{id: testSelfID, name: "docker-agent", project: "docker-agent"},
 			{id: testTraefikID, name: "traefik", project: "docker-agent"},
 		}), []string{}, false, blockedSelf},
-		{"no-view", "docker-agent", root + "/docker-agent", nil, full, true, ""},
+		{"no-view", "docker-agent", root + "/docker-agent", "", nil, full, true, ""},
+		// An externally-rendered stack under the root: every op, never editable, and
+		// no ops_blocked — nothing about its ops is blocked.
+		{"owned-under-root", "gdrive-agent", root + "/gdrive-agent", "ansible", v, full, false, ""},
+		// Ownership does not rescue a stack the agent cannot load, and does not
+		// outrank self or an unusable name.
+		{"owned-outside-root", "gdrive-agent", "/srv/containers/gdrive-agent", "ansible", v, []string{"down", "restart"}, false, blockedOutsideComposeRoot},
+		{"owned-self", "docker-agent", root + "/docker-agent", "ansible", v, []string{}, false, blockedSelf},
+		{"owned-invalid-name", "My.Stack", root + "/My.Stack", "ansible", v, []string{}, false, blockedInvalidName},
+		// An owned control-path stack keeps the control-path rule: no `down`.
+		{"owned-control-path", "traefik", root + "/traefik", "ansible", v, []string{"pull", "recreate", "restart", "up", "update"}, false, blockedControlPath},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := projectCapabilities(c.project, c.dir, root, c.view)
+			got := projectCapabilities(ProjectEntry{Name: c.project, WorkingDir: c.dir, Owner: c.owner}, root, c.view)
 			if !reflect.DeepEqual(got.Allowed, c.allowed) || got.Editable != c.editable || got.Blocked != c.blocked {
 				t.Fatalf("got %+v, want allowed=%v editable=%v blocked=%q", got, c.allowed, c.editable, c.blocked)
+			}
+			if got.Owner != c.owner {
+				t.Fatalf("Owner = %q, want %q", got.Owner, c.owner)
 			}
 			if got.Allowed == nil {
 				t.Fatal("Allowed must never be nil")
@@ -574,7 +588,7 @@ func TestProjectCapabilities(t *testing.T) {
 func TestSnapshotWireContract(t *testing.T) {
 	v := observed(t, testSelfID, defaultContainers("/data"))
 	self := ComposeProject{Name: "docker-agent"}
-	self.stampCapability(projectCapabilities("docker-agent", "/srv/containers/docker-agent", "/data", v))
+	self.stampCapability(projectCapabilities(ProjectEntry{Name: "docker-agent", WorkingDir: "/srv/containers/docker-agent"}, "/data", v))
 	raw, err := json.Marshal(self)
 	must(t, err)
 	for _, want := range []string{`"allowed_ops":[]`, `"managed":false`, `"operable":false`, `"ops_blocked":"self"`} {
@@ -584,7 +598,7 @@ func TestSnapshotWireContract(t *testing.T) {
 	}
 
 	ok := ComposeProject{Name: "frigate"}
-	ok.stampCapability(projectCapabilities("frigate", "/data/frigate", "/data", v))
+	ok.stampCapability(projectCapabilities(ProjectEntry{Name: "frigate", WorkingDir: "/data/frigate"}, "/data", v))
 	raw, _ = json.Marshal(ok)
 	for _, want := range []string{`"allowed_ops":["down","pull","recreate","restart","up","update"]`, `"managed":true`, `"operable":true`} {
 		if !bytes.Contains(raw, []byte(want)) {

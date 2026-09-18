@@ -550,6 +550,16 @@ The rules, per op rather than per stack:
 - **The control-path proxy** — the container `TRAEFIK_DOCKER_DNS` names — refuses `down` on its
   stack and `stop`/`kill`/`remove` on the container: the agent would be alive but unreachable with
   nothing able to start the proxy again. `restart`/`recreate`/`update` bring it back and are allowed.
+- **An externally-rendered stack keeps every op but is not editable.** A registry entry may declare
+  an `owner` — the tool that writes its compose files, `"ansible"` for the agent stacks Ansible
+  renders under `$COMPOSE_ROOT`. The agent operates such a stack normally (including `update`,
+  which rewrites the image value in its `.env`, the one file Ansible deliberately does not
+  re-render), but `managed` is false: the editor, the copy source and `/bundle` refuse it with
+  `409 project_owned`, and `/bundle` answers the same empty-bundle shape it uses for a stack
+  outside the root — so an owner's secrets beside its compose are never served. Nothing about its
+  ops is blocked, so `ops_blocked` stays empty; `owner` is the field that explains the lock.
+  An absent `owner` on a re-register PRESERVES the recorded one (a remediation must not unclaim a
+  stack it knows nothing about); an explicit `"owner": ""` clears it and reopens the editor.
 
 Self identity comes from `/proc/self/mountinfo` (the container ID) plus the container **list**
 (the compose project, and every container sharing the agent's network namespace, which is treated
@@ -568,6 +578,7 @@ ID starts with `db`.
 | Op not in `allowed_ops` (non-self reason) | 409 | `project_not_operable` |
 | Any op, register, copy source/target on the agent's own project | 409 | `self_project` |
 | Copy of a project whose files are not visible | 409 | `project_not_editable` |
+| Copy source, or register-with-`files`, on a stack another tool renders | 409 | `project_owned` (`owner`, `working_dir`) |
 | Container verb on the agent's own container | 409 | `self_container` |
 | `stop`/`kill`/`remove` on the control-path container | 409 | `control_path_container` |
 | Register/copy with a name compose would normalise, or longer than 255 bytes | 400 | `invalid_project_name` |
@@ -576,6 +587,7 @@ ID starts with `db`.
 | Register: a declared compose/env path escaping the working dir | 400 | `project_path_outside_working_dir` |
 | Register: an inline file path that is empty or has a >255-byte component | 400 | `invalid_file_path` |
 | Register: a path-only project under the root with no readable compose file | 400 | `compose_files_missing` |
+| Register: `owner` not lowercase `[a-z0-9_-]`, or longer than 32 bytes | 400 | `invalid_owner` |
 | Unknown project (op, copy source, bundle) | 404 | `unknown_project` |
 | Malformed body, or a required field missing | 400 | `invalid_body` |
 | Op not one of the six | 400 | `invalid_op` |
