@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -139,6 +140,12 @@ func TestOwnedStackRefusesEveryFileWrite(t *testing.T) {
 		if status != http.StatusConflict || body["code"] != "project_owned" {
 			t.Fatalf("a different owner pushing files: %d %v", status, body)
 		}
+		// The RECORDED owner, not the one the request asked to become. Naming
+		// "terraform" here would tell the operator the stack is rendered by the very
+		// tool being refused — a message naming a cause that was never tested.
+		if body["owner"] != "ansible" {
+			t.Errorf("the refusal named %v, want the recorded owner ansible", body["owner"])
+		}
 	})
 
 	t.Run("copy-reads-the-source-and-lands-an-UNOWNED-copy", func(t *testing.T) {
@@ -209,6 +216,36 @@ func TestOwnerIsPreservedUnlessExplicitlyCleared(t *testing.T) {
 	}
 }
 
+// TestAnOwnerMayCLAIMAStackWithItsFiles is nut's first converge: render the
+// compose in memory and push it with the register, declaring the owner, on a stack
+// the registry has never seen. prevOwner is empty, so the write guard must not
+// fire — keying that guard on the RESULTING owner instead of the recorded one
+// refuses every such claim permanently (the entry is never recorded, so it can
+// never get past the guard) and prints an empty owner name while doing it.
+func TestAnOwnerMayCLAIMAStackWithItsFiles(t *testing.T) {
+	e := newCapEnv(t, testSelfID, defaultContainers)
+	status, body := e.do(t, http.MethodPost, "/v1/projects", map[string]any{
+		"name": "nut-ups", "owner": "ansible",
+		"files": map[string]string{"docker-compose.yml": composeA, ".env": "CURRENT_NUT_UPS_IMAGE=reg/nut:1\n"},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("an owner claiming a fresh stack with its files: %d %v", status, body)
+	}
+	entry, ok := e.a.projects.get("nut-ups")
+	if !ok || entry.Owner != "ansible" {
+		t.Fatalf("the claim did not record the owner: %+v", entry)
+	}
+	// And the converge is repeatable: the same push again, still declaring the
+	// owner, is the steady state — not a one-time grant.
+	status, body = e.do(t, http.MethodPost, "/v1/projects", map[string]any{
+		"name": "nut-ups", "replace": true, "owner": "ansible",
+		"files": map[string]string{"docker-compose.yml": composeA, ".env": "CURRENT_NUT_UPS_IMAGE=reg/nut:2\n"},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("the owner re-converging its own stack: %d %v", status, body)
+	}
+}
+
 // TestOwnerSurvivesARestart: the flag is only worth having if it is durable —
 // projects.json is what the agent reloads, and an owner lost on restart reopens
 // the editor on files Ansible renders.
@@ -230,7 +267,9 @@ func TestInvalidOwnerIsRefused(t *testing.T) {
 	e := newCapEnv(t, testSelfID, defaultContainers)
 	dir := e.writeCompose(t, "stack", composeA)
 
-	for _, owner := range []string{"Ansible", "ansible ", "an/sible", "a\nb", string(make([]byte, maxOwnerLen+1))} {
+	// strings.Repeat, not NUL bytes: a NUL fails validProjectName's alphabet check
+	// before the length check is ever reached, so the bound was a placeholder.
+	for _, owner := range []string{"Ansible", "ansible ", "an/sible", "a\nb", strings.Repeat("a", maxOwnerLen+1)} {
 		status, body := e.do(t, http.MethodPost, "/v1/projects", map[string]any{
 			"name": "stack", "working_dir": dir, "replace": true, "owner": owner,
 		})
@@ -240,6 +279,14 @@ func TestInvalidOwnerIsRefused(t *testing.T) {
 	}
 	if _, ok := e.a.projects.get("stack"); ok {
 		t.Error("a refused register was recorded")
+	}
+
+	// The accepted side of the boundary, so the bound is a bound and not a wall.
+	status, body := e.do(t, http.MethodPost, "/v1/projects", map[string]any{
+		"name": "stack", "working_dir": dir, "replace": true, "owner": strings.Repeat("a", maxOwnerLen),
+	})
+	if status != http.StatusOK {
+		t.Fatalf("an owner of exactly maxOwnerLen must be accepted: %d %v", status, body)
 	}
 }
 
@@ -290,22 +337,42 @@ func TestOwnerOnTheFleetSnapshotWire(t *testing.T) {
 	registerOwned(t, e, "gdrive-agent", "ansible")
 
 	view := e.a.self.current()
-	merged := e.a.projects.mergeKnown(nil, view)
-	var got *ComposeProject
-	for i := range merged {
-		if merged[i].Name == "gdrive-agent" {
-			got = &merged[i]
-		}
-	}
-	if got == nil {
-		t.Fatalf("gdrive-agent missing from the snapshot: %+v", merged)
-	}
-	raw, err := json.Marshal(got)
-	must(t, err)
-	for _, want := range []string{`"owner":"ansible"`, `"managed":false`, `"operable":true`} {
-		if !containsStr(string(raw), want) {
-			t.Errorf("snapshot wire %s missing %s", raw, want)
-		}
+
+	// BOTH branches of mergeKnown, because they are different code and only one of
+	// them is what production reads. A stack with no running containers takes the
+	// registry-only branch; a RUNNING one — which all four agent stacks are, always
+	// — takes the live branch, where the row is built from container labels and the
+	// registry entry has to be merged onto it. A version of this test that covered
+	// only the first left the live branch free to drop the owner entirely, shipping
+	// managed:true on the wire and a live Edit button over Ansible's files.
+	for _, tc := range []struct {
+		name string
+		live []ComposeProject
+	}{
+		{"registry-only (the stack is stopped)", nil},
+		{"live (the stack is running — what production reads)", []ComposeProject{
+			{Name: "gdrive-agent", WorkingDir: "/some/label/path", ContainerCount: 1, RunningCount: 1},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			merged := e.a.projects.mergeKnown(tc.live, view)
+			var got *ComposeProject
+			for i := range merged {
+				if merged[i].Name == "gdrive-agent" {
+					got = &merged[i]
+				}
+			}
+			if got == nil {
+				t.Fatalf("gdrive-agent missing from the snapshot: %+v", merged)
+			}
+			raw, err := json.Marshal(got)
+			must(t, err)
+			for _, want := range []string{`"owner":"ansible"`, `"managed":false`, `"operable":true`} {
+				if !containsStr(string(raw), want) {
+					t.Errorf("snapshot wire %s missing %s", raw, want)
+				}
+			}
+		})
 	}
 
 	// A project with no owner must not put an empty owner on the wire: absent is
@@ -315,7 +382,7 @@ func TestOwnerOnTheFleetSnapshotWire(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("register frigate: %d %v", status, body)
 	}
-	merged = e.a.projects.mergeKnown(nil, view)
+	merged := e.a.projects.mergeKnown(nil, view)
 	for i := range merged {
 		if merged[i].Name != "frigate" {
 			continue
