@@ -35,6 +35,10 @@ Spans three repos: docker-agent (this one), control-center, ansible.
     nothing to load.
   - The client also gained `working_dir`/`compose_files`/`env_files`: the module only had the
     INLINE register mode, so path-only registration did not exist for Ansible at all.
+  - ⚠ **CORRECTED in review.** `managed` = editable was only half the model. Ownership governs
+    WRITES; the COMPOSE ROOT governs reads. Gating `/bundle` on editability broke the nut stack's
+    own converge, which reads its stack back to preserve the `.env` — see the Phase 2 handoff's
+    Surprises. `Readable` and `Editable` are separate.
 - **Each role** (duplicacy-agent-api, gdrive-agent, build-agent, filemesh-agent): template the compose
   to `{{ docker_agent_data_dir }}/<agent>/docker-compose.yml` with top-level `name: <agent>`; write
   `CURRENT_<AGENT>_IMAGE` into that directory's `.env` (not the task's process env — a pin in a
