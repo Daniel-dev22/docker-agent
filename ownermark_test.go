@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -113,22 +114,49 @@ func TestEditorSaveIsRefusedAfterTheRegistryIsLost(t *testing.T) {
 	}
 }
 
-// TestDeregisterRefusesAnOwnedStack closes the laundering path that needed no
-// loss at all: DELETE dropped the entry carrying the owner while the containers
-// kept running, and the next snapshot rebuilt the row as editable.
-func TestDeregisterRefusesAnOwnedStack(t *testing.T) {
+// TestDeregisterCannotMakeAnOwnedStackEditable is what the deregister path has
+// to guarantee, and it is a property of the DIRECTORY rather than a refusal.
+//
+// Before the mark, DELETE was a one-call ownership launder: the entry carrying
+// the owner disappeared, the containers kept running, and the very next fleet
+// snapshot rebuilt the row as unowned and editable — measured 2026-09-20. An
+// owner CHECK on the delete was written first and then removed: it refused the
+// drop, which cost a shared working directory its only exit and broke the
+// documented teardown of a stack whose files are gone, and it bought nothing,
+// because the row is rebuilt from the directory either way.
+func TestDeregisterCannotMakeAnOwnedStackEditable(t *testing.T) {
 	e := newCapEnv(t, testSelfID, defaultContainers)
 	dir := registerOwned(t, e, "gdrive-agent", "ansible")
 
 	status, body := e.do(t, http.MethodDelete, "/v1/projects/gdrive-agent", nil)
-	if status != http.StatusConflict || body["code"] != "project_owned" {
-		t.Fatalf("deregister of an owned stack: %d %v, want 409 project_owned", status, body)
+	if status != http.StatusOK {
+		t.Fatalf("deregister: %d %v, want 200", status, body)
 	}
-	if _, ok := e.a.projects.get("gdrive-agent"); !ok {
-		t.Fatal("a refused deregister dropped the entry anyway")
+	if _, ok := e.a.projects.get("gdrive-agent"); ok {
+		t.Fatal("the entry survived a deregister")
 	}
 
-	// The documented way out, and the only one: take the files back first.
+	// 1. the live row the UI reads
+	merged := e.a.projects.mergeKnown([]ComposeProject{liveOf("gdrive-agent", dir)}, nil)
+	if merged[0].Owner != "ansible" || merged[0].Managed {
+		t.Errorf("the snapshot offered Edit after a deregister: %+v", merged[0])
+	}
+	// 2. the write itself
+	before, err := os.ReadFile(filepath.Join(dir, "docker-compose.yml"))
+	must(t, err)
+	status, body = e.do(t, http.MethodPost, "/v1/projects", map[string]any{
+		"name": "gdrive-agent", "replace": true,
+		"files": map[string]string{"docker-compose.yml": "services: {}\n"},
+	})
+	if status != http.StatusConflict || body["code"] != "project_owned" {
+		t.Fatalf("editor save after a deregister: %d %v, want 409 project_owned", status, body)
+	}
+	after, err := os.ReadFile(filepath.Join(dir, "docker-compose.yml"))
+	must(t, err)
+	if string(after) != string(before) {
+		t.Error("a refused save rewrote the owner's compose file")
+	}
+	// 3. and the way out still works, in one call
 	status, body = e.do(t, http.MethodPost, "/v1/projects", map[string]any{
 		"name": "gdrive-agent", "working_dir": dir, "replace": true, "owner": "",
 	})
@@ -138,12 +166,20 @@ func TestDeregisterRefusesAnOwnedStack(t *testing.T) {
 	if got := markOf(t, dir); got != "" {
 		t.Errorf("clearing the owner left a mark on disk: %q", got)
 	}
-	status, body = e.do(t, http.MethodDelete, "/v1/projects/gdrive-agent", nil)
+}
+
+// TestDeregisterOfATornDownStackStillWorks: a role that removes a stack's files
+// and then deregisters it is a documented op (docker_agent_stack op=deregister).
+// An owner check on the delete broke it — the entry still carried the owner, the
+// directory was gone, and the index kept a dead entry forever.
+func TestDeregisterOfATornDownStackStillWorks(t *testing.T) {
+	e := newCapEnv(t, testSelfID, defaultContainers)
+	dir := registerOwned(t, e, "gdrive-agent", "ansible")
+	must(t, os.RemoveAll(dir))
+
+	status, body := e.do(t, http.MethodDelete, "/v1/projects/gdrive-agent", nil)
 	if status != http.StatusOK {
-		t.Fatalf("deregister after clearing the owner: %d %v", status, body)
-	}
-	if _, ok := e.a.projects.get("gdrive-agent"); ok {
-		t.Error("the entry survived a successful deregister")
+		t.Fatalf("deregister of a torn-down owned stack: %d %v, want 200", status, body)
 	}
 }
 
@@ -284,7 +320,14 @@ func TestAMarkThatCannotBeUnderstoodFailsSafe(t *testing.T) {
 		must(t, os.MkdirAll(filepath.Join(dir, ownerMarkName), 0o755))
 		owner, err := readOwnerMark(dir, root)
 		if err == nil || owner != unknownOwner {
-			t.Errorf("a mark that is a directory: owner=%q err=%v", owner, err)
+			t.Fatalf("a mark that is a directory: owner=%q err=%v", owner, err)
+		}
+		// The read would fail on its own (EISDIR), so the explicit regular-file
+		// check earns its place by naming the CAUSE rather than reporting a
+		// malformed owner. A refusal that blames the wrong thing sends whoever
+		// reads it looking at the file's contents.
+		if !strings.Contains(err.Error(), "not a regular file") {
+			t.Errorf("the failure does not name the cause: %v", err)
 		}
 	})
 }
@@ -417,36 +460,6 @@ func TestReadinessReportsAnOwnerItCouldNotRecord(t *testing.T) {
 	}
 }
 
-// TestDeregisterWaitsForTheProjectLock. Deregister took no lock, so it could drop
-// the entry an in-flight register was about to re-read the owner from — the exact
-// window that register's under-lock re-read exists to close, reached from the
-// other side. The observable is direct: without the lock this answers 200 while
-// another change holds the project.
-func TestDeregisterWaitsForTheProjectLock(t *testing.T) {
-	e := newCapEnv(t, testSelfID, defaultContainers)
-	requestLockWait = 50 * time.Millisecond
-	defer func() { requestLockWait = 10 * time.Second }()
-	dir := e.writeCompose(t, "plain", composeA)
-	if status, _ := e.do(t, http.MethodPost, "/v1/projects", map[string]any{
-		"name": "plain", "working_dir": dir, "replace": true,
-	}); status != http.StatusOK {
-		t.Fatal("fixture register failed")
-	}
-	entry, _ := e.a.projects.get("plain")
-
-	release, err := e.a.reg.eng.locks.acquire(context.Background(), projectLockKey(entry), "job 42 (update)", nil)
-	must(t, err)
-	status, body := e.do(t, http.MethodDelete, "/v1/projects/plain", nil)
-	release()
-
-	if status != http.StatusConflict || body["code"] != "project_busy" || body["holder"] != "job 42 (update)" {
-		t.Fatalf("deregister while the project is locked: %d %v, want 409 project_busy", status, body)
-	}
-	if _, ok := e.a.projects.get("plain"); !ok {
-		t.Error("a busy deregister dropped the entry anyway")
-	}
-}
-
 // TestEditorSaveIsRefusedForAStoppedStackAfterTheRegistryIsLost is why the write
 // guard asks the DIRECTORY and not the index it just rebuilt.
 //
@@ -513,4 +526,383 @@ func TestAnOwnedWriteIsRefusedWithoutWaitingForTheLock(t *testing.T) {
 		t.Errorf("it waited %v for a lock it did not need", elapsed)
 	}
 	_ = dir
+}
+
+// ---------------------------------------------------------------------------
+// Review findings. Each of these fails against the first version of this change.
+// ---------------------------------------------------------------------------
+
+// TestAnUnreadableMarkIsNeverPersisted is the defect three independent review
+// lenses found, from three directions.
+//
+// readOwnerMark answers unknownOwner for a mark it cannot read, so a write guard
+// refuses — that is right. Recording it was not: reconcile wrote the sentinel
+// into the index, and the next boot's migration branch then wrote it into the
+// DIRECTORY as though a tool had declared it, destroying the real owner and
+// refusing the owner's own converge (`"ansible" != "unknown"`). Readiness read
+// healthy throughout, because a mark was present.
+//
+// The trigger is not exotic: confinePath resolves the compose root, so a root
+// that is briefly unresolvable — a mount not up yet when the agent starts —
+// fails this way for EVERY entry at once.
+func TestAnUnreadableMarkIsNeverPersisted(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "gdrive-agent")
+	must(t, os.MkdirAll(dir, 0o755))
+	must(t, os.WriteFile(filepath.Join(dir, ownerMarkName), []byte("not a valid owner!\n"), 0o600))
+	path := filepath.Join(root, "projects.json")
+	must(t, os.WriteFile(path, []byte(`[{"name":"gdrive-agent","working_dir":"`+dir+`","owner":"ansible"}]`), 0o600))
+
+	reg := newComposeRegistry(path, root)
+	must(t, reg.load())
+
+	entry, _ := reg.get("gdrive-agent")
+	if entry.Owner != "ansible" {
+		t.Errorf("the index lost the real owner to an unreadable mark: %q", entry.Owner)
+	}
+	if got := markOf(t, dir); got == unknownOwner {
+		t.Error("the sentinel was written into the stack directory as a declaration")
+	}
+	var persisted []ProjectEntry
+	raw, err := os.ReadFile(path)
+	must(t, err)
+	must(t, json.Unmarshal(raw, &persisted))
+	for _, p := range persisted {
+		if p.Owner == unknownOwner {
+			t.Errorf("the sentinel was persisted into the index: %+v", p)
+		}
+	}
+	// And it is still reported, because an owner the directory cannot back up is
+	// exactly what this readiness field is for.
+	if got := reg.unmarkedOwners(); len(got) != 1 || got[0] != "gdrive-agent" {
+		t.Errorf("unmarkedOwners = %v, want [gdrive-agent] — an unreadable mark is not a healthy one", got)
+	}
+}
+
+// TestAnUnresolvableRootDoesNotRewriteEveryOwner is the same defect at its worst
+// trigger: one failing read per entry, all at once, on a boot that then persists.
+func TestAnUnresolvableRootDoesNotRewriteEveryOwner(t *testing.T) {
+	root := t.TempDir()
+	var entries []string
+	for _, name := range []string{"gdrive-agent", "duplicacy-agent-api", "plain"} {
+		dir := filepath.Join(root, name)
+		must(t, os.MkdirAll(dir, 0o755))
+		owner := "ansible"
+		if name == "plain" {
+			owner = "" // an UNOWNED stack must not acquire an owner either
+		}
+		must(t, writeOwnerMark(dir, root, owner))
+		entries = append(entries, `{"name":"`+name+`","working_dir":"`+dir+`","owner":"`+owner+`"}`)
+	}
+	path := filepath.Join(root, "projects.json")
+	must(t, os.WriteFile(path, []byte("["+strings.Join(entries, ",")+"]"), 0o600))
+
+	// Every mark now unreadable, by the same cause, at once.
+	for _, name := range []string{"gdrive-agent", "duplicacy-agent-api", "plain"} {
+		mark := filepath.Join(root, name, ownerMarkName)
+		if _, err := os.Stat(mark); err == nil {
+			must(t, os.Remove(mark))
+		}
+		must(t, os.MkdirAll(mark, 0o755)) // a directory: open succeeds, read does not
+	}
+
+	reg := newComposeRegistry(path, root)
+	must(t, reg.load())
+
+	for _, e := range reg.list() {
+		if e.Owner == unknownOwner {
+			t.Errorf("%s was rewritten as owned by the sentinel", e.Name)
+		}
+	}
+	if e, _ := reg.get("plain"); e.Owner != "" {
+		t.Errorf("an unowned stack acquired owner %q from a failed read", e.Owner)
+	}
+	if e, _ := reg.get("gdrive-agent"); e.Owner != "ansible" {
+		t.Errorf("a real owner was replaced by a failed read: %q", e.Owner)
+	}
+}
+
+// TestTheSentinelCannotBeDeclared. It is the one value that must never be
+// storable, so it cannot be an input either — otherwise the thing the fix stops
+// the agent writing could be written through the front door, and "unknown" on
+// the wire would mean two unrelated things.
+func TestTheSentinelCannotBeDeclared(t *testing.T) {
+	e := newCapEnv(t, testSelfID, defaultContainers)
+	dir := e.writeCompose(t, "plain", composeA)
+	status, body := e.do(t, http.MethodPost, "/v1/projects", map[string]any{
+		"name": "plain", "working_dir": dir, "replace": true, "owner": unknownOwner,
+	})
+	if status != http.StatusBadRequest || body["code"] != "invalid_owner" {
+		t.Fatalf("register owner=%q: %d %v, want 400 invalid_owner", unknownOwner, status, body)
+	}
+	if err := writeOwnerMark(dir, e.root, unknownOwner); err == nil {
+		t.Error("writeOwnerMark accepted the sentinel")
+	}
+}
+
+// TestTheReservedNameIsReservedAsAPathComponent. Reproduced against the first
+// version: writeProjectFiles MkdirAll's a path's parents before confining it, so
+// a bundle path of "<mark>/x" created a DIRECTORY at the reserved name. It then
+// read as owner "unknown" (EISDIR), and neither the clear (ENOTEMPTY) nor the
+// atomic rename (EEXIST) could remove it — the stack was un-editable,
+// un-registerable and unrecoverable through the API, from three unauthenticated
+// calls.
+func TestTheReservedNameIsReservedAsAPathComponent(t *testing.T) {
+	e := newCapEnv(t, testSelfID, defaultContainers)
+	for _, path := range []string{
+		ownerMarkName + "/x", "nested/" + ownerMarkName + "/x", ownerMarkName + "/a/b",
+	} {
+		status, body := e.do(t, http.MethodPost, "/v1/projects", map[string]any{
+			"name": "forged", "replace": true,
+			"files": map[string]string{"docker-compose.yml": composeA, path: "boom"},
+		})
+		if status != http.StatusBadRequest || body["code"] != "invalid_file_path" {
+			t.Errorf("bundle path %q: %d %v, want 400 invalid_file_path", path, status, body)
+		}
+		if _, err := os.Stat(filepath.Join(e.root, "forged", ownerMarkName)); err == nil {
+			t.Fatalf("bundle path %q created the reserved path", path)
+		}
+	}
+}
+
+// TestANonRegularMarkIsRepairedRatherThanWedging is the second half of the same
+// finding: the guard above stops it being created through the API, and this stops
+// anything already at that path — from an older agent, a restore, a host-side
+// tool — being a dead end. Every route out used to fail.
+func TestANonRegularMarkIsRepairedRatherThanWedging(t *testing.T) {
+	for _, shape := range []string{"non-empty-directory", "symlink"} {
+		t.Run(shape, func(t *testing.T) {
+			root := t.TempDir()
+			dir := filepath.Join(root, "stack")
+			must(t, os.MkdirAll(dir, 0o755))
+			mark := filepath.Join(dir, ownerMarkName)
+			if shape == "symlink" {
+				other := filepath.Join(root, "elsewhere")
+				must(t, os.WriteFile(other, []byte("do not clobber\n"), 0o600))
+				must(t, os.Symlink(other, mark))
+			} else {
+				must(t, os.MkdirAll(mark, 0o755))
+				must(t, os.WriteFile(filepath.Join(mark, "x"), []byte("boom"), 0o644))
+			}
+
+			owner, err := readOwnerMark(dir, root)
+			if err == nil || owner != unknownOwner {
+				t.Fatalf("readOwnerMark = %q, %v; want the fail-safe value and an error", owner, err)
+			}
+			// Both repairs must work, or the stack is stuck.
+			must(t, writeOwnerMark(dir, root, "ansible"))
+			if got := markOf(t, dir); got != "ansible" {
+				t.Fatalf("after the repair the mark reads %q", got)
+			}
+			must(t, writeOwnerMark(dir, root, ""))
+			if got := markOf(t, dir); got != "" {
+				t.Errorf("the mark survived a clear: %q", got)
+			}
+			if shape == "symlink" {
+				b, rerr := os.ReadFile(filepath.Join(root, "elsewhere"))
+				must(t, rerr)
+				if string(b) != "do not clobber\n" {
+					t.Error("the write followed the symlink and clobbered its target")
+				}
+			}
+		})
+	}
+}
+
+// TestAMovedProjectDoesNotOrphanItsOldMark. A mark with no entry is invisible to
+// readiness, which only walks entries — and it refuses a later stack registered
+// at that path as rendered by a tool that no longer renders it.
+func TestAMovedProjectDoesNotOrphanItsOldMark(t *testing.T) {
+	e := newCapEnv(t, testSelfID, defaultContainers)
+	oldDir := registerOwned(t, e, "traefik", "ansible")
+	newDir := e.writeCompose(t, "traefik-v2", composeA)
+
+	status, body := e.do(t, http.MethodPost, "/v1/projects", map[string]any{
+		"name": "traefik", "working_dir": newDir, "replace": true, "owner": "ansible",
+	})
+	if status != http.StatusOK {
+		t.Fatalf("move: %d %v", status, body)
+	}
+	if got := markOf(t, newDir); got != "ansible" {
+		t.Errorf("the new directory does not record the owner: %q", got)
+	}
+	if got := markOf(t, oldDir); got != "" {
+		t.Errorf("the old directory kept an orphan mark: %q", got)
+	}
+	// The consequence, stated directly: a fresh stack at the vacated path.
+	status, body = e.do(t, http.MethodPost, "/v1/projects", map[string]any{
+		"name": "traefik-fresh", "replace": true,
+		"files": map[string]string{"docker-compose.yml": composeA},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("a new stack at the vacated path: %d %v", status, body)
+	}
+}
+
+// TestReadinessIsComputedWhenThereIsNoIndexAtALL. load() returned early for a
+// missing or empty projects.json — before the reconcile and before the readiness
+// refresh — so the phase's own scenario was the one case where readiness
+// reported "none" for "not yet checked".
+func TestReadinessIsComputedWhenThereIsNoIndexAtAll(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "projects.json")
+	reg := newComposeRegistry(path, root)
+	must(t, reg.load()) // no file at all
+	if reg.unmarked.Load() == nil {
+		t.Error("the readiness cache was never computed with no index file")
+	}
+	must(t, os.WriteFile(path, nil, 0o600))
+	reg = newComposeRegistry(path, root)
+	must(t, reg.load()) // zero-length file
+	if reg.unmarked.Load() == nil {
+		t.Error("the readiness cache was never computed with an empty index file")
+	}
+}
+
+// TestAFifoAtTheMarkPathDoesNotHangTheRead. The mark read runs on the fleet
+// snapshot's path. A FIFO there would block the open FOREVER without O_NONBLOCK,
+// and the snapshot builds on every liveness tick and every WS connect.
+//
+// This replaces a test that asserted a register could complete "while a snapshot
+// was mid-flight" — it created no FIFO, blocked on nothing, and would have passed
+// against any implementation. It proved nothing, which is the thing a
+// verification pass exists to find.
+func TestAFifoAtTheMarkPathDoesNotHangTheRead(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "stack")
+	must(t, os.MkdirAll(dir, 0o755))
+	if err := syscall.Mkfifo(filepath.Join(dir, ownerMarkName), 0o600); err != nil {
+		t.Skipf("cannot create a fifo here: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		owner, err := readOwnerMark(dir, root)
+		if err == nil || owner != unknownOwner {
+			t.Errorf("a fifo mark read as %q, %v", owner, err)
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the mark read hung on a fifo")
+	}
+}
+
+// TestAdoptionDoesNotPersistAnUnreadableOwner. Adoption is the other writer, and
+// it persists what it builds — so a transient read failure at boot would store
+// the sentinel there too, feeding the same migration that turns it into a real
+// declaration at the next boot.
+func TestAdoptionDoesNotPersistAnUnreadableOwner(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "gdrive-agent")
+	must(t, os.MkdirAll(filepath.Join(dir, ownerMarkName), 0o755)) // unreadable
+	path := filepath.Join(root, "projects.json")
+	reg := newComposeRegistry(path, root)
+	must(t, reg.load())
+
+	reg.enrichFromLive([]ComposeProject{liveOf("gdrive-agent", dir)})
+
+	if e, ok := reg.get("gdrive-agent"); ok && e.Owner == unknownOwner {
+		t.Errorf("adoption stored the sentinel: %+v", e)
+	}
+	if raw, err := os.ReadFile(path); err == nil && strings.Contains(string(raw), unknownOwner) {
+		t.Errorf("the sentinel reached projects.json: %s", raw)
+	}
+}
+
+// TestARecordedOwnerIsNotRewrittenOnEveryRegister. An owner's converge
+// re-registers on every run; rewriting the mark each time is two fsyncs and a new
+// inode per stack, which on an SD-card host is the dominant cost of a converge.
+func TestARecordedOwnerIsNotRewrittenOnEveryRegister(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "stack")
+	must(t, os.MkdirAll(dir, 0o755))
+	must(t, writeOwnerMark(dir, root, "ansible"))
+	first, err := os.Stat(filepath.Join(dir, ownerMarkName))
+	must(t, err)
+
+	must(t, writeOwnerMark(dir, root, "ansible"))
+	again, err := os.Stat(filepath.Join(dir, ownerMarkName))
+	must(t, err)
+
+	if !os.SameFile(first, again) {
+		t.Error("re-recording the same owner replaced the file")
+	}
+	// ...and a DIFFERENT owner still lands.
+	must(t, writeOwnerMark(dir, root, "someone-else"))
+	if got := markOf(t, dir); got != "someone-else" {
+		t.Errorf("a changed owner was not written: %q", got)
+	}
+}
+
+// TestAMarkSymlinkedWithinTheRootIsRefused. The out-of-root case is caught by
+// confinePath; this is the one only O_NOFOLLOW catches — a link to a perfectly
+// valid file INSIDE the root, which confinement is happy with.
+func TestAMarkSymlinkedWithinTheRootIsRefused(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "stack")
+	must(t, os.MkdirAll(dir, 0o755))
+	other := filepath.Join(root, "other-owner")
+	must(t, os.WriteFile(other, []byte("ansible\n"), 0o600))
+	must(t, os.Symlink(other, filepath.Join(dir, ownerMarkName)))
+
+	owner, err := readOwnerMark(dir, root)
+	if err == nil {
+		t.Fatalf("a symlinked mark inside the root was read as %q", owner)
+	}
+	if owner != unknownOwner {
+		t.Errorf("owner = %q, want %q", owner, unknownOwner)
+	}
+}
+
+// TestASnapshotKeepsAnIndexedOwnerWhenTheMarkIsMissing. The snapshot reads the
+// directory ONLY for rows the index does not hold. Reading it for every row
+// looks harmless — the answers usually agree — but it silently drops a recorded
+// owner whose mark has not been written yet or could not be read, and it puts a
+// file read per project on the path that builds on every liveness tick.
+//
+// A canary found this: reading the mark for indexed rows too left every other
+// test green.
+func TestASnapshotKeepsAnIndexedOwnerWhenTheMarkIsMissing(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "gdrive-agent")
+	must(t, os.MkdirAll(dir, 0o755))
+	reg := newComposeRegistry(filepath.Join(root, "projects.json"), root)
+	must(t, reg.register(ProjectEntry{Name: "gdrive-agent", WorkingDir: dir, Owner: "ansible"}))
+	must(t, os.Remove(filepath.Join(dir, ownerMarkName))) // as a failed mark write leaves it
+
+	merged := reg.mergeKnown([]ComposeProject{liveOf("gdrive-agent", dir)}, nil)
+	if merged[0].Owner != "ansible" {
+		t.Errorf("the snapshot dropped the index's owner: %+v", merged[0])
+	}
+	if merged[0].Managed {
+		t.Error("and offered Edit on it")
+	}
+}
+
+// TestAnEntryIsImmutableOnceIndexed. persist() collects the *ProjectEntry
+// pointers under a read lock, RELEASES it, and marshals them with no lock held —
+// which is only safe because an indexed entry is never written through again.
+// setOwner broke that by assigning in place. Today its one caller runs before the
+// listener binds, so nothing races it; this pins the invariant rather than the
+// caller, because the next caller will not know.
+func TestAnEntryIsImmutableOnceIndexed(t *testing.T) {
+	root := t.TempDir()
+	reg := newComposeRegistry(filepath.Join(root, "projects.json"), root)
+	must(t, reg.register(ProjectEntry{Name: "s", WorkingDir: filepath.Join(root, "s")}))
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 200; i++ {
+			_ = reg.persist()
+		}
+	}()
+	for i := 0; i < 200; i++ {
+		reg.setOwner("s", "ansible")
+		reg.setOwner("s", "")
+	}
+	<-done
 }

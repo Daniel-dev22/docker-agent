@@ -330,6 +330,13 @@ func validOwner(owner string) bool {
 	if owner == "" {
 		return true
 	}
+	if owner == unknownOwner {
+		// Reserved. It is what the agent reports when it cannot READ a directory's
+		// owner mark, so letting it be declared would make one wire value mean two
+		// unrelated things — and the one that must never be storable would be
+		// storable through the front door.
+		return false
+	}
 	if len(owner) > maxOwnerLen {
 		return false
 	}
@@ -456,6 +463,10 @@ func (a *app) handleRegisterProject(c *gin.Context) {
 	if body.Owner == nil {
 		entry.Owner = prevOwner // absent still means "keep what is recorded"
 	}
+	// capa was built before the lock, from the owner as it was then. The refusal
+	// below quotes it, so recompute it against the owner the re-read just found —
+	// otherwise a 409 can advertise a capability derived from the wrong owner.
+	capa = a.capabilityOf(entry, view)
 	if refuseOwnedWrite(c, body, entry, prevOwner, capa) {
 		return
 	}
@@ -505,48 +516,25 @@ func (a *app) existingProject(name string, summaries []container.Summary) (exist
 }
 
 // handleDeregisterProject drops a project from the index. It does NOT touch the
-// files, so on an OWNED stack it was a one-call ownership launder: the entry
-// carrying the owner disappeared, the containers kept running, and the very next
-// fleet snapshot rebuilt the row from their labels as unowned and editable
-// (measured 2026-09-20 — no registry loss, no restart, no credential). The
-// directory now records the owner, so re-adoption comes back owned; the refusal
-// below closes the window in between, and makes dropping an owner's entry a
-// thing you have to mean.
+// files — and it does not need to check the owner, because the owner is no
+// longer something the index alone carries: the directory records it
+// (ownermark.go), so the fleet row rebuilt from container labels comes back
+// owned, and so does the next boot's adoption.
 //
-// The way out is the one that already exists: re-register with "owner": "" to
-// take the files back, then deregister.
+// An owner CHECK here was written first and then removed. Refusing the drop
+// reads as safer and is not: it made a shared working directory permanently
+// un-deregisterable (both entries refuse, and the documented way out — a
+// path-only register with "owner": "" — is itself refused by
+// working_dir_in_use), and it broke the documented teardown of a stack whose
+// files are already gone. Both are cycles with no exit through the API. It also
+// needed the project lock, which put a retryable project_busy on a verb whose
+// one external client only retries POSTs. None of it bought anything the
+// directory does not already give — which is the plan's own reasoning, that
+// structural recovery SUBSUMES the deregister check.
 func (a *app) handleDeregisterProject(c *gin.Context) {
 	name := c.Param("name")
 	if name == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "project name is required"})
-		return
-	}
-	entry, known := a.projects.get(name)
-	if !known {
-		// Nothing to drop. Answering OK keeps deregister idempotent, which every
-		// caller that cleans up after itself relies on.
-		c.JSON(http.StatusOK, gin.H{"deregistered": name})
-		return
-	}
-	// Under the project's lock, so a register cannot land between the owner check
-	// and the delete — the same reason the register re-reads the owner under it.
-	release, locked := a.lockForRequest(c, projectLockKey(entry), "a deregister request for "+name)
-	if !locked {
-		return
-	}
-	defer release()
-	entry, known = a.projects.get(name)
-	if !known {
-		c.JSON(http.StatusOK, gin.H{"deregistered": name})
-		return
-	}
-	owner := a.ownerOfFiles(entry)
-	if owner != "" {
-		view, ok := a.viewForRead(c)
-		if !ok {
-			return
-		}
-		refuseProjectOwned(c, entry, owner, a.capabilityOf(entry, view))
 		return
 	}
 	if err := a.projects.deregister(name); err != nil {
@@ -823,10 +811,20 @@ func validateBundlePaths(files map[string]string) error {
 		clean := cleanBundlePath(rel)
 		// The owner mark is the agent's own record of who renders these files
 		// (ownermark.go). A bundle that could write one would let anything able to
-		// push files — the editor, a cross-host copy — declare an owner and lock a
-		// stack out of the editor without going through the register's `owner`.
-		if filepath.Base(clean) == ownerMarkName {
-			return fmt.Errorf("%q is reserved: declare an owner with the register's \"owner\" field", echo(rel))
+		// push files — the editor, a cross-host copy — declare an owner without
+		// going through the register's `owner`.
+		//
+		// EVERY component, not just the base: writeProjectFiles MkdirAll's the
+		// parents of each path before confining it, so "<mark>/x" creates a
+		// DIRECTORY at the reserved name. Reproduced before this covered it —
+		// three unauthenticated calls left the stack reading owner "unknown",
+		// un-editable and un-registerable, because a directory defeats both the
+		// clear (ENOTEMPTY) and the atomic rename (EEXIST), with no way back
+		// through the API at all. writeOwnerMark repairs that now; this stops it.
+		for _, part := range strings.Split(clean, "/") {
+			if part == ownerMarkName {
+				return fmt.Errorf("%q is reserved: declare an owner with the register's \"owner\" field", echo(rel))
+			}
 		}
 		if clean == "" || clean == "." || strings.HasPrefix(clean, "..") || len(clean) > maxPathLen {
 			return fmt.Errorf("invalid file path %q", echo(rel))

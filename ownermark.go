@@ -31,6 +31,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 const (
@@ -42,11 +43,15 @@ const (
 	// maxOwnerMarkBytes bounds the read. The file holds a tool name, and a
 	// working dir is host state the agent does not otherwise control.
 	maxOwnerMarkBytes = 128
-	// unknownOwner is what a mark that exists but cannot be read as a valid owner
-	// resolves to. Fail-safe: a directory that says something about who renders it
-	// and cannot be understood is not one the agent may rewrite. It is itself a
-	// valid owner name, so it needs no special case on the wire, in a refusal
-	// message, or in the frontend.
+	// unknownOwner is what a mark that exists but cannot be READ resolves to.
+	// Fail-safe: a directory that says something about who renders it and cannot be
+	// understood is not one the agent may rewrite.
+	//
+	// It is RESERVED — validOwner refuses it as an input — so it has exactly one
+	// meaning wherever it appears: the agent could not read the mark. A sentinel
+	// that doubles as a legal declaration is one every future reader of Owner has
+	// to remember, and three review lenses independently found the same
+	// consequence: it was being written back as though it were one.
 	unknownOwner = "unknown"
 )
 
@@ -67,11 +72,17 @@ func readOwnerMark(dir, root string) (string, error) {
 		return "", nil
 	}
 	p := ownerMarkPath(dir)
-	// Symlinks resolved: a mark linking out of the root is not this stack's.
+	// confinePath resolves symlinks on the whole path, which is what stops a
+	// symlinked PARENT — a stack directory linked out of the root — aiming the
+	// read somewhere it should not go. O_NOFOLLOW covers the last component, which
+	// confinePath can only check before the open rather than at it.
 	if err := confinePath(p, root); err != nil {
 		return unknownOwner, fmt.Errorf("owner mark %s: %w", echo(p), err)
 	}
-	f, err := os.Open(p)
+	// O_NOFOLLOW: the mark is the agent's own metadata and is never legitimately a
+	// link. O_NONBLOCK: a FIFO at this path would otherwise block the open
+	// FOREVER, and this read runs on the fleet-snapshot path.
+	f, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return "", nil
@@ -79,6 +90,16 @@ func readOwnerMark(dir, root string) (string, error) {
 		return unknownOwner, fmt.Errorf("open owner mark %s: %w", echo(p), err)
 	}
 	defer f.Close()
+	// Decided on the OPEN FILE, not on a path that could have changed since: a
+	// directory at this path reads as EISDIR, and a device or socket as something
+	// stranger. Only a regular file can carry a declaration.
+	st, err := f.Stat()
+	if err != nil {
+		return unknownOwner, fmt.Errorf("stat owner mark %s: %w", echo(p), err)
+	}
+	if !st.Mode().IsRegular() {
+		return unknownOwner, fmt.Errorf("owner mark %s is not a regular file (%s)", echo(p), st.Mode().Type())
+	}
 	// The read is bounded, so a huge file costs one page, not its size. There is
 	// deliberately no separate "too large" branch: maxOwnerMarkBytes is far above
 	// maxOwnerLen, so anything oversized fails the validity check below — a branch
@@ -105,9 +126,26 @@ func writeOwnerMark(dir, root, owner string) error {
 	if !underComposeRoot(dir, root) {
 		return nil
 	}
+	if owner != "" && (!validOwner(owner) || len(owner) > maxOwnerLen) {
+		// Reaches unknownOwner too, which validOwner reserves: a failed READ must
+		// never become a written declaration.
+		return fmt.Errorf("refusing to record %s as an owner", echo(owner))
+	}
 	p := ownerMarkPath(dir)
 	if err := confinePath(p, root); err != nil {
 		return fmt.Errorf("owner mark %s: %w", echo(p), err)
+	}
+	// Whatever is at the reserved path and is not a regular file cannot be a
+	// declaration and must not be able to wedge the mechanism: a DIRECTORY there
+	// defeats both os.Remove (ENOTEMPTY) and the atomic rename (EEXIST), which
+	// left the stack un-clearable and un-registerable through the API, repairable
+	// only on the host. A symlink is refused for a different reason — the atomic
+	// write resolves it and would clobber its target. Nothing legitimate lives at
+	// this name.
+	if lst, lerr := os.Lstat(p); lerr == nil && !lst.Mode().IsRegular() {
+		if err := os.RemoveAll(p); err != nil {
+			return fmt.Errorf("remove a non-regular owner mark at %s: %w", echo(p), err)
+		}
 	}
 	if owner == "" {
 		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -115,8 +153,11 @@ func writeOwnerMark(dir, root, owner string) error {
 		}
 		return nil
 	}
-	if !validOwner(owner) || len(owner) > maxOwnerLen {
-		return fmt.Errorf("refusing to record %s as an owner", echo(owner))
+	// Already recorded: skip the write. An owner's converge re-registers every
+	// run, and rewriting the mark each time costs two fsyncs and a new inode per
+	// stack — the dominant cost of a converge on an SD-card host.
+	if cur, cerr := readOwnerMark(dir, root); cerr == nil && cur == owner {
+		return nil
 	}
 	// Atomic (tmp + fsync + rename), so a crash mid-write cannot leave a mark
 	// that names nobody — which readOwnerMark would have to treat as unknown.
