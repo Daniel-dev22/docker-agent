@@ -10,8 +10,8 @@ stack editable**, because the owner is recorded in the directory it governs.
 
 | | docker-agent | ansible | control-center |
 |---|---|---|---|
-| Branch | `feat/owner-durable` | `feat/nut-owner-gate` | — no change needed |
-| Commits | 2 (`a0ef577` build, `b725d69` review fixes) | 2 (`e798722d`, `3a25bfc8`) | — |
+| Branch | `feat/owner-durable` (merged, deleted) | `feat/nut-owner-gate` + `feat/nut-host-correction` (merged, deleted) | — no change needed |
+| Code commits | 2 (`a0ef577` build, `b725d69` review fixes) | 3 (`e798722d`, `3a25bfc8`, `9bb3ff03` post-deploy corrections) | — |
 | Merged | see §Merge record | see §Merge record | — |
 | Released / deployed | **`0.1.20`, LIVE on all 10 hosts** — see §Rollout record | **`51.107.10` + `51.107.11`, distributed to kd-cluster + ng-cluster** — see §Rollout record | — |
 | Review | 4 lenses commissioned, 3 completed, 1 stopped (see §Surprises); every finding fixed or recorded below |
@@ -79,8 +79,10 @@ that only listed stacks which already had an owner is what hid kd-nuc02's from m
 
 The two decisions are now separate — the owner opens the gate on its own; only a content change
 earns a `deploy`, because recording a name must not restart the UPS monitor. `ups/tests/` is new
-(15 tests that read both decisions out of the YAML and *evaluate* them), and `ups/**` was added to
-both `paths` filters and the pytest invocation in `plugin-tests.yml`, because it was in neither.
+(**17** tests that read the decisions out of the YAML and *evaluate* them — 15 for the owner gate,
+plus 2 added with the correction below that refuse an owner on the legacy path), and `ups/**` was
+added to both `paths` filters and the pytest invocation in `plugin-tests.yml`, because it was in
+neither.
 
 `docker_agent_client.py`'s register docstring no longer claims `/bundle` "serves nothing" for an
 owned stack — it serves the files, and that distinction is what broke the nut converge once.
@@ -112,7 +114,14 @@ the review fixes:
   index keeps `ansible`, nothing is persisted, and readiness lists the stack.
 
 **Suites:** Go `./...` green (631 tests, 31 of them new in `ownermark_test.go`), `-race` green on
-the new tests; ansible CI invocation green (1,722 passed) including the new `ups/tests`.
+the new tests.
+
+Ansible, run at the RELEASE POINT rather than at a branch tip — a tag ships the repo, not the diff:
+**1,724 passed at `51.107.11`**, the tag this phase shipped. The number first written here was
+1,722, measured at the `feat/nut-owner-gate` merge and then left standing while the correction
+commit added two tests: a measurement expires with the code it was taken against, and a fix is the
+fastest way to invalidate one. Re-run later at `main`/`51.107.14`, which carries other sessions'
+work on top: **1,730 passed** — so nothing of this phase's went red under theirs.
 
 **Canaries.** 16 mutations of the build, then **15 of the review FIXES** — the round that matters,
 because a review fix is a change like any other. Two survived first and both were real gaps:
@@ -180,8 +189,12 @@ itself (nobody has deleted a live `projects.json`, and nobody should).
   stack whose files had been removed could not be deregistered at all; and it put a retryable
   `project_busy` on a verb whose one external client only retries POSTs. It protected nothing the
   directory did not already protect. **Refusing reads as safer and was not.**
-- **The plan named the wrong stack.** It says `nut-ups`; the project is `nut`, and it is on
-  **ng-nuc01 only**. A grep for the plan's name finds nothing.
+- **The plan named the wrong stack, and then so did I.** The plan says `nut-ups`; the project is
+  `nut`, so a grep for the plan's name finds nothing. I then compounded it: I measured ng-nuc01,
+  found `owner=null`, and wrote it up as the unowned repo-owned stack. It is not — ng-nuc01 is the
+  LEGACY host and is correctly unowned. The repo-owned stack is **kd-nuc02**, and my own project
+  filter (which listed only stacks that already had an owner) is what hid it. A true reading of the
+  wrong subject looks exactly like a measurement. Corrected in `51.107.11`.
 - **`traefik` is `managed:true` on all six kd hosts.** Expected — it is the gated Phase 4 stack —
   but worth seeing written down: the UI offers Edit on it today, on every host.
 
@@ -225,8 +238,9 @@ Re-read that field before starting anyway; it is a state, not a one-off reading.
 - 🔴 **Merging the ansible change reaches ZERO hosts.** `/home/daniel/ansible` sits at the last
   released tag, so the nut fix needs a tag **and** `git_updates/git_update_ansible_directory.yaml`
   before any host runs it. A release ships the whole repo — check `git log <last-tag>..main` first.
-  At the time of writing another session was holding a fleet distribute; coordinate rather than
-  cutting a tag into someone else's release window.
+  This happened here: another session was holding a fleet distribute, so the window was negotiated
+  rather than taken, and the release tool's own payload print confirmed each tag shipped only its
+  own commits. Coordinate rather than cutting a tag into someone else's release window.
 - **The first restart after this ships WRITES a file into every owned stack directory.** That is the
   migration and it is the point — but it means the agent creates `.docker-agent-owner` (root, 0600)
   inside directories Ansible renders. No role prunes unknown files from those directories today. If
@@ -242,7 +256,7 @@ Re-read that field before starting anyway; it is a state, not a one-off reading.
 
 ## Rollout record (2026-09-20)
 
-Order was **docker-agent FIRST, ansible LAST**, per the trap below.
+Order was **docker-agent FIRST, ansible LAST**, per the trap above.
 
 | # | Step | Verified |
 |---|---|---|
@@ -262,9 +276,11 @@ saying `changed=9` is evidence about the run, not about the host.
 
 ## Merge record
 
-Both branches are MERGED to `main`. Neither is released, and nothing runs on a host until it is —
-see the Status table, which this does not change.
+All three branches are merged to `main`, **released, and deployed** — see §Rollout record for the
+evidence. (An earlier version of this section said "neither is released, and nothing runs on a host
+until it is". That was true when written and false within the hour; it is recorded here because a
+"what you can trust" section that is never re-read is the first part of a handoff to rot.)
 
-- docker-agent `feat/owner-durable` → merged as `c44f311` (2026-09-20)
-- ansible `feat/nut-owner-gate` → merged as `a21865e0` (2026-09-20). **`/home/daniel/ansible` is still
-  at the previous tag**, so the nut fix reaches zero hosts until a release + a fleet distribute.
+- docker-agent `feat/owner-durable` → merged as `c44f311`, released as **`0.1.20`**
+- ansible `feat/nut-owner-gate` → merged as `a21865e0`, released as **`51.107.10`**
+- ansible `feat/nut-host-correction` → merged as `6a2fad97`, released as **`51.107.11`**
