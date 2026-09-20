@@ -160,6 +160,11 @@ cert-manager wrong-image bug), node page and Update Stack driven by `allowed_ops
 
 ## Deferred register
 
+> **Superseded — the single register lives in `docs/AGENT_STACK_OPS_PLAN.md`.**
+> These rows were merged there on 2026-09-20 with their measurements. They are kept below
+> as the phase's own record; do NOT add to them, and re-measure before trusting one.
+
+
 | Item | Why deferred | Measurement |
 |---|---|---|
 | Job-history retention across agents (`compose_jobs`, duplicacy/gdrive/filemesh job tables) and controller (`docker_jobs`, `duplicacy_jobs`) | pre-existing, fleet-wide (5 repos); raised with the user as its own phase | no DELETE path exists in any of them; only `build_jobs` has retention |

@@ -160,6 +160,11 @@ the containers run), and a `-e <agent>_image_tag` override rewriting an agent-wr
 
 ## Deferred
 
+> **Superseded — the single register lives in `docs/AGENT_STACK_OPS_PLAN.md`.**
+> These rows were merged there on 2026-09-20 with their measurements. They are kept below
+> as the phase's own record; do NOT add to them, and re-measure before trusting one.
+
+
 | Item | Why deferred | Measurement / trigger |
 |---|---|---|
 | **Ownership has no structural recovery.** `Owner` lives only in `projects.json`. If that file is lost while the containers run, `enrichFromLive` re-adopts them from container labels with NO owner → under the root → `managed:true`, and the editor reopens on Ansible's files until the next converge. | The obvious fix — a compose label the agent reads back — is a SECOND source of truth for one fact, which is its own failure mode. The recovery path exists (any agent-role run re-establishes it) and the trigger is narrow: the ComposeRoot must be wiped *while the containers keep running* (a host rebuild leaves nothing to adopt). | Reproduce by deleting `projects.json` and restarting the agent with the stacks up. Decide between the label and making the loss loud. **This is the next phase's first step.** |
