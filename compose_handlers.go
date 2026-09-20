@@ -214,6 +214,25 @@ func (a *app) capabilityOf(e ProjectEntry, v *selfView) projectCapability {
 	return projectCapabilities(e, a.cfg.ComposeRoot, v)
 }
 
+// ownerOfFiles answers who the files in e's working directory belong to RIGHT
+// NOW. Every guard that is about to write, drop or overwrite those files asks
+// this one question, so there is a single rule rather than several that drift.
+//
+// The DIRECTORY is asked first (ownermark.go) and the index is only a fallback
+// for an entry registered before the mark existed. That order is the whole of
+// Phase 3: a lost projects.json, an entry deregistered, or a stopped stack the
+// boot adoption never saw all leave the index unable to answer, and answering ""
+// there is what reopened the editor on files Ansible renders.
+func (a *app) ownerOfFiles(e ProjectEntry) string {
+	if owner := a.projects.ownerOfDir(e.WorkingDir); owner != "" {
+		return owner
+	}
+	if prev, ok := a.projects.get(e.Name); ok {
+		return prev.Owner
+	}
+	return ""
+}
+
 // --- project registry CRUD ---
 
 // projectListEntry is one GET /v1/projects row: the durable entry plus the same
@@ -349,21 +368,17 @@ func (a *app) handleRegisterProject(c *gin.Context) {
 		Profiles:     body.Profiles,
 		EnvFiles:     body.EnvFiles,
 	}
-	// An absent owner keeps what is recorded; the durable entry is the only
-	// source (a live container label never carries one). prevOwner is who the
-	// files belong to RIGHT NOW, which is what a write has to be checked against
-	// — entry.Owner is already whoever this request says they will belong to.
-	var prevOwner string
-	if prev, ok := a.projects.get(body.Name); ok {
-		prevOwner = prev.Owner
-		entry.Owner = prev.Owner
-	}
-	if body.Owner != nil {
-		entry.Owner = *body.Owner
-	}
 	if len(body.Files) > 0 {
 		// Inline files always land under ComposeRoot; decide on that directory.
 		entry.WorkingDir = filepath.Join(a.cfg.ComposeRoot, body.Name)
+	}
+	// An absent owner keeps what is recorded. prevOwner is who the files belong to
+	// RIGHT NOW, which is what a write has to be checked against — entry.Owner is
+	// already whoever this request says they will belong to.
+	prevOwner := a.ownerOfFiles(entry)
+	entry.Owner = prevOwner
+	if body.Owner != nil {
+		entry.Owner = *body.Owner
 	}
 	if !filepath.IsAbs(entry.WorkingDir) || len(entry.WorkingDir) > maxPathLen {
 		refuse(c, http.StatusBadRequest, "invalid_working_dir",
@@ -437,12 +452,9 @@ func (a *app) handleRegisterProject(c *gin.Context) {
 	// window would leave a concurrent editor save holding prevOwner == "" — writing
 	// over the owner's files AND clearing the owner, the two things this rule
 	// exists to stop, in one request.
-	prevOwner = ""
-	if prev, ok := a.projects.get(body.Name); ok {
-		prevOwner = prev.Owner
-		if body.Owner == nil {
-			entry.Owner = prev.Owner // absent still means "keep what is recorded"
-		}
+	prevOwner = a.ownerOfFiles(entry)
+	if body.Owner == nil {
+		entry.Owner = prevOwner // absent still means "keep what is recorded"
 	}
 	if refuseOwnedWrite(c, body, entry, prevOwner, capa) {
 		return
@@ -459,7 +471,11 @@ func (a *app) handleRegisterProject(c *gin.Context) {
 			entry.ComposeFiles = composeFileNames(written)
 		}
 	}
+	// register records the owner in the stack's own directory before the index
+	// learns it (ownermark.go); a failure there is a failure here.
 	if err := a.projects.register(entry); err != nil {
+		slog.Error("register failed", "project", entry.Name, "owner", entry.Owner,
+			"working_dir", entry.WorkingDir, "error", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -488,10 +504,49 @@ func (a *app) existingProject(name string, summaries []container.Summary) (exist
 	return "", false
 }
 
+// handleDeregisterProject drops a project from the index. It does NOT touch the
+// files, so on an OWNED stack it was a one-call ownership launder: the entry
+// carrying the owner disappeared, the containers kept running, and the very next
+// fleet snapshot rebuilt the row from their labels as unowned and editable
+// (measured 2026-09-20 — no registry loss, no restart, no credential). The
+// directory now records the owner, so re-adoption comes back owned; the refusal
+// below closes the window in between, and makes dropping an owner's entry a
+// thing you have to mean.
+//
+// The way out is the one that already exists: re-register with "owner": "" to
+// take the files back, then deregister.
 func (a *app) handleDeregisterProject(c *gin.Context) {
 	name := c.Param("name")
 	if name == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "project name is required"})
+		return
+	}
+	entry, known := a.projects.get(name)
+	if !known {
+		// Nothing to drop. Answering OK keeps deregister idempotent, which every
+		// caller that cleans up after itself relies on.
+		c.JSON(http.StatusOK, gin.H{"deregistered": name})
+		return
+	}
+	// Under the project's lock, so a register cannot land between the owner check
+	// and the delete — the same reason the register re-reads the owner under it.
+	release, locked := a.lockForRequest(c, projectLockKey(entry), "a deregister request for "+name)
+	if !locked {
+		return
+	}
+	defer release()
+	entry, known = a.projects.get(name)
+	if !known {
+		c.JSON(http.StatusOK, gin.H{"deregistered": name})
+		return
+	}
+	owner := a.ownerOfFiles(entry)
+	if owner != "" {
+		view, ok := a.viewForRead(c)
+		if !ok {
+			return
+		}
+		refuseProjectOwned(c, entry, owner, a.capabilityOf(entry, view))
 		return
 	}
 	if err := a.projects.deregister(name); err != nil {
@@ -617,6 +672,15 @@ func (a *app) handleCopyProject(c *gin.Context) {
 	defer release()
 	if owner, taken := a.projects.workingDirOwner(dst.WorkingDir, dst.Name); taken {
 		refuseWorkingDirInUse(c, dst.WorkingDir, owner)
+		return
+	}
+	// A copy WRITES the destination's files, which is the one act an owner's
+	// directory forbids. The index cannot answer this — the destination has no
+	// entry, that is what makes it a new project — so the DIRECTORY does. Without
+	// it, copying onto the name of a stack whose entry was lost would overwrite
+	// Ansible's files with a duplicate of something else.
+	if owner := a.ownerOfFiles(dst); owner != "" {
+		refuseProjectOwned(c, dst, owner, dstCapa)
 		return
 	}
 	files := map[string]string{}
@@ -757,6 +821,13 @@ func cleanBundlePath(rel string) string {
 func validateBundlePaths(files map[string]string) error {
 	for rel := range files {
 		clean := cleanBundlePath(rel)
+		// The owner mark is the agent's own record of who renders these files
+		// (ownermark.go). A bundle that could write one would let anything able to
+		// push files — the editor, a cross-host copy — declare an owner and lock a
+		// stack out of the editor without going through the register's `owner`.
+		if filepath.Base(clean) == ownerMarkName {
+			return fmt.Errorf("%q is reserved: declare an owner with the register's \"owner\" field", echo(rel))
+		}
 		if clean == "" || clean == "." || strings.HasPrefix(clean, "..") || len(clean) > maxPathLen {
 			return fmt.Errorf("invalid file path %q", echo(rel))
 		}

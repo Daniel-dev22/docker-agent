@@ -20,9 +20,18 @@ func (a *app) handleLiveness(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"stat
 // Docker daemon.
 func (a *app) handleReadiness(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ready", "self": a.self.status(),
-		// Registry entries that share a working directory (predating the rule that
-		// refuses them): reported, not gated — the agent still serves both.
-		"projects": gin.H{"shared_working_dirs": a.projects.sharedWorkingDirs()}})
+		"projects": gin.H{
+			// Registry entries that share a working directory (predating the rule that
+			// refuses them): reported, not gated — the agent still serves both.
+			"shared_working_dirs": a.projects.sharedWorkingDirs(),
+			// Entries the index says are externally rendered whose DIRECTORY does not
+			// record it (ownermark.go). Empty in a healthy agent: load writes any that
+			// are missing. A name here is ownership that would not survive losing
+			// projects.json — the failure the mark exists to prevent, and one that is
+			// otherwise silent until the day it matters. Reported, not gated: the
+			// index still protects the stack for this process's lifetime.
+			"owners_not_recorded": a.projects.unmarkedOwners(),
+		}})
 }
 
 // ---------------------------------------------------------------------------

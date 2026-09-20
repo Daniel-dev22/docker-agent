@@ -88,6 +88,12 @@ type composeRegistry struct {
 	// register handler refuses to create one, and auto-adoption skips one; what
 	// remains predates that rule and is reported in readiness.
 	shared atomic.Pointer[map[string][]string]
+
+	// unmarked holds the entries whose owner the index knows and whose DIRECTORY
+	// does not record (ownermark.go), recomputed on the same edges as shared.
+	// Derived here rather than in the readiness handler so a health probe does no
+	// file I/O — the same reason shared is cached.
+	unmarked atomic.Pointer[[]string]
 }
 
 func newComposeRegistry(path, composeRoot string) *composeRegistry {
@@ -140,8 +146,88 @@ func (r *composeRegistry) load() error {
 	count := len(r.byName)
 	r.mu.Unlock()
 	slog.Info("compose registry loaded", "count", count, "path", r.path)
-	r.refreshShared() // before the listener binds, so readiness never reports "none" for "not yet checked"
+	r.reconcileOwnerMarks() // before the listener binds: no request may see an entry whose owner is stale
+	r.refreshShared()       // before the listener binds, so readiness never reports "none" for "not yet checked"
 	return nil
+}
+
+// reconcileOwnerMarks makes the index agree with the directories it indexes, with
+// the DIRECTORY winning — it is the durable record, and the index is the copy
+// that can be lost (ownermark.go).
+//
+// It also MIGRATES: an entry whose owner the index knows and the directory does
+// not gets its mark written here, so the very first restart after this ships
+// protects every stack the fleet already converged, with no role run and no
+// operator step. An entry that has no mark and no owner is left alone — that is
+// the overwhelmingly common case and it costs one failed open.
+func (r *composeRegistry) reconcileOwnerMarks() {
+	var changed bool
+	for _, e := range r.list() {
+		if !underComposeRoot(e.WorkingDir, r.composeRoot) {
+			continue // ownership is only durable, and only meaningful, under the root
+		}
+		mark, err := readOwnerMark(e.WorkingDir, r.composeRoot)
+		if err != nil {
+			slog.Warn("owner mark unreadable — treating the stack as externally rendered",
+				"project", e.Name, "working_dir", e.WorkingDir, "error", err)
+		}
+		switch {
+		case mark == "" && e.Owner != "":
+			if werr := writeOwnerMark(e.WorkingDir, r.composeRoot, e.Owner); werr != nil {
+				// The index still protects it for this process's lifetime; what is lost
+				// is recovery from a registry loss, which is what readiness reports.
+				slog.Warn("could not record the owner in its stack directory",
+					"project", e.Name, "owner", e.Owner, "working_dir", e.WorkingDir, "error", werr)
+			} else {
+				slog.Info("recorded the owner in its stack directory",
+					"project", e.Name, "owner", e.Owner, "working_dir", e.WorkingDir)
+			}
+		case mark != "" && mark != e.Owner:
+			slog.Info("owner taken from the stack directory, which outranks the index",
+				"project", e.Name, "index_owner", e.Owner, "directory_owner", mark, "working_dir", e.WorkingDir)
+			r.setOwner(e.Name, mark)
+			changed = true
+		}
+	}
+	if changed {
+		if err := r.persist(); err != nil {
+			slog.Warn("persist reconciled owners failed", "error", err)
+		}
+	}
+}
+
+// setOwner updates the cached owner of a registered entry. The directory is the
+// source; this keeps the index and the wire value in step with it.
+func (r *composeRegistry) setOwner(name, owner string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.byName[name]; ok {
+		e.Owner = owner
+	}
+}
+
+// ownerOfDir answers "who do the files in dir belong to right now?" from the
+// directory itself, which outlives the index. "" means nobody claims them.
+//
+// Every write guard asks this rather than the index: the index is what a lost
+// projects.json, or a deregister, takes away.
+func (r *composeRegistry) ownerOfDir(dir string) string {
+	owner, _ := readOwnerMark(dir, r.composeRoot) // fails safe to unknownOwner
+	return owner
+}
+
+// unmarkedOwners returns the entries whose owner the index holds but whose
+// directory does not record — ownership that would NOT survive losing
+// projects.json. Reads the cache refreshed by refreshUnmarked, so readiness
+// answers without touching the filesystem.
+func (r *composeRegistry) unmarkedOwners() []string {
+	if r == nil {
+		return []string{} // readiness must answer even before a registry exists
+	}
+	if p := r.unmarked.Load(); p != nil && len(*p) > 0 {
+		return *p
+	}
+	return []string{}
 }
 
 // canonicalDir is dir with symlinks resolved as far as the path exists, so two
@@ -210,12 +296,49 @@ func (r *composeRegistry) refreshShared() {
 			slog.Info("compose registry: no projects share a working directory")
 		}
 	}
+	r.refreshUnmarked()
+}
+
+// refreshUnmarked recomputes which owned entries have no record in their own
+// directory. Logged on CHANGE only: it is recomputed on every index edit, and a
+// standing problem that logged each time would bury the edit that caused it.
+func (r *composeRegistry) refreshUnmarked() {
+	var unmarked []string
+	for _, e := range r.list() {
+		if e.Owner == "" || !underComposeRoot(e.WorkingDir, r.composeRoot) {
+			continue
+		}
+		if mark, _ := readOwnerMark(e.WorkingDir, r.composeRoot); mark == "" {
+			unmarked = append(unmarked, e.Name)
+		}
+	}
+	sort.Strings(unmarked)
+	if prev := r.unmarked.Swap(&unmarked); (prev == nil && len(unmarked) > 0) || (prev != nil && !slices.Equal(*prev, unmarked)) {
+		if len(unmarked) > 0 {
+			slog.Warn("compose registry: an owner is recorded in the index but not in its stack directory — "+
+				"losing projects.json would make these editable again", "projects", unmarked)
+		} else {
+			slog.Info("compose registry: every recorded owner is durable in its own stack directory")
+		}
+	}
 }
 
 // register adds or replaces a durable project entry and rewrites projects.json.
 func (r *composeRegistry) register(e ProjectEntry) error {
 	if e.Name == "" {
 		return errors.New("project name is required")
+	}
+	// The directory records the owner BEFORE the index does, for every caller —
+	// the invariant is "the index never holds an owner its directory does not",
+	// and a rule enforced in one handler is a rule the next caller forgets. A
+	// failure here fails the register: an index-only owner is the state this
+	// mechanism exists to prevent. The reverse order fails safe — an owner
+	// recorded with no index entry is re-adopted owned.
+	//
+	// An empty Owner REMOVES the mark, so taking the files back is the same one
+	// call it always was.
+	if err := writeOwnerMark(e.WorkingDir, r.composeRoot, e.Owner); err != nil {
+		return err
 	}
 	r.mu.Lock()
 	if e.RegisteredAt.IsZero() {
@@ -276,7 +399,7 @@ func (r *composeRegistry) resolve(name string, live []ComposeProject) (ProjectEn
 	}
 	for _, p := range live {
 		if p.Name == name {
-			return projectEntryFromLive(p), true
+			return projectEntryFromLive(p, r.composeRoot), true
 		}
 	}
 	return ProjectEntry{}, false
@@ -316,17 +439,30 @@ func (r *composeRegistry) enrichFromLive(live []ComposeProject) {
 		}
 		candidates[dir] = p
 	}
+	// Build the entries — which READS each directory's owner mark — before taking
+	// the lock. The registry lock is on the fleet snapshot's path; file I/O does
+	// not belong under it.
+	ordered := slices.Sorted(maps.Keys(candidates))
+	adopting := make([]ProjectEntry, 0, len(ordered))
+	for _, dir := range ordered {
+		e := projectEntryFromLive(candidates[dir], r.composeRoot)
+		e.RegisteredAt = time.Now().UTC()
+		// Adopted marks an entry not yet persisted; these are about to be.
+		e.Adopted = false
+		adopting = append(adopting, e)
+	}
 	var added int
 	r.mu.Lock()
-	for _, dir := range slices.Sorted(maps.Keys(candidates)) {
-		p := candidates[dir]
-		if _, ok := r.byName[p.Name]; ok {
+	for i := range adopting {
+		e := adopting[i]
+		if _, ok := r.byName[e.Name]; ok {
 			continue
 		}
-		e := projectEntryFromLive(p)
-		e.RegisteredAt = time.Now().UTC()
-		e.Adopted = false
-		r.byName[p.Name] = &e
+		if e.Owner != "" {
+			slog.Info("adopted a running compose project its directory says is externally rendered",
+				"project", e.Name, "owner", e.Owner, "working_dir", e.WorkingDir)
+		}
+		r.byName[e.Name] = &e
 		added++
 	}
 	r.mu.Unlock()
@@ -361,6 +497,15 @@ func (r *composeRegistry) mergeKnown(live []ComposeProject, v *selfView) []Compo
 		if e, ok := r.byName[live[i].Name]; ok {
 			row = *e
 			live[i].WorkingDir = e.WorkingDir
+		} else {
+			// No index entry to carry an owner, so the directory answers. This reads a
+			// file under the registry's read lock, which is only tolerable because the
+			// set is EMPTY in steady state — boot adoption registers every running
+			// project — and non-empty exactly when the index has been lost or an entry
+			// deregistered, which is when a wrong answer here offers Edit on Ansible's
+			// files. The error is deliberately dropped: readOwnerMark already fails
+			// safe, and this runs once per snapshot.
+			row.Owner, _ = readOwnerMark(row.WorkingDir, r.composeRoot)
 		}
 		live[i].stampCapability(projectCapabilities(row, r.composeRoot, v))
 	}
@@ -384,7 +529,13 @@ func (p *ComposeProject) stampCapability(c projectCapability) {
 
 // projectEntryFromLive builds an entry from a label-derived ComposeProject. The
 // config_files label is a comma-separated list of absolute paths.
-func projectEntryFromLive(p ComposeProject) ProjectEntry {
+//
+// A container label never carries an owner, so the OWNER COMES FROM THE
+// DIRECTORY (ownermark.go). Without that, every path that derives an entry from
+// live containers — boot adoption, and an op resolved against a name the index
+// does not hold — produces an unowned, editable entry for files Ansible renders.
+// That is exactly what a lost projects.json did.
+func projectEntryFromLive(p ComposeProject, composeRoot string) ProjectEntry {
 	var files []string
 	if p.ConfigFiles != "" {
 		for _, f := range strings.Split(p.ConfigFiles, ",") {
@@ -393,10 +544,12 @@ func projectEntryFromLive(p ComposeProject) ProjectEntry {
 			}
 		}
 	}
+	owner, _ := readOwnerMark(p.WorkingDir, composeRoot) // fails safe; logged by the callers that run once
 	return ProjectEntry{
 		Name:         p.Name,
 		WorkingDir:   p.WorkingDir,
 		ComposeFiles: files,
+		Owner:        owner,
 		Adopted:      true,
 	}
 }
