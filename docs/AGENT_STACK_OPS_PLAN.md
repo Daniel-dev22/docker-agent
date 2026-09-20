@@ -12,6 +12,49 @@ Spans three repos: docker-agent (this one), control-center, ansible.
 |---|---|---|
 | 1 | Truthful per-op capability in the agent, advertised on the wire and enforced; consumers (UI, Update Stack, control-api, sync-worker, system_monitor, Ansible modules) act on it; deploy-scope fix so the VPS agent stops falling behind | ✅ done — `docs/AGENT_STACK_OPS_PHASE1_HANDOFF.md` |
 | 2 | The four Ansible-owned agent stacks relocated under COMPOSE_ROOT, registered `owner: ansible` (operable, not editable), image pin in their `.env` | ✅ done — `docs/AGENT_STACK_OPS_PHASE2_HANDOFF.md` |
+| 3 | **Ownership survives losing the registry** — `Owner` stops being a fact that exists only in `projects.json`, so an agent that loses it cannot silently reopen the editor on Ansible-rendered files | next |
+| 4 | **traefik joins the owned set** — the fifth Ansible-rendered stack under the root declares `owner: ansible`, and the read-modify-write callers that would break are fixed first | 🔒 GATED, see below |
+
+### Phase 3 — what it ships, and the one thing to do first
+
+One sentence: *after Phase 3, deleting `projects.json` on a live host cannot make an
+Ansible-rendered stack editable.*
+
+Do the reproduction BEFORE choosing a design — the fix depends on what the agent actually does,
+and this has not been observed, only reasoned about. On a throwaway host with the stacks running:
+`rm` the agent's `projects.json`, restart it, `GET /v1/projects`. The expectation is `managed:true`
+and no `owner` on all four.
+
+Then choose, and write down why the other was rejected:
+
+- **(a) a compose label `projectEntryFromLive` reads back.** Structural and self-correcting, the
+  same shape as `underComposeRoot`. Cost: a SECOND source of truth for one fact — the template and
+  the register both declare the owner and can disagree. That is the reason it was not simply done
+  in Phase 2.
+- **(b) make the loss loud rather than silent.** Readiness reports "adopted entries under the root
+  with no recorded owner". Cheaper, no second source, but it leaves the window open and relies on
+  someone reading readiness.
+
+Also in scope, because it is the same fact: `deregister` takes no lock and no owner check. With
+structural recovery it cannot launder ownership; without it, it can.
+
+Verify while there: `nut-ups` should by then have taken its owner at its next template change —
+confirm, because the nut path is the one Phase 2 broke and fixed, and it is still unexercised in
+production.
+
+### Phase 4 — gated, and the gate is not a preference
+
+traefik is the fifth Ansible-rendered stack and already sits under the ComposeRoot, so declaring
+it owned is a two-line change. **Do not do it until the three literal secrets in its compose are
+moved to env from Bitwarden and rotated** (see the register). Ownership would not close that
+exposure — reads are governed by containment — so declaring it owned would look like a fix while
+changing nothing about the secrets.
+
+The other reason to take them in this order: `server_setup/general/include_tasks/rewrite_stack_container_dns.yaml`
+reads a stack's bundle and pushes it back, and its `dns_pinning_stacks` is `[traefik,
+homeassistant]`. It is inert today only because neither is owned. It is the same read-modify-write
+shape that broke `nut-ups`, and it fails CLOSED (a silent no-op) rather than loudly. Fix it in the
+same change that declares traefik owned.
 
 ## Phase 2 design (as BUILT — corrections to the pre-build design are marked)
 
