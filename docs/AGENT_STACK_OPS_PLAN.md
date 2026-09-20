@@ -12,35 +12,34 @@ Spans three repos: docker-agent (this one), control-center, ansible.
 |---|---|---|
 | 1 | Truthful per-op capability in the agent, advertised on the wire and enforced; consumers (UI, Update Stack, control-api, sync-worker, system_monitor, Ansible modules) act on it; deploy-scope fix so the VPS agent stops falling behind | ✅ done — `docs/AGENT_STACK_OPS_PHASE1_HANDOFF.md` |
 | 2 | The four Ansible-owned agent stacks relocated under COMPOSE_ROOT, registered `owner: ansible` (operable, not editable), image pin in their `.env` | ✅ done — `docs/AGENT_STACK_OPS_PHASE2_HANDOFF.md` |
-| 3 | **Ownership survives losing the registry** — `Owner` stops being a fact that exists only in `projects.json`, so an agent that loses it cannot silently reopen the editor on Ansible-rendered files | next |
+| 3 | **Ownership survives losing the registry** — `Owner` is recorded in the directory it governs, so an agent that loses `projects.json` cannot reopen the editor on Ansible-rendered files | ✅ built — `docs/AGENT_STACK_OPS_PHASE3_HANDOFF.md`. **Merged? released? see its Status table.** |
 | 4 | **traefik joins the owned set** — the fifth Ansible-rendered stack under the root declares `owner: ansible`, and the read-modify-write callers that would break are fixed first | 🔒 GATED, see below |
 
-### Phase 3 — what it ships, and the one thing to do first
+### Phase 3 — as BUILT (the pre-build design is corrected here)
 
-One sentence: *after Phase 3, deleting `projects.json` on a live host cannot make an
-Ansible-rendered stack editable.*
+*after Phase 3, deleting `projects.json` on a live host cannot make an Ansible-rendered stack
+editable.* Full detail in `docs/AGENT_STACK_OPS_PHASE3_HANDOFF.md`; what the plan got wrong:
 
-Do the reproduction BEFORE choosing a design — the fix depends on what the agent actually does,
-and this has not been observed, only reasoned about. On a throwaway host with the stacks running:
-`rm` the agent's `projects.json`, restart it, `GET /v1/projects`. The expectation is `managed:true`
-and no `owner` on all four.
-
-Then choose, and write down why the other was rejected:
-
-- **(a) a compose label `projectEntryFromLive` reads back.** Structural and self-correcting, the
-  same shape as `underComposeRoot`. Cost: a SECOND source of truth for one fact — the template and
-  the register both declare the owner and can disagree. That is the reason it was not simply done
-  in Phase 2.
-- **(b) make the loss loud rather than silent.** Readiness reports "adopted entries under the root
-  with no recorded owner". Cheaper, no second source, but it leaves the window open and relies on
-  someone reading readiness.
-
-Also in scope, because it is the same fact: `deregister` takes no lock and no owner check. With
-structural recovery it cannot launder ownership; without it, it can.
-
-Verify while there: `nut-ups` should by then have taken its owner at its next template change —
-confirm, because the nut path is the one Phase 2 broke and fixed, and it is still unexercised in
-production.
+- **The reproduction was done first, and it was worse than described.** `rm projects.json` +
+  restart gave `owner:null, managed:true` AND persisted the unowned entry, and the editor's own
+  call then rewrote the compose file on disk. The `deregister` row below was not a separate
+  nice-to-have: `DELETE` laundered ownership with **no file loss at all**, and the next fleet
+  snapshot read `managed:true` with the containers still running.
+- **Neither (a) nor (b) was chosen.** (a) a compose label is a second *declaration* that can
+  disagree with the register, needs a container recreate the converge deliberately does not do, and
+  every future owned stack must remember it. (b) leaves the hole open. What shipped is the owner
+  recorded in `<working_dir>/.docker-agent-owner` — the same record, kept beside the files instead
+  of in an index that can be lost separately from them, written by the register that already
+  carries the owner, so there is nothing to remember.
+- ⚠ **The `deregister` row's remedy was wrong, and the plan already said so.** An owner CHECK on
+  the delete was built and then removed: it made a shared working directory permanently
+  un-deregisterable, broke the documented teardown of a stack whose files are gone, and put a
+  retryable `project_busy` on a verb whose one client only retries POSTs. The plan's own sentence —
+  *"with structural recovery a deregister cannot launder ownership"* — was the right answer.
+- ⚠ **`nut-ups` is called `nut`, it is on ng-nuc01 only, and the deferred row's reason had
+  expired.** It had NOT taken its owner: the register that declares it is gated on the compose
+  *content* differing, so a converged host never declares an owner at all. Fixed in the ansible
+  half of this phase; the owner now opens that gate on its own.
 
 ### Phase 4 — gated, and the gate is not a preference
 
@@ -135,9 +134,12 @@ a row's reason is re-measured when it is picked up, not trusted.
 
 | Item | Reason / measurement | State |
 |---|---|---|
-| **Ownership has no structural recovery.** `Owner` lives only in `projects.json`; lose it while containers run and `enrichFromLive` re-adopts them unowned → `managed:true` → the editor reopens on Ansible's files until the next converge. | The obvious fix (a compose label read back) is a SECOND source of truth for one fact. Trigger is narrow: the ComposeRoot must be wiped *while the containers keep running*. Reproduce by deleting `projects.json` and restarting the agent with the stacks up. | OPEN — **Phase 3's first step** |
-| `deregister` takes no lock and no owner check | subsumed by the row above: with structural recovery a deregister cannot launder ownership. API-only; nothing in the UI calls it. | OPEN, blocked on the above |
-| `nut-ups` has not taken its owner yet | its register is gated `when: _nut_compose_changed`, so the owner is first set at its next genuine template change. Correct and safe now reads are open — but the nut path is not yet exercised in production. | OPEN — check `owner` on a nut host after its next template change |
+| ~~**Ownership has no structural recovery.**~~ | CLOSED in Phase 3 — the directory records its own owner. Reproduced first: the loss also persisted the unowned entry, and the editor's call then rewrote the file. | ✅ closed |
+| ~~`deregister` takes no lock and no owner check~~ | CLOSED in Phase 3, by the row above rather than by a check — exactly as this row predicted. A check was built, found to create three cycles with no exit through the API, and removed. | ✅ closed |
+| ~~`nut-ups` has not taken its owner yet~~ | CLOSED in Phase 3. The reason had expired: the owner rode the compose-CONTENT gate, so a converged host would never have declared one. Measured `owner=null, managed=true` on ng-nuc01 two days after Phase 2 shipped. The stack is called `nut`, not `nut-ups`. | ✅ closed |
+| `DockerAgentClient._await_retryable` is POST-only | `headers` is set only for POST, so a `retryable` refusal on any other verb is a hard error string. Pre-existing; Phase 3 briefly created an exposure and then removed it. | OPEN — pre-existing |
+| `owner:"unknown"` renders in the UI as a tool name | the frontend prints `project.owner` verbatim. Only reachable while a mark is unreadable (it is never persisted), and the Edit button is correctly disabled either way. | OPEN — fold into the next control-center change |
+| `tools/docker-agent-test` sends no `owner` anywhere | so the integration harness exercises none of Phase 2's or Phase 3's behaviour; coverage is the Go suite only. | OPEN — worth one harness phase |
 | `rewrite_stack_container_dns.yaml` silently no-ops on an owned stack | inert today: `dns_pinning_stacks` is `[traefik, homeassistant]`, neither owned. Becomes real the day traefik is declared owned. | OPEN, inert |
 | Idempotency middleware → `agent-kit-go` | only docker-agent has a POST-resending consumer | OPEN — promote the day a second agent gets one |
 
