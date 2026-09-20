@@ -222,7 +222,9 @@ Before any of that: **release and deploy this phase** (see below), and read
 
 ## Merge record
 
-<!-- Filled in when the branches merge. If this section says "pending", they did not. -->
+Both branches are MERGED to `main`. Neither is released, and nothing runs on a host until it is —
+see the Status table, which this does not change.
 
-- docker-agent `feat/owner-durable` → pending
-- ansible `feat/nut-owner-gate` → pending
+- docker-agent `feat/owner-durable` → merged as `c44f311` (2026-09-20)
+- ansible `feat/nut-owner-gate` → merged as `a21865e0` (2026-09-20). **`/home/daniel/ansible` is still
+  at the previous tag**, so the nut fix reaches zero hosts until a release + a fleet distribute.
