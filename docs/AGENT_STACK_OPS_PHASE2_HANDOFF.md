@@ -91,9 +91,11 @@ agent's project JSON verbatim.
   implementations — it sequenced on a lock ref the test itself held, so the save was refused by a
   different code path. Waiting for a ref beyond the test's own makes it fail with `200`.
 
-**Assumed, not measured:** nothing in this phase has run on a real host yet, unless §Rollout record
-below says otherwise. In particular the first converge's compose-file relocation and container
-relabel, and a Docker Jobs `update` against a relocated stack, are reasoned-about, not observed.
+**Measured on the fleet (2026-09-20):** see §Rollout record. The compose-file relocation, the `.env`
+seed, the `owner` capability verdict, a Docker Jobs `update`, and a `restart` against a relocated
+stack are all OBSERVED, on kd-nas01 first and then fleet-wide. What remains reasoned-about rather
+than observed: the ownership-durability case in §Deferred (it needs `projects.json` to be lost while
+the containers run), and a `-e <agent>_image_tag` override rewriting an agent-written pin.
 
 ## Decisions, and the alternatives rejected
 
@@ -137,6 +139,21 @@ relabel, and a Docker Jobs `update` against a relocated stack, are reasoned-abou
 - **The security rationale I wrote for `owner` was false.** The bearer tokens stay in the legacy
   directories, outside the agent's mount entirely — the agent's container cannot read them at all —
   and the four templates carry no inline credentials. Ownership was never the secret boundary.
+- **The converge does NOT relabel the running container, and the label points at the file
+  it just deleted.** `docker_compose_v2 state: present` finds the service already up and matching
+  — the move changes no service spec — so the container keeps
+  `com.docker.compose.project.{working_dir,config_files}` from the legacy path, and `config_files`
+  now names a file the converge removed. Measured on the kd-nas01 canary. It is benign and
+  self-healing, which is why it is documented rather than fixed:
+  - `restart` still works (verified, exit 0): compose drives it off the project name, not the
+    config file. Capability is unaffected — `mergeKnown` overrides the live label with the registry
+    entry's working dir, which is the new path.
+  - the first `update` or `recreate` rewrites both labels to the ComposeRoot (verified).
+  - during the window, a registry loss would adopt the OLD path, which is *outside* the root and
+    therefore NOT editable — i.e. the window fails safe, and the deferred ownership-durability risk
+    only begins after the first recreate.
+  Forcing a recreate in the converge would restart five agent stacks fleet-wide to fix a label that
+  the next update fixes for free.
 - **A mechanical fixture rename broke the property a test existed for**: `Gdrive-Agent` /
   `gdrive-agent` was a case-folded PAIR; renaming one side left `Gdrive-Agent` / `vendor-stack`,
   which tests something much weaker.
@@ -149,10 +166,51 @@ relabel, and a Docker Jobs `update` against a relocated stack, are reasoned-abou
 | `deregister` takes no lock and makes no owner check | Subsumed by the row above: with structural recovery, a deregister cannot launder ownership | API-only; nothing in the UI calls it |
 | Credentials inline in the traefik compose files | Belongs to the traefik role; user decision | carried over from Phase 1 |
 | `rewrite_stack_container_dns.yaml` silently no-ops on an owned stack | Its `dns_pinning_stacks` is `[traefik, homeassistant]`, neither owned | becomes real the day traefik is declared owned — which this phase's reasoning invites |
+| `filemesh-agent` is not built for nghome; its role targets ng-nas01 anyway | pre-existing; the fix is a product/targeting decision the user owns | no `filemesh-agent` repo in the ng registry; no container has ever run there |
+| `nut-ups` has not taken its owner yet | its register is gated `when: _nut_compose_changed`, so the owner is first set the next time the template genuinely differs. Correct, and safe now that reads are open — but it means the nut path is not yet exercised in production | check `owner` on a nut host after its next template change |
 | system-monitor CI job failures; two router tests red on main | pre-existing, unrelated | fail identically on origin/main |
 | `test_docker_redeploy_network_stacks.py::test_read_engine…` fails only in a full-suite run | pre-existing — **verified failing identically on `main`** | passes when run alone |
 | `test_bond_migration_playbook.py::test_every_jinja_filter_the_playbook_uses_actually_exists` fails only in the full CI invocation | pre-existing — **verified failing identically at the previous release tag `51.107.7`** | passes alone (114/114) and with the filter tests (491/491); cross-test pollution in the full run |
 | Two test directories' `conftest.py` collide when collected together (`plugins/modules/tests` + `plugins/module_utils/tests`) → 11 collection errors | pre-existing; CI passes an explicit file list, which is why it never sees this | `ImportError: cannot import name 'load_module' from 'conftest'` |
+
+## Rollout record (2026-09-20)
+
+Order was **docker-agent FIRST, ansible LAST** — the inverse of Phase 1's, see Traps.
+
+| Step | What | Verified |
+|---|---|---|
+| 1 | control-center `4.0.781` → kd + ng | frontend image `20260918-110204` live |
+| 2 | docker-agent `0.1.19` → all 10 hosts (`failed=0`) | every agent advertises the new capability fields; `owner` absent everywhere, as expected before the converge |
+| 3 | Registry junk cleared — 10 entries, all confirmed 0 containers first | see the note below |
+| 4 | ansible `51.107.8` → kd-cluster + ng-cluster | deployed tree carries `converge_owned_stack.yaml`, the module's new params and the client's `owner` kwarg |
+| 5 | Converge the stacks | **14 stack instances across both sites**, all `owner=ansible`, `managed=false`, `operable=true`, `ops_blocked=''`. One pre-existing failure, below. |
+| 6 | The deployed frontend bundle | greps clean for the post-review strings — `renders this stack`, `rendered by`, `every compose op still runs here`, `cannot read` — so 4.0.781 shipped the reviewed version, not the first draft |
+
+**The canary (gdrive-agent on kd-nas01) proved the phase's goal.** Before: `allowed_ops = [down,
+restart]`, `ops_blocked = outside_compose_root`. After: `owner='ansible'`, `managed=false`,
+`operable=true`, `ops_blocked=''`, `allowed_ops` all six. A Docker Jobs **`update` completed, exit
+0** — the operation this whole phase exists to enable, which previously answered `409
+project_not_operable`. The `.env` pin was seeded, the legacy compose file removed, the legacy
+directory's `state/`/`bearer-token` untouched, and the container stayed healthy throughout.
+
+⚠ **Two entries in the plan's "registry junk" list were NOT junk.** The note named `homeassistant`
+on kd-nuc02/kd-pi01/kd-vm01; it is ALSO registered on kd-nuc01 and ng-nuc01, where it is **running
+with a live container**. Container counts were checked per entry before deleting and those two were
+left alone. The note was a measurement of the fleet when it was written, not of the fleet now.
+
+⚠ **`filemesh-agent` on ng-nas01 failed, and the converge left a phantom.** The stack has **never
+been built for nghome** — no `filemesh-agent` repository in the ng registry, no container ever on
+that host — so `filemesh-agent/deploy.yml -e server_home=nghome` has always failed at the image
+pull. This phase did not cause that, but it changed the footprint: the converge runs BEFORE the
+pull, so the host got a rendered compose, a seeded `.env` and a registry entry for a stack that
+cannot run. Deregistered and the files removed, leaving the host as it was. **Open question for the
+user: build filemesh-agent for ng, or exclude ng from that role's targeting.** The register cannot
+simply move after the pull — it is before `up` on purpose, so auto-adoption cannot beat it.
+
+⚠ **Per-site image tags differ.** kd built `20260918-110206`, ng `20260918-110207` — one second
+apart, because each site builds its own image. `-e docker_agent_tag_override=<kd tag>` failed on all
+four ng hosts with `manifest unknown` (loudly, which is right). Phase 1's rollout record cites a
+single tag for both sites; that is misleading. Pin per site, or let it default.
 
 ## Next phase — first concrete step
 
