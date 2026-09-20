@@ -13,7 +13,7 @@ stack editable**, because the owner is recorded in the directory it governs.
 | Branch | `feat/owner-durable` | `feat/nut-owner-gate` | — no change needed |
 | Commits | 2 (`a0ef577` build, `b725d69` review fixes) | 2 (`e798722d`, `3a25bfc8`) | — |
 | Merged | see §Merge record | see §Merge record | — |
-| Released / deployed | **NOT released, NOT deployed.** No tag, no build, nothing on any host. | **NOT released, NOT distributed.** `/home/daniel/ansible` is still at the previous tag, so the nut fix reaches zero hosts until a release + `git_update_ansible_directory.yaml`. | — |
+| Released / deployed | **`0.1.20`, LIVE on all 10 hosts** — see §Rollout record | **`51.107.10` + `51.107.11`, distributed to kd-cluster + ng-cluster** — see §Rollout record | — |
 | Review | 4 lenses commissioned, 3 completed, 1 stopped (see §Surprises); every finding fixed or recorded below |
 
 **The wire is unchanged.** `owner` was already on `/v1/projects` and the fleet snapshot from Phase 2;
@@ -67,18 +67,33 @@ therefore fails safe. True when written; that host has since been through an upd
 Phase 2's deferred row said nut "will take its owner at its next template change". **Re-measured,
 and the implication was wrong**: the register that declares the owner is gated on the compose
 *content* differing, so a host whose template is already converged never declares an owner at all.
-Two days after the owner shipped, ng-nuc01's `nut` stack still read `owner=null, managed=true`, and
-Control Center was still offering Edit on files that play reverts every 25 minutes.
+Two days after the owner shipped, **kd-nuc02**'s `nut` stack still read `owner=null, managed=true`,
+and Control Center was still offering Edit on files that play reverts every 25 minutes.
+
+⚠ **I first named the wrong host, and the correction matters.** `nut_ups_hosts` is `[kd-nuc02]` —
+that is the only host this file renders. **ng-nuc01 is in `nut_legacy_device_sync_hosts`**, whose
+compose this repo deliberately does NOT render, so `owner=null` there is CORRECT and must stay that
+way. I measured ng-nuc01, saw a true symptom, and attributed it to the wrong role; a project filter
+that only listed stacks which already had an owner is what hid kd-nuc02's from me. Fixed in
+`51.107.11`, along with a revert described below.
 
 The two decisions are now separate — the owner opens the gate on its own; only a content change
 earns a `deploy`, because recording a name must not restart the UPS monitor. `ups/tests/` is new
 (15 tests that read both decisions out of the YAML and *evaluate* them), and `ups/**` was added to
 both `paths` filters and the pytest invocation in `plugin-tests.yml`, because it was in neither.
 
-Also: `legacy_device_sync.yaml` declares the same owner (it re-registers the same stack and would
-now be refused), and `docker_agent_client.py`'s register docstring no longer claims `/bundle`
-"serves nothing" for an owned stack — it serves the files, and that distinction is what broke the
-nut converge once.
+`docker_agent_client.py`'s register docstring no longer claims `/bundle` "serves nothing" for an
+owned stack — it serves the files, and that distinction is what broke the nut converge once.
+
+⚠ **`legacy_device_sync.yaml` must NOT declare an owner**, and briefly did. A review lens suggested
+adding `owner: 'ansible'` for symmetry with the owner path; I applied it without reading what
+"legacy" means. That file handles a compose this repo does not render — it rewrites
+`services.nut-ups.devices` and leaves every other key as the host has it, "so converging a site onto
+the template stays a deliberate act rather than a side effect of the 25-minute schedule". Declaring
+an owner asserts the opposite and takes the stack out of the editor on the one kind of host where a
+human is meant to edit it. It shipped in `51.107.10`, was inert (the task is gated on the USB device
+id changing, which no host did), and is reverted in `51.107.11` with two tests that refuse it next
+time. **Symmetry between an owner and a non-owner is the bug.**
 
 ## What was verified, and how
 
@@ -107,8 +122,9 @@ indexed rows too (every test tolerated it; it silently drops a recorded owner wh
 missing). A third fix, the regular-file check, is **not independently falsifiable** — the read fails
 on a directory anyway — so the test asserts what it actually earns: the failure *names the cause*.
 
-**Assumed, not measured:** nothing has run on a real fleet host. The migration is verified on a
-throwaway agent with one stack, not on the 14 owned stack instances across both sites.
+**Measured on the fleet after release** — see §Rollout record. The migration, the mark on disk, and
+the nut owner are all observed in production; what remains unexercised there is the reproduction
+itself (nobody has deleted a live `projects.json`, and nobody should).
 
 ## Decisions, and the alternatives rejected
 
@@ -194,14 +210,18 @@ Then, in the same change as declaring traefik `owner: 'ansible'`, fix
 pushes it back with **no owner**, which is refused the moment traefik is owned. It fails CLOSED — a
 silent no-op — which is the same shape that broke `nut-ups`.
 
-Before any of that: **release and deploy this phase** (see below), and read
-`owners_not_recorded` on each host afterwards. It must be empty.
+This phase is already released and deployed (§Rollout record), and `owners_not_recorded` was empty
+on all 10 hosts afterwards — so Phase 4 starts from a fleet where every recorded owner is durable.
+Re-read that field before starting anyway; it is a state, not a one-off reading.
 
 ## Traps
 
 - 🔴 **Deploy order: docker-agent FIRST, ansible LAST** — the same direction as Phase 2, and for a
-  related reason. The nut fix makes ng-nuc01 declare its owner; an agent that predates this phase
-  records that owner only in its index, which is the state this phase exists to end.
+  related reason. The nut fix makes **kd-nuc02** declare its owner; an agent that predates this
+  phase records that owner only in its index, which is the state this phase exists to end.
+- 🔴 **`nut_ups_hosts` is `[kd-nuc02]`; ng-nuc01 is the LEGACY host.** `owner=null` on ng-nuc01 is
+  correct and must stay that way. Do not "fix" it, and do not add an owner to
+  `legacy_device_sync.yaml` — there are two tests refusing that, and the reason is in them.
 - 🔴 **Merging the ansible change reaches ZERO hosts.** `/home/daniel/ansible` sits at the last
   released tag, so the nut fix needs a tag **and** `git_updates/git_update_ansible_directory.yaml`
   before any host runs it. A release ships the whole repo — check `git log <last-tag>..main` first.
@@ -219,6 +239,26 @@ Before any of that: **release and deploy this phase** (see below), and read
 - **Everything Phase 2's traps say still applies** — `/bundle` answers a refusal with an empty
   bundle and HTTP 200; never re-render an owned stack's `.env`; a path-only register needs the
   compose file on disk first; do not add an `owner` branch to `StackEditorDrawer`.
+
+## Rollout record (2026-09-20)
+
+Order was **docker-agent FIRST, ansible LAST**, per the trap below.
+
+| # | Step | Verified |
+|---|---|---|
+| 1 | docker-agent `0.1.20` tagged from `main` (`1a711d1`), built on kd-nas01 + ng-nas01 as `20260920-212338` | `failed=0` both sites; the build log names commit `1a711d1` |
+| 2 | `docker-agent/deploy.yml` → kdhome (6 hosts) then nghome (4) | `failed=0` on all 10 |
+| 3 | **The migration ran.** kd-nuc01's log: `recorded the owner in its stack directory project=duplicacy-agent-api` | the FILE on disk: `.docker-agent-owner`, root:root `0600`, content `ansible`, mtime 17:27 |
+| 4 | Fleet-wide: `owners_not_recorded` empty on all 10, 14 owned stack instances still `owner=ansible, managed=false` | checked with the field's PRESENCE as well as its emptiness — an older agent omits the key, which parses identically to healthy |
+| 5 | ansible `51.107.10` released and distributed to kd-cluster + ng-cluster | `failed=0` on 7; both python daemons restarted, as the path gate predicts for a `plugins/module_utils/` change |
+| 6 | `ups/manage_ups_nut_device_id.yaml -e target_servers=kd-nuc02` | the run reports **"declaring the owner"**; `nut` → `owner=ansible, managed=false`; the container's created timestamp is **unchanged** (no redeploy); a second run reports **"already converged"**, `changed=0` |
+| 7 | ansible `51.107.11` (the two corrections above) released and distributed | `failed=0` on 7; `Daemons to restart: []`, correct for a `ups/`-only change |
+| 8 | ng-nuc01's `nut` still reads `owner=null, managed=true` | **correct** — it is the legacy host, and that is the state it must keep |
+
+⚠ **A peer session read the ng hosts mid-distribute and saw `51.107.10`.** Both our recaps were
+consistent with the truth at different instants, so neither settled it; ssh to each host and reading
+`ansible_repo_version.txt` **and** `git describe` did — all three ng hosts were at `.11`. A recap
+saying `changed=9` is evidence about the run, not about the host.
 
 ## Merge record
 
