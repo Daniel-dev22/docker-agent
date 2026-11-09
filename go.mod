@@ -3,7 +3,7 @@ module github.com/Daniel-dev22/docker-agent
 go 1.26
 
 require (
-	github.com/Daniel-dev22/agent-kit-go v0.1.11
+	github.com/Daniel-dev22/agent-kit-go v0.5.1
 	github.com/compose-spec/compose-go/v2 v2.11.0
 	github.com/containerd/errdefs v1.0.0
 	github.com/distribution/reference v0.6.0
